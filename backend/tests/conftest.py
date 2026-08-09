@@ -9,11 +9,25 @@ os.environ.setdefault(
     "postgresql+asyncpg://postgres@localhost:5432/platform_test",
 )
 
-from app.core.database import async_sessionmaker  # noqa: E402
+from app.core.database import engine  # noqa: E402
 
 
 @pytest_asyncio.fixture
 async def db_session() -> AsyncIterator[AsyncSession]:
-    async with async_sessionmaker() as session:
-        yield session
-        await session.rollback()
+    try:
+        async with engine.connect() as connection:
+            outer_transaction = await connection.begin()
+            session = AsyncSession(
+                bind=connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            try:
+                yield session
+            finally:
+                try:
+                    await session.close()
+                finally:
+                    await outer_transaction.rollback()
+    finally:
+        await engine.dispose()
