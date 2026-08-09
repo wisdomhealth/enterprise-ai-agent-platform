@@ -1,0 +1,46 @@
+from pydantic import AnyUrl, Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        case_sensitive=True,
+        env_file=None,
+        env_ignore_empty=True,
+        extra="forbid",
+        strict=True,
+    )
+
+    database_url: AnyUrl | None = Field(default=None, validation_alias="DATABASE_URL")
+    redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
+    anthropic_api_key: SecretStr | None = Field(
+        default=None, validation_alias="ANTHROPIC_API_KEY"
+    )
+    openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
+    google_oidc_client_id: SecretStr | None = Field(
+        default=None, validation_alias="GOOGLE_OIDC_CLIENT_ID"
+    )
+    google_oidc_client_secret: SecretStr | None = Field(
+        default=None, validation_alias="GOOGLE_OIDC_CLIENT_SECRET"
+    )
+    google_drive_client_id: SecretStr | None = Field(
+        default=None, validation_alias="GOOGLE_DRIVE_CLIENT_ID"
+    )
+    google_drive_client_secret: SecretStr | None = Field(
+        default=None, validation_alias="GOOGLE_DRIVE_CLIENT_SECRET"
+    )
+    google_gmail_client_id: SecretStr | None = Field(
+        default=None, validation_alias="GOOGLE_GMAIL_CLIENT_ID"
+    )
+    google_gmail_client_secret: SecretStr | None = Field(
+        default=None, validation_alias="GOOGLE_GMAIL_CLIENT_SECRET"
+    )
+    google_cloud_project: str | None = Field(
+        default=None, validation_alias="GOOGLE_CLOUD_PROJECT"
+    )
+    google_kms_key_name: str | None = Field(
+        default=None, validation_alias="GOOGLE_KMS_KEY_NAME"
+    )
+    session_secret: SecretStr | None = Field(default=None, validation_alias="SESSION_SECRET")
+    public_base_url: AnyUrl | None = Field(default=None, validation_alias="PUBLIC_BASE_URL")
+    internal_base_url: AnyUrl | None = Field(default=None, validation_alias="INTERNAL_BASE_URL")

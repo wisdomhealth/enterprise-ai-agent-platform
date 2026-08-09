@@ -1,0 +1,13 @@
+services:
+  backend-test:
+    build:
+      context: ./backend
+      target: test
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      REDIS_URL: ${REDIS_URL:-}
+
+  frontend-test:
+    build:
+      context: ./frontend
+      target: test
