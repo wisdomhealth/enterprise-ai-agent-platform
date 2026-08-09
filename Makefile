@@ -1,10 +1,23 @@
 .PHONY: install test lint typecheck test-integration test-e2e
 
-PYTHON ?= python3
+PYTHON ?= $(shell \
+	for candidate in python3.13 python3.12 python3; do \
+		candidate_path=$$(command -v "$$candidate" 2>/dev/null) || continue; \
+		if "$$candidate_path" -c 'import sys; raise SystemExit(not ((3, 12) <= sys.version_info[:2] < (3, 14)))' >/dev/null 2>&1; then \
+			printf '%s' "$$candidate_path"; \
+			break; \
+		fi; \
+	done)
 BACKEND_VENV ?= $(CURDIR)/backend/.venv
 BACKEND_PYTHON ?= $(BACKEND_VENV)/bin/python
 
 install:
+	@if [ ! -x "$(BACKEND_PYTHON)" ] || [ "$(origin PYTHON)" != "file" ]; then \
+		if [ -z "$(PYTHON)" ] || ! "$(PYTHON)" -c 'import sys; raise SystemExit(not ((3, 12) <= sys.version_info[:2] < (3, 14)))' >/dev/null 2>&1; then \
+			printf '%s\n' 'Compatible Python 3.12 or 3.13 is required. Set PYTHON=/path/to/python3.12-or-3.13.' >&2; \
+			exit 1; \
+		fi; \
+	fi
 	@test -x "$(BACKEND_PYTHON)" || "$(PYTHON)" -m venv "$(BACKEND_VENV)"
 	"$(BACKEND_PYTHON)" -m pip install -e "./backend[dev]"
 	cd frontend && npm install
