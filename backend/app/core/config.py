@@ -1,4 +1,4 @@
-from pydantic import AnyUrl, Field, SecretStr
+from pydantic import AnyUrl, Field, PostgresDsn, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,7 +11,7 @@ class Settings(BaseSettings):
         strict=True,
     )
 
-    database_url: AnyUrl | None = Field(default=None, validation_alias="DATABASE_URL")
+    database_url: PostgresDsn | None = Field(default=None, validation_alias="DATABASE_URL")
     redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
     anthropic_api_key: SecretStr | None = Field(
         default=None, validation_alias="ANTHROPIC_API_KEY"

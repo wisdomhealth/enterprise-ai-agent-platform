@@ -1,11 +1,27 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: platform_test
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d platform_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   backend-test:
     build:
       context: ./backend
       target: test
     environment:
-      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
       REDIS_URL: ${REDIS_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   frontend-test:
     build:
