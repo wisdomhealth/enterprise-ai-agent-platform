@@ -14,11 +14,6 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.create_unique_constraint(
-        "uq_staff_users_organization_id_id",
-        "staff_users",
-        ["organization_id", "id"],
-    )
     op.create_table(
         "resource_grants",
         sa.Column(
@@ -42,9 +37,8 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
-            ["organization_id", "subject_id"],
-            ["staff_users.organization_id", "staff_users.id"],
-            name="fk_resource_grants_organization_subject",
+            ["subject_id"],
+            ["staff_users.id"],
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id"),
@@ -66,8 +60,3 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_resource_grants_subject_lookup", table_name="resource_grants")
     op.drop_table("resource_grants")
-    op.drop_constraint(
-        "uq_staff_users_organization_id_id",
-        "staff_users",
-        type_="unique",
-    )
