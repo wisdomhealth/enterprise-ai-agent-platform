@@ -5,6 +5,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.core.celery import create_celery
 from app.core.config import Settings
 from app.core.logging import configure_logging
+from app.modules.connectors.router import router as connectors_router
+from app.modules.connectors.service import ConnectorService
 from app.modules.identity.oidc import configure_google_oidc
 from app.modules.identity.router import router as identity_router
 
@@ -16,6 +18,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.celery = create_celery(settings)
     app.state.google_oidc_client = None
+    app.state.connector_service = ConnectorService.from_settings(settings)
 
     if settings.session_secret is not None:
         app.add_middleware(
@@ -38,6 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(identity_router)
+    app.include_router(connectors_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from pydantic import AnyUrl, Field, PostgresDsn, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -17,9 +19,7 @@ class Settings(BaseSettings):
         validation_alias="MIGRATION_DATABASE_URL",
     )
     redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
-    anthropic_api_key: SecretStr | None = Field(
-        default=None, validation_alias="ANTHROPIC_API_KEY"
-    )
+    anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     google_oidc_client_id: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_OIDC_CLIENT_ID"
@@ -39,11 +39,14 @@ class Settings(BaseSettings):
     google_gmail_client_secret: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_GMAIL_CLIENT_SECRET"
     )
-    google_cloud_project: str | None = Field(
-        default=None, validation_alias="GOOGLE_CLOUD_PROJECT"
+    google_cloud_project: str | None = Field(default=None, validation_alias="GOOGLE_CLOUD_PROJECT")
+    google_kms_key_name: str | None = Field(default=None, validation_alias="GOOGLE_KMS_KEY_NAME")
+    app_env: str = Field(default="development", validation_alias="APP_ENV")
+    self_hosted_file_key_allowed: bool = Field(
+        default=False, validation_alias="SELF_HOSTED_FILE_KEY_ALLOWED"
     )
-    google_kms_key_name: str | None = Field(
-        default=None, validation_alias="GOOGLE_KMS_KEY_NAME"
+    connector_file_key_path: Path | None = Field(
+        default=None, validation_alias="CONNECTOR_FILE_KEY_PATH"
     )
     session_secret: SecretStr | None = Field(default=None, validation_alias="SESSION_SECRET")
     staff_session_ttl_seconds: int = Field(
