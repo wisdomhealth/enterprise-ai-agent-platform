@@ -57,8 +57,10 @@ and provider bodies must never be allow-listed.
 
 ## Recovery checklist
 
-1. Confirm PostgreSQL is healthy and the current Alembic revision is
-   `0005_audit_outbox_jobs`.
+1. Confirm PostgreSQL is healthy and `alembic current` matches the current single head from
+   `alembic heads`. At the time of writing, both report
+   `0006_idempotency_lease_fencing (head)`; use the commands rather than this example after
+   later append-only migrations are published.
 2. Inspect overdue `RUNNING` rows by `lease_expires_at`; restarting workers is safe because
    an expired row can be reclaimed.
 3. Inspect pending Outbox rows by `published_at IS NULL` and `publish_attempts`; restart the
