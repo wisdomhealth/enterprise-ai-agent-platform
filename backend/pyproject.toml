@@ -19,6 +19,7 @@ dependencies = [
   "google-auth-oauthlib>=1.2,<2",
   "google-cloud-kms>=3.4,<4",
   "httpx>=0.28,<1",
+  "itsdangerous>=2.2,<3",
   "openai>=1.66,<3",
   "pgvector>=0.3,<1",
   "prometheus-client>=0.21,<1",

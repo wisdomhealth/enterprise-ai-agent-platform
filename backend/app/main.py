@@ -1,11 +1,41 @@
+from authlib.integrations.starlette_client import OAuth  # type: ignore[import-untyped]
 from fastapi import FastAPI
+from starlette.middleware.sessions import SessionMiddleware
 
+from app.core.config import Settings
 from app.core.logging import configure_logging
+from app.modules.identity.oidc import configure_google_oidc
+from app.modules.identity.router import router as identity_router
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     configure_logging()
+    settings = settings or Settings()
     app = FastAPI(title="Enterprise AI Agent Platform", version="0.1.0")
+    app.state.settings = settings
+    app.state.google_oidc_client = None
+
+    if settings.session_secret is not None:
+        app.add_middleware(
+            SessionMiddleware,
+            secret_key=settings.session_secret.get_secret_value(),
+            session_cookie="oidc_flow",
+            max_age=600,
+            same_site="lax",
+            https_only=True,
+        )
+
+    if (
+        settings.google_oidc_client_id is not None
+        and settings.google_oidc_client_secret is not None
+    ):
+        app.state.google_oidc_client = configure_google_oidc(
+            OAuth(),
+            client_id=settings.google_oidc_client_id.get_secret_value(),
+            client_secret=settings.google_oidc_client_secret.get_secret_value(),
+        )
+
+    app.include_router(identity_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

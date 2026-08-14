@@ -42,5 +42,10 @@ class Settings(BaseSettings):
         default=None, validation_alias="GOOGLE_KMS_KEY_NAME"
     )
     session_secret: SecretStr | None = Field(default=None, validation_alias="SESSION_SECRET")
+    staff_session_ttl_seconds: int = Field(
+        default=28_800,
+        gt=0,
+        validation_alias="STAFF_SESSION_TTL_SECONDS",
+    )
     public_base_url: AnyUrl | None = Field(default=None, validation_alias="PUBLIC_BASE_URL")
     internal_base_url: AnyUrl | None = Field(default=None, validation_alias="INTERNAL_BASE_URL")
