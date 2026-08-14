@@ -77,6 +77,7 @@ async def delete_organization(organization_id: UUID) -> None:
 def test_downgrade_refuses_unbound_invitation_without_losing_identity_data():
     assert run_alembic("upgrade", "head").returncode == 0
     organization_id, user_id = asyncio.run(insert_unbound_invitation())
+    _, starting_revision = asyncio.run(read_invitation_and_revision(user_id))
     try:
         downgrade = run_alembic("downgrade", "0001_platform_foundation")
 
@@ -84,7 +85,7 @@ def test_downgrade_refuses_unbound_invitation_without_losing_identity_data():
         assert DOWNGRADE_BLOCKED_MESSAGE in f"{downgrade.stdout}\n{downgrade.stderr}"
         oidc_subject, revision = asyncio.run(read_invitation_and_revision(user_id))
         assert oidc_subject is None
-        assert revision == "0002_identity_sessions"
+        assert revision == starting_revision
     finally:
         asyncio.run(delete_organization(organization_id))
 

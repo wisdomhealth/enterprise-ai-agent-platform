@@ -8,6 +8,8 @@ from uuid import UUID
 from fastapi import Cookie, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.database import async_sessionmaker
 from app.modules.identity.models import StaffSession, StaffUser, UserRole, UserStatus
@@ -22,6 +24,15 @@ class Principal:
     role: UserRole
     session_id: UUID
     csrf_hash: str
+
+    def organization_filter(
+        self,
+        organization_id: InstrumentedAttribute[UUID],
+    ) -> ColumnElement[bool]:
+        return organization_id == self.organization_id
+
+    def subject_filter(self, subject_id: InstrumentedAttribute[UUID]) -> ColumnElement[bool]:
+        return subject_id == self.id
 
 
 async def get_db_session() -> AsyncIterator[AsyncSession]:
