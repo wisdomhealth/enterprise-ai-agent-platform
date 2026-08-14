@@ -158,6 +158,8 @@ def prepare_legacy_0003() -> None:
 
 
 def restore_current_head(organization_ids: tuple[UUID, ...] = ()) -> None:
+    downgrade = run_alembic("downgrade", PREVIOUS_REVISION)
+    assert downgrade.returncode == 0, downgrade.stderr
     asyncio.run(reset_legacy_schema_to_0002(organization_ids))
     restore = run_alembic("upgrade", "head")
     assert restore.returncode == 0, restore.stderr

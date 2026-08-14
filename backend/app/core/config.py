@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     )
 
     database_url: PostgresDsn | None = Field(default=None, validation_alias="DATABASE_URL")
+    migration_database_url: PostgresDsn | None = Field(
+        default=None,
+        validation_alias="MIGRATION_DATABASE_URL",
+    )
     redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
     anthropic_api_key: SecretStr | None = Field(
         default=None, validation_alias="ANTHROPIC_API_KEY"

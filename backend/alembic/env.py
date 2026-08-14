@@ -9,13 +9,18 @@ from alembic import context
 from app.core.config import Settings
 from app.db.base import Base
 from app.modules.authorization import models as authorization_models  # noqa: F401
+from app.modules.audit import models as audit_models  # noqa: F401
 from app.modules.identity import models  # noqa: F401
+from app.modules.idempotency import models as idempotency_models  # noqa: F401
+from app.modules.jobs import models as job_models  # noqa: F401
+from app.modules.outbox import models as outbox_models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = Settings().database_url
+settings = Settings()
+database_url = settings.migration_database_url or settings.database_url
 if database_url is not None:
     config.set_main_option(
         "sqlalchemy.url",

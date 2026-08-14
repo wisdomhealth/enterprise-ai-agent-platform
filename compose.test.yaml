@@ -12,15 +12,28 @@ services:
       timeout: 3s
       retries: 15
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   backend-test:
     build:
       context: ./backend
       target: test
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
-      REDIS_URL: ${REDIS_URL:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://platform_app@postgres:5432/platform_test}
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   frontend-test:
