@@ -27,7 +27,9 @@ Do not use Redis or Celery result state as proof that an event was processed.
 `JobService.enqueue()` deduplicates on `(kind, idempotency_key)`. A worker calls
 `JobLeaseService.claim()` before work. Claim is one conditional `UPDATE ... RETURNING`:
 only due pending work or a running job with an expired lease can transition to `RUNNING`.
-Payload is retained during takeover and `attempts` is incremented.
+Payload is retained during takeover and `attempts` is incremented. Lease comparisons,
+expiry values, completion, and retry scheduling use PostgreSQL's clock rather than a worker's
+wall clock.
 
 Failure routing is durable:
 
@@ -38,7 +40,20 @@ Failure routing is durable:
 - `SECURITY`: deny the operation, move to `FAILED`, and append a redacted audit signal.
 
 Manual and automated retries call the same `JobLeaseService.retry()` path. Celery is only
-a scheduling hint; PostgreSQL job state and leases are authoritative.
+a scheduling hint; PostgreSQL job state and leases are authoritative. Worker failure entry
+points require organization and actor IDs so a SECURITY transition always writes its redacted
+audit signal in the same transaction.
+
+## Idempotent write fencing
+
+Every `IdempotencyService.begin()` acquisition has a durable UUID `lease_token`. An expired
+takeover replaces the token. The executor must pass the token returned by `begin()` to
+`complete()`; a stale or expired token raises `IdempotencyLeaseLost` and cannot overwrite the
+new executor's result. Completed matching requests replay their stored safe response.
+
+Response persistence is deny-by-default. Without `safe_response_keys`, the stored body is
+empty. Callers may explicitly allow-list fields that are safe to replay; secrets, credentials,
+and provider bodies must never be allow-listed.
 
 ## Recovery checklist
 

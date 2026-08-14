@@ -1,9 +1,9 @@
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from random import random
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -95,16 +95,19 @@ class JobLeaseService:
     ) -> JobIntent | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        now = datetime.now(UTC)
+        database_now = func.current_timestamp()
         claimable = or_(
             and_(
                 JobIntent.state == JobState.PENDING,
-                or_(JobIntent.next_attempt_at.is_(None), JobIntent.next_attempt_at <= now),
+                or_(
+                    JobIntent.next_attempt_at.is_(None),
+                    JobIntent.next_attempt_at <= database_now,
+                ),
             ),
             and_(
                 JobIntent.state == JobState.RUNNING,
                 JobIntent.lease_expires_at.is_not(None),
-                JobIntent.lease_expires_at <= now,
+                JobIntent.lease_expires_at <= database_now,
             ),
         )
         return await self._db_session.scalar(
@@ -113,24 +116,24 @@ class JobLeaseService:
             .values(
                 state=JobState.RUNNING,
                 lease_owner=worker_id,
-                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                lease_expires_at=database_now + timedelta(seconds=lease_seconds),
                 attempts=JobIntent.attempts + 1,
                 next_attempt_at=None,
                 version=JobIntent.version + 1,
-                updated_at=now,
+                updated_at=database_now,
             )
             .returning(JobIntent)
         )
 
     async def complete(self, job_id: UUID, worker_id: str) -> JobIntent:
-        now = datetime.now(UTC)
+        database_now = func.current_timestamp()
         completed = await self._db_session.scalar(
             update(JobIntent)
             .where(
                 JobIntent.id == job_id,
                 JobIntent.state == JobState.RUNNING,
                 JobIntent.lease_owner == worker_id,
-                JobIntent.lease_expires_at > now,
+                JobIntent.lease_expires_at > database_now,
             )
             .values(
                 state=JobState.SUCCEEDED,
@@ -138,7 +141,7 @@ class JobLeaseService:
                 lease_expires_at=None,
                 next_attempt_at=None,
                 version=JobIntent.version + 1,
-                updated_at=now,
+                updated_at=database_now,
             )
             .returning(JobIntent)
         )
@@ -164,41 +167,55 @@ class JobLeaseService:
             organization_id is None or actor_id is None
         ):
             raise ValueError("security job failures require organization_id and actor_id")
-        now = datetime.now(UTC)
-        job = await self._db_session.scalar(
-            select(JobIntent)
+        database_now = func.current_timestamp()
+        attempts = await self._db_session.scalar(
+            select(JobIntent.attempts)
             .where(
                 JobIntent.id == job_id,
                 JobIntent.state == JobState.RUNNING,
                 JobIntent.lease_owner == worker_id,
-                JobIntent.lease_expires_at > now,
+                JobIntent.lease_expires_at > database_now,
             )
             .with_for_update()
         )
-        if job is None:
+        if attempts is None:
             raise JobLeaseLost(job_id)
 
-        next_attempt_at: datetime | None = None
+        next_attempt_at = None
         if error_class is ErrorClass.RETRYABLE:
             state = JobState.PENDING
             delay = self._retry_policy.delay_seconds(
-                attempts=job.attempts,
+                attempts=attempts,
                 retry_after_seconds=retry_after_seconds,
             )
-            next_attempt_at = now + timedelta(seconds=delay)
+            next_attempt_at = database_now + timedelta(seconds=delay)
         elif error_class is ErrorClass.AMBIGUOUS:
             state = JobState.RECONCILIATION
         else:
             state = JobState.FAILED
 
-        job.state = state
-        job.lease_owner = None
-        job.lease_expires_at = None
-        job.next_attempt_at = next_attempt_at
-        job.last_error_code = error_code
-        job.error_class = error_class
-        job.version += 1
-        job.updated_at = now
+        job = await self._db_session.scalar(
+            update(JobIntent)
+            .where(
+                JobIntent.id == job_id,
+                JobIntent.state == JobState.RUNNING,
+                JobIntent.lease_owner == worker_id,
+                JobIntent.lease_expires_at > database_now,
+            )
+            .values(
+                state=state,
+                lease_owner=None,
+                lease_expires_at=None,
+                next_attempt_at=next_attempt_at,
+                last_error_code=error_code,
+                error_class=error_class,
+                version=JobIntent.version + 1,
+                updated_at=database_now,
+            )
+            .returning(JobIntent)
+        )
+        if job is None:
+            raise JobLeaseLost(job_id)
 
         if error_class is ErrorClass.SECURITY:
             assert organization_id is not None
@@ -209,7 +226,7 @@ class JobLeaseService:
                 actor_id=actor_id,
                 action="job.security_denied",
                 object_type="job",
-                object_id=job.id,
+                object_id=job_id,
                 outcome="DENIED",
                 details={"error_code": error_code},
                 safe_detail_keys={"error_code"},

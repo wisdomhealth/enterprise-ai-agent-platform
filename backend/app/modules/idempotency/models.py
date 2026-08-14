@@ -49,6 +49,12 @@ class IdempotencyRecord(Base):
         default=IdempotencyState.IN_PROGRESS,
         server_default=text("'IN_PROGRESS'::idempotency_state"),
     )
+    lease_token: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
     lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_body: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)

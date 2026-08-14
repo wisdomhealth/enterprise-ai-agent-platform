@@ -15,6 +15,8 @@ class JobWorker:
         *,
         error_code: str,
         error_class: ErrorClass,
+        organization_id: UUID,
+        actor_id: UUID,
         retry_after_seconds: int | None = None,
     ) -> JobIntent:
         return await self._retry(
@@ -23,6 +25,8 @@ class JobWorker:
             error_code=error_code,
             error_class=error_class,
             retry_after_seconds=retry_after_seconds,
+            organization_id=organization_id,
+            actor_id=actor_id,
         )
 
     async def manual_retry(
@@ -32,6 +36,8 @@ class JobWorker:
         *,
         error_code: str,
         error_class: ErrorClass,
+        organization_id: UUID,
+        actor_id: UUID,
         retry_after_seconds: int | None = None,
     ) -> JobIntent:
         return await self._retry(
@@ -40,6 +46,8 @@ class JobWorker:
             error_code=error_code,
             error_class=error_class,
             retry_after_seconds=retry_after_seconds,
+            organization_id=organization_id,
+            actor_id=actor_id,
         )
 
     async def _retry(
@@ -50,6 +58,8 @@ class JobWorker:
         error_code: str,
         error_class: ErrorClass,
         retry_after_seconds: int | None,
+        organization_id: UUID,
+        actor_id: UUID,
     ) -> JobIntent:
         return await self._lease_service.retry(
             job_id,
@@ -57,4 +67,6 @@ class JobWorker:
             error_code=error_code,
             error_class=error_class,
             retry_after_seconds=retry_after_seconds,
+            organization_id=organization_id,
+            actor_id=actor_id,
         )

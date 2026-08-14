@@ -2,9 +2,10 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
+import app.modules.jobs.service as jobs_service_module
 from app.modules.audit.models import AuditEvent
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService, RetryPolicy
@@ -59,6 +60,60 @@ async def test_expired_lease_is_recovered_without_losing_payload(
     assert recovered.lease_owner == "recovery-worker"
     assert recovered.payload == {"cursor": "9"}
     assert recovered.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_database_clock_controls_job_lease_transitions(
+    monkeypatch, job_service, lease_service, db_session
+):
+    claim_job = await job_service.enqueue(
+        db_session, "drive.sync", "drive:database-clock:claim", {"cursor": "1"}
+    )
+    retry_job = await job_service.enqueue(
+        db_session, "drive.sync", "drive:database-clock:retry", {"cursor": "2"}
+    )
+    terminal_job = await job_service.enqueue(
+        db_session, "drive.sync", "drive:database-clock:terminal", {"cursor": "3"}
+    )
+    await db_session.flush()
+    await lease_service.claim(retry_job.id, "worker-retry", 60)
+    await lease_service.claim(terminal_job.id, "worker-terminal", 60)
+
+    class WorkerClockMustNotBeRead:
+        @classmethod
+        def now(cls, *_args, **_kwargs):
+            raise AssertionError("job leases must use PostgreSQL CURRENT_TIMESTAMP")
+
+    monkeypatch.setattr(
+        jobs_service_module,
+        "datetime",
+        WorkerClockMustNotBeRead,
+        raising=False,
+    )
+
+    claimed = await lease_service.claim(claim_job.id, "worker-claim", 60)
+    assert claimed is not None
+    assert await lease_service.claim(claim_job.id, "worker-other", 60) is None
+    completed = await lease_service.complete(claim_job.id, "worker-claim")
+    retried = await lease_service.retry(
+        retry_job.id,
+        "worker-retry",
+        error_code="rate_limited",
+        error_class=ErrorClass.RETRYABLE,
+    )
+    failed = await lease_service.fail_terminal(
+        terminal_job.id,
+        "worker-terminal",
+        error_code="invalid_request",
+    )
+    database_now = await db_session.scalar(select(func.current_timestamp()))
+
+    assert completed.state is JobState.SUCCEEDED
+    assert retried.state is JobState.PENDING
+    assert retried.next_attempt_at is not None
+    assert database_now is not None
+    assert retried.next_attempt_at > database_now
+    assert failed.state is JobState.FAILED
 
 
 @pytest.mark.asyncio
@@ -201,6 +256,44 @@ async def test_security_error_emits_safe_audit_signal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("worker_method", ["handle_failure", "manual_retry"])
+async def test_job_worker_security_failure_transitions_and_audits_safely(
+    worker_method, job_service, lease_service, db_session
+):
+    organization_id = uuid4()
+    actor_id = uuid4()
+    job = await job_service.enqueue(
+        db_session,
+        "drive.sync",
+        f"drive:worker-security:{worker_method}",
+        {"access_token": "must-not-be-audited"},
+    )
+    await db_session.flush()
+    assert await lease_service.claim(job.id, "worker-security", 60) is not None
+    worker = JobWorker(lease_service)
+
+    result = await getattr(worker, worker_method)(
+        job.id,
+        "worker-security",
+        error_code="credential_scope_denied",
+        error_class=ErrorClass.SECURITY,
+        organization_id=organization_id,
+        actor_id=actor_id,
+    )
+
+    audit_event = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.organization_id == organization_id,
+            AuditEvent.actor_id == actor_id,
+            AuditEvent.object_id == job.id,
+        )
+    )
+    assert result.state is JobState.FAILED
+    assert audit_event is not None
+    assert audit_event.details == {"error_code": "credential_scope_denied"}
+
+
+@pytest.mark.asyncio
 async def test_security_error_without_audit_context_does_not_transition_job(
     job_service, lease_service, db_session
 ):
@@ -229,6 +322,8 @@ async def test_security_error_without_audit_context_does_not_transition_job(
 async def test_manual_and_automatic_retry_use_the_same_durable_transition(
     job_service, lease_service, db_session
 ):
+    organization_id = uuid4()
+    actor_id = uuid4()
     automatic = await job_service.enqueue(
         db_session, "drive.sync", "drive:auto-retry", {"cursor": "1"}
     )
@@ -245,6 +340,8 @@ async def test_manual_and_automatic_retry_use_the_same_durable_transition(
         "worker-a",
         error_code="rate_limited",
         error_class=ErrorClass.RETRYABLE,
+        organization_id=organization_id,
+        actor_id=actor_id,
         retry_after_seconds=10,
     )
     manual_result = await worker.manual_retry(
@@ -252,6 +349,8 @@ async def test_manual_and_automatic_retry_use_the_same_durable_transition(
         "worker-b",
         error_code="rate_limited",
         error_class=ErrorClass.RETRYABLE,
+        organization_id=organization_id,
+        actor_id=actor_id,
         retry_after_seconds=10,
     )
 
