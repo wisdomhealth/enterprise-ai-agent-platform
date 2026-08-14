@@ -11,6 +11,21 @@ from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffSession, StaffUser, UserRole, UserStatus
 
 
+def test_principal_accepts_canonical_subject_id():
+    subject_id = uuid4()
+
+    principal = Principal(
+        subject_id=subject_id,
+        organization_id=uuid4(),
+        email="canonical-principal@example.com",
+        role=UserRole.MEMBER,
+        session_id=uuid4(),
+        csrf_hash="canonical-principal-csrf",
+    )
+
+    assert principal.subject_id == subject_id
+
+
 async def _principal(db_session, *, role: UserRole = UserRole.MEMBER) -> Principal:
     organization = Organization(name=f"Policy organization {uuid4()}")
     db_session.add(organization)
@@ -33,7 +48,7 @@ async def _principal(db_session, *, role: UserRole = UserRole.MEMBER) -> Princip
     db_session.add(session)
     await db_session.flush()
     return Principal(
-        id=user.id,
+        subject_id=user.id,
         organization_id=organization.id,
         email=user.email,
         role=user.role,
@@ -74,7 +89,7 @@ async def test_matching_resource_grant_allows_role_action(db_session):
     db_session.add(
         ResourceGrant(
             organization_id=principal.organization_id,
-            subject_id=principal.id,
+            subject_id=principal.subject_id,
             resource_type=resource.resource_type,
             resource_id=resource.resource_id,
             actions=["knowledge.read"],
@@ -96,7 +111,7 @@ async def test_role_matrix_denies_member_review_even_with_resource_grant(db_sess
     db_session.add(
         ResourceGrant(
             organization_id=principal.organization_id,
-            subject_id=principal.id,
+            subject_id=principal.subject_id,
             resource_type=resource.resource_type,
             resource_id=resource.resource_id,
             actions=["knowledge.review"],
@@ -120,7 +135,7 @@ async def test_cross_organization_grant_does_not_authorize_resource(db_session):
     db_session.add(
         ResourceGrant(
             organization_id=foreign_principal.organization_id,
-            subject_id=principal.id,
+            subject_id=foreign_principal.subject_id,
             resource_type=resource.resource_type,
             resource_id=resource.resource_id,
             actions=["knowledge.read"],
@@ -143,7 +158,7 @@ async def test_disabled_resource_state_denies_assigned_action(db_session):
     db_session.add(
         ResourceGrant(
             organization_id=principal.organization_id,
-            subject_id=principal.id,
+            subject_id=principal.subject_id,
             resource_type=resource.resource_type,
             resource_id=resource.resource_id,
             actions=["knowledge.read"],
@@ -186,7 +201,7 @@ async def test_role_matrix_allows_each_roles_explicit_actions(db_session, role, 
     db_session.add(
         ResourceGrant(
             organization_id=principal.organization_id,
-            subject_id=principal.id,
+            subject_id=principal.subject_id,
             resource_type=resource.resource_type,
             resource_id=resource.resource_id,
             actions=[action],

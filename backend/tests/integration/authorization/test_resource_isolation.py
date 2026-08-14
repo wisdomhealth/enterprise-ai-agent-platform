@@ -61,7 +61,7 @@ async def test_resource_candidate_filter_excludes_other_subjects_and_organizatio
 ):
     staff_user = authorization_records["staff_user"]
     principal = Principal(
-        id=staff_user.id,
+        subject_id=staff_user.id,
         organization_id=staff_user.organization_id,
         email=staff_user.email,
         role=staff_user.role,
@@ -79,3 +79,18 @@ async def test_resource_candidate_filter_excludes_other_subjects_and_organizatio
         authorization_records["readable_resource_id"],
         authorization_records["forbidden_resource_id"],
     }
+
+
+@pytest.mark.asyncio
+async def test_unfiltered_loader_does_not_reveal_unassigned_resource_exists(
+    client,
+    authorization_records,
+):
+    client.cookies.set("staff_session", authorization_records["staff_cookie"])
+
+    response = await client.get(
+        "/api/v1/authorization-probe/unfiltered/"
+        f"{authorization_records['other_subject_resource_id']}"
+    )
+
+    assert response.status_code == 404

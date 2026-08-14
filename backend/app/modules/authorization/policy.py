@@ -55,6 +55,20 @@ class AuthorizationService:
     def __init__(self, db_session: AsyncSession) -> None:
         self._db_session = db_session
 
+    async def is_visible(self, principal: Principal, resource: ResourceRef) -> bool:
+        if resource.organization_id != principal.organization_id:
+            return False
+        if resource.is_public and resource.state is ResourceState.ACTIVE:
+            return True
+        grant_id = await self._db_session.scalar(
+            select(ResourceGrant.id).where(
+                resource_grant_filter(principal),
+                ResourceGrant.resource_type == resource.resource_type,
+                ResourceGrant.resource_id == resource.resource_id,
+            )
+        )
+        return grant_id is not None
+
     async def require(
         self,
         principal: Principal,

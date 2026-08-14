@@ -18,12 +18,18 @@ from app.modules.identity.oidc import GoogleOIDCClient
 
 @dataclass(frozen=True, slots=True)
 class Principal:
-    id: UUID
+    subject_id: UUID
     organization_id: UUID
     email: str
     role: UserRole
     session_id: UUID
     csrf_hash: str
+
+    @property
+    def id(self) -> UUID:
+        """Compatibility alias for Task 3 consumers; new code uses subject_id."""
+
+        return self.subject_id
 
     def organization_filter(
         self,
@@ -32,7 +38,7 @@ class Principal:
         return organization_id == self.organization_id
 
     def subject_filter(self, subject_id: InstrumentedAttribute[UUID]) -> ColumnElement[bool]:
-        return subject_id == self.id
+        return subject_id == self.subject_id
 
 
 async def get_db_session() -> AsyncIterator[AsyncSession]:
@@ -78,7 +84,7 @@ async def require_staff_session(
 
     session_record, staff_user = row
     return Principal(
-        id=staff_user.id,
+        subject_id=staff_user.id,
         organization_id=staff_user.organization_id,
         email=staff_user.email,
         role=staff_user.role,

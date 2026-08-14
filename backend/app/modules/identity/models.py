@@ -56,6 +56,11 @@ class StaffUser(Base):
             "oidc_subject",
             name="uq_staff_users_organization_oidc_subject",
         ),
+        UniqueConstraint(
+            "organization_id",
+            "id",
+            name="uq_staff_users_organization_id_id",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(

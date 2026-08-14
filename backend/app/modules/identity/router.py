@@ -94,7 +94,7 @@ async def callback(
 @router.get("/me")
 async def me(principal: Principal = Depends(require_staff_session)) -> dict[str, str]:
     return {
-        "id": str(principal.id),
+        "id": str(principal.subject_id),
         "organization_id": str(principal.organization_id),
         "email": principal.email,
         "role": principal.role.value,

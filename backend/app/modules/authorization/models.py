@@ -1,6 +1,14 @@
 from uuid import UUID, uuid4
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, String, UniqueConstraint, text
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -18,6 +26,12 @@ class ResourceGrant(Base):
             "resource_type",
             "resource_id",
             name="uq_resource_grants_subject_resource",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "subject_id"],
+            ["staff_users.organization_id", "staff_users.id"],
+            name="fk_resource_grants_organization_subject",
+            ondelete="CASCADE",
         ),
         Index(
             "ix_resource_grants_subject_lookup",
@@ -41,7 +55,6 @@ class ResourceGrant(Base):
     )
     subject_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
-        ForeignKey("staff_users.id", ondelete="CASCADE"),
         nullable=False,
     )
     resource_type: Mapped[str] = mapped_column(String(100), nullable=False)
