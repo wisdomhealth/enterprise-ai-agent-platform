@@ -4,7 +4,7 @@ from hashlib import sha256
 from secrets import token_urlsafe
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.identity.models import StaffSession, StaffUser, UserStatus
@@ -44,11 +44,33 @@ class IdentityService:
         if staff_user.oidc_subject is not None and staff_user.oidc_subject != identity.subject:
             raise AdmissionDenied
 
-        staff_user.oidc_subject = identity.subject
-        if staff_user.status is UserStatus.INVITED:
-            staff_user.status = UserStatus.ACTIVE
+        updated_users = (
+            await self._db_session.scalars(
+                update(StaffUser)
+                .where(
+                    StaffUser.id == staff_user.id,
+                    StaffUser.email == identity.email,
+                    StaffUser.status.in_([UserStatus.INVITED, UserStatus.ACTIVE]),
+                    or_(
+                        StaffUser.oidc_subject.is_(None),
+                        StaffUser.oidc_subject == identity.subject,
+                    ),
+                )
+                .values(
+                    oidc_subject=identity.subject,
+                    status=UserStatus.ACTIVE,
+                )
+                .returning(StaffUser)
+            )
+        ).all()
+        if len(updated_users) != 1:
+            raise AdmissionDenied
+
+        admitted_user = updated_users[0]
+        admitted_user.oidc_subject = identity.subject
+        admitted_user.status = UserStatus.ACTIVE
         await self._db_session.flush()
-        return staff_user
+        return admitted_user
 
     async def create_session(
         self,

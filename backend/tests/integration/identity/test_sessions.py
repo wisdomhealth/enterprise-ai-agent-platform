@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -6,8 +7,13 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker as create_async_sessionmaker
+from sqlalchemy.pool import NullPool
 
+from app.core.config import Settings
+from app.core.database import engine
 from app.main import create_app
 from app.modules.identity.dependencies import get_db_session, get_oidc_client
 from app.modules.identity.models import (
@@ -18,11 +24,14 @@ from app.modules.identity.models import (
     UserStatus,
 )
 from app.modules.identity.oidc import OIDCIdentity
+from app.modules.identity.service import AdmissionDenied, IdentityService
 
 
 @pytest.fixture
 def app(db_session: AsyncSession) -> FastAPI:
-    application = create_app()
+    application = create_app(
+        Settings.model_validate({"SESSION_SECRET": "test-only-oidc-flow-secret"})
+    )
 
     async def override_db_session() -> AsyncIterator[AsyncSession]:
         yield db_session
@@ -211,3 +220,115 @@ async def test_callback_sets_secure_opaque_session_for_invited_staff(
     client.cookies.set("staff_session", session_cookie)
     me = await client.get("/api/v1/auth/me")
     assert me.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_callback_without_oidc_flow_session_storage_returns_503(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.delenv("SESSION_SECRET", raising=False)
+    application = create_app(Settings())
+
+    async def override_db_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    class FakeOIDCClient:
+        async def identity_from_callback(self, _request):
+            return OIDCIdentity(
+                subject="google-subject-without-flow-session",
+                email="not-admitted@example.com",
+                email_verified=True,
+            )
+
+    application.dependency_overrides[get_db_session] = override_db_session
+    application.dependency_overrides[get_oidc_client] = lambda: FakeOIDCClient()
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://testserver",
+    ) as no_session_client:
+        response = await no_session_client.get("/api/v1/auth/callback")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "OIDC flow session storage is not configured"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_logins_cannot_replace_stable_subject_or_create_two_sessions():
+    independent_engine = create_async_engine(engine.url, poolclass=NullPool)
+    sessionmaker = create_async_sessionmaker(independent_engine, expire_on_commit=False)
+    organization_id = None
+    try:
+        async with sessionmaker() as setup_session:
+            organization = Organization(name="Concurrent OIDC Admission")
+            setup_session.add(organization)
+            await setup_session.flush()
+            invited = StaffUser(
+                organization_id=organization.id,
+                oidc_subject=None,
+                email="concurrent-invite@example.com",
+                role=UserRole.REVIEWER,
+                status=UserStatus.INVITED,
+            )
+            setup_session.add(invited)
+            await setup_session.commit()
+            organization_id = organization.id
+
+        start = asyncio.Event()
+
+        async def attempt_login(subject: str) -> bool:
+            async with sessionmaker() as login_session:
+                await start.wait()
+                service = IdentityService(login_session)
+                try:
+                    admitted = await service.admit(
+                        OIDCIdentity(
+                            subject=subject,
+                            email="concurrent-invite@example.com",
+                            email_verified=True,
+                        )
+                    )
+                    await service.create_session(admitted, ttl_seconds=3_600)
+                    await login_session.commit()
+                except AdmissionDenied:
+                    await login_session.rollback()
+                    return False
+                return True
+
+        attempts = [
+            asyncio.create_task(attempt_login("google-subject-concurrent-a")),
+            asyncio.create_task(attempt_login("google-subject-concurrent-b")),
+        ]
+        await asyncio.sleep(0)
+        start.set()
+        outcomes = await asyncio.gather(*attempts)
+
+        async with sessionmaker() as verification_session:
+            stored_subject = await verification_session.scalar(
+                select(StaffUser.oidc_subject).where(
+                    StaffUser.email == "concurrent-invite@example.com"
+                )
+            )
+            session_count = await verification_session.scalar(
+                select(func.count(StaffSession.id)).join(
+                    StaffUser,
+                    StaffUser.id == StaffSession.user_id,
+                ).where(StaffUser.email == "concurrent-invite@example.com")
+            )
+
+        assert outcomes.count(True) == 1
+        assert outcomes.count(False) == 1
+        assert stored_subject in {
+            "google-subject-concurrent-a",
+            "google-subject-concurrent-b",
+        }
+        assert session_count == 1
+    finally:
+        if organization_id is not None:
+            async with sessionmaker() as cleanup_session:
+                await cleanup_session.execute(
+                    delete(Organization).where(Organization.id == organization_id)
+                )
+                await cleanup_session.commit()
+        await independent_engine.dispose()

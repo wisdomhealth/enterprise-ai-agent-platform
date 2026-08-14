@@ -49,6 +49,11 @@ async def callback(
     db_session: AsyncSession = Depends(get_db_session),
     oidc_client: GoogleOIDCClient = Depends(get_oidc_client),
 ) -> Response:
+    if "session" not in request.scope:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OIDC flow session storage is not configured",
+        )
     try:
         identity = await oidc_client.identity_from_callback(request)
         service = IdentityService(db_session)

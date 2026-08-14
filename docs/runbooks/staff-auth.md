@@ -48,6 +48,20 @@ login endpoint responds with `503` rather than inventing a fallback credential.
   subject; verify the invitation and Google account before any deliberate administrative repair.
 - Apply migrations through `0002_identity_sessions` before enabling the routes.
 
+### Downgrading revision 0002
+
+Revision `0001` requires every `staff_users.oidc_subject` value to be non-null, so migration `0002`
+refuses to downgrade while any unbound invitation exists. The refusal happens before the session
+table is dropped and leaves both the schema revision and identity data unchanged. It never invents
+a subject and never deletes an invitation.
+
+The safest response is to remain on `0002`. If rollback is operationally mandatory, first back up
+the database and resolve every unbound invitation through an authorized process: let the intended
+user complete verified Google login so the stable subject is bound, or explicitly cancel/archive
+an invalid invitation according to the organization's retention policy. Confirm there are no
+`staff_users` rows with a null `oidc_subject`, then retry the downgrade. Do not populate placeholder
+subjects merely to bypass the guard.
+
 ## Local verification limitation
 
 Automated tests inject a fake OIDC client and validated claims. They verify admission, cookie,
