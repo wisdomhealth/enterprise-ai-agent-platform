@@ -68,6 +68,27 @@ def _client_credentials(settings: Settings, kind: ConnectorKind) -> tuple[str, s
     return client_id.get_secret_value(), client_secret.get_secret_value()
 
 
+def _require_same_origin_oauth_start(request: Request) -> None:
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site in {"cross-site", "none", "same-site"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="cross-site OAuth start denied"
+        )
+    supplied_origin = request.headers.get("origin")
+    if supplied_origin is None:
+        return
+    settings: Settings = request.app.state.settings
+    expected_origin = (
+        str(settings.public_base_url).rstrip("/")
+        if settings.public_base_url is not None
+        else str(request.base_url).rstrip("/")
+    )
+    if supplied_origin.rstrip("/") != expected_origin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="cross-origin OAuth start denied"
+        )
+
+
 async def _exchange_code(
     *, code: str, client_id: str, client_secret: str, redirect_uri: str
 ) -> str:
@@ -99,9 +120,11 @@ async def authorize(
     kind: ConnectorKind,
     request: Request,
     principal: Principal = Depends(require_staff_session),
+    db_session: AsyncSession = Depends(get_db_session),
     service: ConnectorService = Depends(_connector_service),
 ) -> RedirectResponse:
-    service.require_admin(principal)
+    _require_same_origin_oauth_start(request)
+    await service.require_authorization_start(db_session, principal=principal, kind=kind)
     if "session" not in request.scope:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     client_id, _ = _client_credentials(request.app.state.settings, kind)
@@ -133,7 +156,6 @@ async def callback(
     db_session: AsyncSession = Depends(get_db_session),
     service: ConnectorService = Depends(_connector_service),
 ) -> ConnectorRead:
-    service.require_admin(principal)
     expected = request.session.pop("connector_oauth", None) if "session" in request.scope else None
     if (
         not isinstance(expected, dict)

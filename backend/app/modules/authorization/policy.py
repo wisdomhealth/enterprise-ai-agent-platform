@@ -19,6 +19,9 @@ ROLE_ACTIONS: Final = MappingProxyType(
     {
         UserRole.ADMIN: frozenset(
             {
+                "connector.create",
+                "connector.reauthorize",
+                "connector.revoke",
                 "knowledge.read",
                 "knowledge.write",
                 "knowledge.review",
@@ -32,6 +35,9 @@ ROLE_ACTIONS: Final = MappingProxyType(
 
 ACTION_STATES: Final = MappingProxyType(
     {
+        "connector.create": frozenset({ResourceState.ACTIVE}),
+        "connector.reauthorize": frozenset({ResourceState.REAUTH_REQUIRED, ResourceState.ERROR}),
+        "connector.revoke": frozenset({ResourceState.ACTIVE}),
         "knowledge.read": frozenset(
             {ResourceState.DRAFT, ResourceState.ACTIVE, ResourceState.ARCHIVED}
         ),

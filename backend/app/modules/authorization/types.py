@@ -4,12 +4,15 @@ from typing import Literal
 from uuid import UUID
 
 type Action = Literal[
+    "connector.create",
+    "connector.reauthorize",
+    "connector.revoke",
     "knowledge.read",
     "knowledge.write",
     "knowledge.review",
     "knowledge.publish",
 ]
-type ResourceType = Literal["knowledge"]
+type ResourceType = Literal["connector", "knowledge"]
 
 
 class ResourceState(StrEnum):
@@ -17,6 +20,8 @@ class ResourceState(StrEnum):
     ACTIVE = "ACTIVE"
     ARCHIVED = "ARCHIVED"
     DISABLED = "DISABLED"
+    ERROR = "ERROR"
+    REAUTH_REQUIRED = "REAUTH_REQUIRED"
 
 
 @dataclass(frozen=True, slots=True)
