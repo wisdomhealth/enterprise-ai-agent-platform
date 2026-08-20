@@ -84,3 +84,15 @@ def test_cross_site_authorize_is_rejected_before_starting_flow() -> None:
 
     assert response.status_code == 403
     assert probe.calls == 0
+
+
+def test_authorize_without_fetch_metadata_or_origin_is_rejected() -> None:
+    probe = ConnectorServiceProbe()
+    with TestClient(_app(probe)) as client:
+        response = client.get(
+            "/api/v1/admin/connectors/DRIVE/authorize",
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 403
+    assert probe.calls == 0

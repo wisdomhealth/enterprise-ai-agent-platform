@@ -70,13 +70,17 @@ def _client_credentials(settings: Settings, kind: ConnectorKind) -> tuple[str, s
 
 def _require_same_origin_oauth_start(request: Request) -> None:
     fetch_site = request.headers.get("sec-fetch-site")
+    supplied_origin = request.headers.get("origin")
     if fetch_site in {"cross-site", "none", "same-site"}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="cross-site OAuth start denied"
         )
-    supplied_origin = request.headers.get("origin")
-    if supplied_origin is None:
+    if fetch_site == "same-origin":
         return
+    if supplied_origin is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="unproven OAuth start origin denied"
+        )
     settings: Settings = request.app.state.settings
     expected_origin = (
         str(settings.public_base_url).rstrip("/")
