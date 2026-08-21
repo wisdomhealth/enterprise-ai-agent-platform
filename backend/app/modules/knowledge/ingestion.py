@@ -1,23 +1,57 @@
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from hashlib import sha256
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.jobs.models import JobIntent
 from app.modules.knowledge.chunking import DeterministicChunker
+from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import (
     Document,
     DocumentChunk,
     DocumentVersion,
     DocumentVersionState,
+    DriveSource,
 )
 from app.modules.knowledge.parsers import DocumentParseError, DocumentParser, PdfParser, WordParser
+from app.modules.knowledge.service import KnowledgeSourceService
 
 
 class DocumentIngestionService:
     def __init__(
-        self, db_session: AsyncSession, *, chunker: DeterministicChunker | None = None
+        self,
+        db_session: AsyncSession,
+        *,
+        chunker: DeterministicChunker | None = None,
+        knowledge_source_service: KnowledgeSourceService | None = None,
     ) -> None:
         self._db_session = db_session
         self._chunker = chunker or DeterministicChunker()
+        self._knowledge_source_service = knowledge_source_service
+
+    async def parse(self, job_id: UUID) -> DocumentVersion:
+        """Parse one durable job through the existing authorized Drive download boundary."""
+        if self._knowledge_source_service is None:
+            raise RuntimeError("an authorized knowledge source service is required")
+        job = await self._db_session.get(JobIntent, job_id)
+        if job is None or job.kind != "knowledge.document.parse":
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        document_id = self._document_id_from_payload(job.payload)
+        document = await self._db_session.get(Document, document_id)
+        if document is None:
+            raise DocumentParseError("DOCUMENT_NOT_FOUND")
+        source = await self._db_session.get(DriveSource, document.source_id)
+        if source is None or source.organization_id != document.organization_id:
+            raise DocumentParseError("DOCUMENT_SOURCE_NOT_FOUND")
+        drive_file = self._drive_file_from_payload(job.payload)
+        content = await self._knowledge_source_service.download_authorized(
+            self._db_session,
+            source=source,
+            file=drive_file,
+        )
+        return await self.parse_bytes(document, content, drive_file.mime_type)
 
     async def parse_bytes(
         self,
@@ -80,3 +114,57 @@ class DocumentIngestionService:
         if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             return WordParser()
         raise DocumentParseError("UNSUPPORTED_DOCUMENT_TYPE")
+
+    @staticmethod
+    def _document_id_from_payload(payload: Mapping[str, object]) -> UUID:
+        raw_document_id = payload.get("document_id")
+        if not isinstance(raw_document_id, str):
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        try:
+            return UUID(raw_document_id)
+        except ValueError as exc:
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB") from exc
+
+    @staticmethod
+    def _drive_file_from_payload(payload: Mapping[str, object]) -> DriveFile:
+        raw_file = payload.get("drive_file")
+        if not isinstance(raw_file, Mapping):
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        file_id = raw_file.get("id")
+        name = raw_file.get("name")
+        mime_type = raw_file.get("mime_type")
+        parent_ids = raw_file.get("parent_ids")
+        if (
+            not isinstance(file_id, str)
+            or not isinstance(name, str)
+            or not isinstance(mime_type, str)
+            or not isinstance(parent_ids, list)
+            or not all(isinstance(parent_id, str) for parent_id in parent_ids)
+        ):
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        raw_modified_time = raw_file.get("modified_time")
+        modified_time: datetime | None = None
+        if raw_modified_time is not None:
+            if not isinstance(raw_modified_time, str):
+                raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+            try:
+                modified_time = datetime.fromisoformat(raw_modified_time.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB") from exc
+            if modified_time.tzinfo is None:
+                modified_time = modified_time.replace(tzinfo=UTC)
+        raw_link = raw_file.get("web_view_link")
+        removed = raw_file.get("removed")
+        if (raw_link is not None and not isinstance(raw_link, str)) or not isinstance(
+            removed, bool
+        ):
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        return DriveFile(
+            id=file_id,
+            name=name,
+            mime_type=mime_type,
+            modified_time=modified_time,
+            parent_ids=tuple(parent_ids),
+            web_view_link=raw_link,
+            removed=removed,
+        )
