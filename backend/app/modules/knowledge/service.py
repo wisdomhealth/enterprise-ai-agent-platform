@@ -4,18 +4,29 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.audit.service import AuditService
 from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
 from app.modules.authorization.types import ResourceRef, ResourceState
+from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
+from app.modules.connectors.service import ConnectorService
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
-from app.modules.knowledge.drive_gateway import DriveFile, DriveGateway
+from app.modules.knowledge.drive_gateway import DriveConnection, DriveFile, DriveGatewayFactory
 from app.modules.knowledge.models import DriveSource, DriveSourceStatus, KnowledgeBase
 from app.modules.knowledge.scope import DriveScope
 
 
 class KnowledgeSourceService:
-    def __init__(self, drive_gateway: DriveGateway) -> None:
-        self._drive_gateway = drive_gateway
+    def __init__(
+        self,
+        connector_service: ConnectorService,
+        drive_gateway_factory: DriveGatewayFactory,
+        *,
+        audit_service: AuditService | None = None,
+    ) -> None:
+        self._connector_service = connector_service
+        self._drive_gateway_factory = drive_gateway_factory
+        self._audit_service = audit_service or AuditService()
 
     @staticmethod
     def configuration_resource_id(organization_id: UUID) -> UUID:
@@ -27,15 +38,15 @@ class KnowledgeSourceService:
         *,
         principal: Principal,
         root_folder_id: str,
-        connection_identity: str,
         include_descendants: bool = True,
     ) -> DriveSource:
         if principal.role is not UserRole.ADMIN:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
         await self._require_configuration_authorization(db_session, principal)
 
+        drive_connection = await self._load_drive_connection(db_session, principal.organization_id)
         descendant_ids = (
-            await self._drive_gateway.resolve_descendant_folder_ids(root_folder_id)
+            await drive_connection.gateway.resolve_descendant_folder_ids(root_folder_id)
             if include_descendants
             else set()
         )
@@ -58,7 +69,7 @@ class KnowledgeSourceService:
                 include_descendants=include_descendants,
                 allowed_descendant_ids=sorted(descendant_ids),
                 status=DriveSourceStatus.ACTIVE,
-                connection_identity=connection_identity,
+                connection_identity=drive_connection.connection_identity,
             )
             db_session.add(source)
         else:
@@ -66,9 +77,35 @@ class KnowledgeSourceService:
             source.include_descendants = include_descendants
             source.allowed_descendant_ids = sorted(descendant_ids)
             source.status = DriveSourceStatus.ACTIVE
-            source.connection_identity = connection_identity
+            source.connection_identity = drive_connection.connection_identity
         await db_session.flush()
+        await self._audit_service.record(
+            db_session,
+            principal,
+            action="knowledge.drive_source.configure",
+            object_type="drive_source",
+            object_id=source.id,
+            outcome="SUCCESS",
+            details={"include_descendants": include_descendants},
+            safe_detail_keys=("include_descendants",),
+        )
         return source
+
+    async def download_authorized(
+        self, db_session: AsyncSession, *, source: DriveSource, file: DriveFile
+    ) -> bytes:
+        current_source = await db_session.scalar(
+            select(DriveSource).where(
+                DriveSource.id == source.id,
+                DriveSource.organization_id == source.organization_id,
+            )
+        )
+        if current_source is None or not self.is_file_authorized(current_source, file):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+        drive_connection = await self._load_drive_connection(
+            db_session, current_source.organization_id
+        )
+        return await drive_connection.gateway.download(file.id)
 
     @staticmethod
     def is_file_authorized(source: DriveSource, file: DriveFile) -> bool:
@@ -92,3 +129,21 @@ class KnowledgeSourceService:
             await AuthorizationService(db_session).require(principal, "knowledge.write", resource)
         except AuthorizationDenied as exc:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from exc
+
+    async def _load_drive_connection(
+        self, db_session: AsyncSession, organization_id: UUID
+    ) -> DriveConnection:
+        connector = await db_session.scalar(
+            select(Connector).where(
+                Connector.organization_id == organization_id,
+                Connector.kind == ConnectorKind.DRIVE,
+                Connector.status == ConnectorStatus.ACTIVE,
+            )
+        )
+        if connector is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="an active Google Drive connector is required",
+            )
+        refresh_token = await self._connector_service.load_refresh_token(db_session, connector)
+        return await self._drive_gateway_factory.create(refresh_token=refresh_token)

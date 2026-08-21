@@ -20,7 +20,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.celery = create_celery(settings)
     app.state.google_oidc_client = None
     app.state.connector_service = ConnectorService.from_settings(settings)
-    app.state.drive_gateway = None
+    app.state.drive_gateway_factory = None
 
     if settings.session_secret is not None:
         app.add_middleware(

@@ -27,6 +27,18 @@ class DriveReadClient(Protocol):
     def resolve_descendant_folder_ids(self, root_folder_id: str) -> Awaitable[set[str]]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class DriveConnection:
+    gateway: "DriveGateway"
+    connection_identity: str
+
+
+class DriveGatewayFactory(Protocol):
+    """Creates a readonly Drive gateway from an encrypted connector credential."""
+
+    def create(self, *, refresh_token: str) -> Awaitable[DriveConnection]: ...
+
+
 class DriveGateway:
     """Narrow gateway for a Google Drive credential with readonly OAuth scope only."""
 

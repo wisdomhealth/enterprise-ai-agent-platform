@@ -1,19 +1,46 @@
+from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
 
+from app.modules.audit.models import AuditEvent
 from app.modules.authorization.models import ResourceGrant
+from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
+from app.modules.connectors.service import ConnectorService
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffUser, UserRole, UserStatus
-from app.modules.knowledge.drive_gateway import DriveFile, DriveGateway
+from app.modules.knowledge.drive_gateway import DriveConnection, DriveFile, DriveGateway
 from app.modules.knowledge.service import KnowledgeSourceService
 
 
 class FakeDriveGateway(DriveGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.download_calls: list[str] = []
+
     async def resolve_descendant_folder_ids(self, root_folder_id: str) -> set[str]:
         assert root_folder_id == "approved-root"
         return {"approved-child"}
+
+    async def download(self, file_id: str) -> bytes:
+        self.download_calls.append(file_id)
+        return b"authorized content"
+
+
+class FakeDriveGatewayFactory:
+    def __init__(self, gateway: FakeDriveGateway) -> None:
+        self._gateway = gateway
+        self.refresh_tokens: list[str] = []
+
+    async def create(self, *, refresh_token: str) -> DriveConnection:
+        self.refresh_tokens.append(refresh_token)
+        return DriveConnection(
+            gateway=self._gateway,
+            connection_identity="knowledge-reader@example.test",
+        )
 
 
 async def _principal_for(
@@ -38,9 +65,45 @@ async def _principal_for(
     )
 
 
+async def _drive_connector_service(
+    db_session, organization: Organization, tmp_path: Path
+) -> ConnectorService:
+    key_path = tmp_path / "connector-master-key"
+    key_path.write_bytes(b"k" * 32)
+    connector_service = ConnectorService.for_file_key(key_path, app_env="development")
+    secret = await connector_service.store_refresh_token(
+        db_session, organization_id=organization.id, refresh_token="test-only-refresh-token"
+    )
+    db_session.add(
+        Connector(
+            organization_id=organization.id,
+            kind=ConnectorKind.DRIVE,
+            status=ConnectorStatus.ACTIVE,
+            secret_id=secret.id,
+        )
+    )
+    await db_session.flush()
+    return connector_service
+
+
+async def _configuration_grant(
+    db_session, principal: Principal, service: KnowledgeSourceService
+) -> None:
+    db_session.add(
+        ResourceGrant(
+            organization_id=principal.organization_id,
+            subject_id=principal.subject_id,
+            resource_type="knowledge",
+            resource_id=service.configuration_resource_id(principal.organization_id),
+            actions=["knowledge.write"],
+        )
+    )
+    await db_session.flush()
+
+
 @pytest.mark.asyncio
-async def test_only_admin_with_knowledge_write_grant_can_configure_drive_root(
-    db_session,
+async def test_admin_configuration_uses_connector_identity_and_writes_safe_audit_event(
+    db_session, tmp_path
 ) -> None:
     organization = Organization(name="Knowledge source owner")
     db_session.add(organization)
@@ -48,34 +111,38 @@ async def test_only_admin_with_knowledge_write_grant_can_configure_drive_root(
     principal = await _principal_for(
         db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
     )
-    service = KnowledgeSourceService(FakeDriveGateway())
-    resource_id = service.configuration_resource_id(organization.id)
-    db_session.add(
-        ResourceGrant(
-            organization_id=organization.id,
-            subject_id=principal.subject_id,
-            resource_type="knowledge",
-            resource_id=resource_id,
-            actions=["knowledge.write"],
-        )
-    )
-    await db_session.flush()
+    connector_service = await _drive_connector_service(db_session, organization, tmp_path)
+    gateway = FakeDriveGateway()
+    factory = FakeDriveGatewayFactory(gateway)
+    service = KnowledgeSourceService(connector_service, factory)
+    await _configuration_grant(db_session, principal, service)
 
     source = await service.configure_drive_source(
         db_session,
         principal=principal,
         root_folder_id="approved-root",
-        connection_identity="knowledge-reader@example.test",
     )
 
+    audit_event = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.object_id == source.id,
+            AuditEvent.action == "knowledge.drive_source.configure",
+        )
+    )
     assert source.organization_id == organization.id
     assert source.root_folder_id == "approved-root"
     assert source.allowed_descendant_ids == ["approved-child"]
+    assert source.connection_identity == "knowledge-reader@example.test"
+    assert factory.refresh_tokens == ["test-only-refresh-token"]
+    assert audit_event is not None
+    assert audit_event.organization_id == organization.id
+    assert audit_event.actor_id == principal.subject_id
+    assert audit_event.details == {"include_descendants": True}
 
 
 @pytest.mark.asyncio
 async def test_member_cannot_configure_drive_root_even_with_knowledge_write_grant(
-    db_session,
+    db_session, tmp_path
 ) -> None:
     organization = Organization(name="Knowledge source member")
     db_session.add(organization)
@@ -83,62 +150,82 @@ async def test_member_cannot_configure_drive_root_even_with_knowledge_write_gran
     principal = await _principal_for(
         db_session, organization, role=UserRole.MEMBER, email="member@example.test"
     )
-    service = KnowledgeSourceService(FakeDriveGateway())
-    db_session.add(
-        ResourceGrant(
-            organization_id=organization.id,
-            subject_id=principal.subject_id,
-            resource_type="knowledge",
-            resource_id=service.configuration_resource_id(organization.id),
-            actions=["knowledge.write"],
-        )
-    )
-    await db_session.flush()
+    connector_service = await _drive_connector_service(db_session, organization, tmp_path)
+    service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(FakeDriveGateway()))
+    await _configuration_grant(db_session, principal, service)
 
     with pytest.raises(HTTPException) as error:
         await service.configure_drive_source(
             db_session,
             principal=principal,
             root_folder_id="approved-root",
-            connection_identity="knowledge-reader@example.test",
         )
 
     assert error.value.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_gateway_download_is_blocked_outside_configured_drive_scope(db_session) -> None:
+async def test_out_of_scope_file_never_reaches_drive_download(db_session, tmp_path) -> None:
     organization = Organization(name="Knowledge scope enforcement")
     db_session.add(organization)
     await db_session.flush()
     principal = await _principal_for(
         db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
     )
-    service = KnowledgeSourceService(FakeDriveGateway())
-    db_session.add(
-        ResourceGrant(
-            organization_id=organization.id,
-            subject_id=principal.subject_id,
-            resource_type="knowledge",
-            resource_id=service.configuration_resource_id(organization.id),
-            actions=["knowledge.write"],
-        )
-    )
-    await db_session.flush()
+    connector_service = await _drive_connector_service(db_session, organization, tmp_path)
+    gateway = FakeDriveGateway()
+    service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(gateway))
+    await _configuration_grant(db_session, principal, service)
     source = await service.configure_drive_source(
         db_session,
         principal=principal,
         root_folder_id="approved-root",
-        connection_identity="knowledge-reader@example.test",
     )
     foreign_file = DriveFile(
         id="outside-file",
         name="private.docx",
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        modified_time=None,
+        modified_time=datetime.now(UTC),
         parent_ids=("private-root",),
         web_view_link=None,
         removed=False,
     )
 
-    assert service.is_file_authorized(source, foreign_file) is False
+    with pytest.raises(HTTPException) as error:
+        await service.download_authorized(db_session, source=source, file=foreign_file)
+
+    assert error.value.status_code == 403
+    assert gateway.download_calls == []
+
+
+@pytest.mark.asyncio
+async def test_active_source_downloads_only_after_scope_authorization(db_session, tmp_path) -> None:
+    organization = Organization(name="Knowledge authorized download")
+    db_session.add(organization)
+    await db_session.flush()
+    principal = await _principal_for(
+        db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
+    )
+    connector_service = await _drive_connector_service(db_session, organization, tmp_path)
+    gateway = FakeDriveGateway()
+    service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(gateway))
+    await _configuration_grant(db_session, principal, service)
+    source = await service.configure_drive_source(
+        db_session,
+        principal=principal,
+        root_folder_id="approved-root",
+    )
+    authorized_file = DriveFile(
+        id="inside-file",
+        name="shared.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        modified_time=datetime.now(UTC),
+        parent_ids=("approved-child",),
+        web_view_link=None,
+        removed=False,
+    )
+
+    content = await service.download_authorized(db_session, source=source, file=authorized_file)
+
+    assert content == b"authorized content"
+    assert gateway.download_calls == ["inside-file"]

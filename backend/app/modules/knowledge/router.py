@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.connectors.service import ConnectorService
 from app.modules.identity.dependencies import Principal, get_db_session, require_staff_csrf
-from app.modules.knowledge.drive_gateway import DriveGateway
 from app.modules.knowledge.schemas import DriveSourceConfigure, DriveSourceRead
 from app.modules.knowledge.service import KnowledgeSourceService
 
@@ -10,13 +10,14 @@ router = APIRouter(prefix="/api/v1/admin/knowledge-sources", tags=["knowledge-so
 
 
 def _knowledge_source_service(request: Request) -> KnowledgeSourceService:
-    gateway = getattr(request.app.state, "drive_gateway", None)
-    if not isinstance(gateway, DriveGateway):
+    connector_service = getattr(request.app.state, "connector_service", None)
+    gateway_factory = getattr(request.app.state, "drive_gateway_factory", None)
+    if not isinstance(connector_service, ConnectorService) or gateway_factory is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Drive read-only gateway is not configured",
+            detail="Google Drive read-only connector is not configured",
         )
-    return KnowledgeSourceService(gateway)
+    return KnowledgeSourceService(connector_service, gateway_factory)
 
 
 @router.put("/drive", response_model=DriveSourceRead)
@@ -31,7 +32,6 @@ async def configure_drive_source(
         principal=principal,
         root_folder_id=payload.root_folder_id,
         include_descendants=payload.include_descendants,
-        connection_identity=payload.connection_identity,
     )
     await db_session.commit()
     return DriveSourceRead.model_validate(source)

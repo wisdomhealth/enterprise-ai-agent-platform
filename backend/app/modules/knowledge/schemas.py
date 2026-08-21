@@ -8,7 +8,6 @@ from app.modules.knowledge.models import DriveSourceStatus
 class DriveSourceConfigure(BaseModel):
     root_folder_id: str = Field(min_length=1, max_length=512)
     include_descendants: bool = True
-    connection_identity: str = Field(min_length=1, max_length=320)
 
 
 class DriveSourceRead(BaseModel):
