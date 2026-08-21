@@ -210,7 +210,14 @@ async def test_reconfiguration_audit_reconstructs_actual_old_and_new_safe_refere
         "after": second.details["connector_id"],
     }
     serialized = str(second.details).lower()
-    for forbidden in ("refresh", "access_token", "client_secret", "authorization"):
+    for forbidden in (
+        "refresh",
+        "access_token",
+        "token",
+        "client_secret",
+        "secret",
+        "authorization",
+    ):
         assert forbidden not in serialized
 
 
