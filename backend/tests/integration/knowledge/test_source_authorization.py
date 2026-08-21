@@ -137,7 +137,15 @@ async def test_admin_configuration_uses_connector_identity_and_writes_safe_audit
     assert audit_event is not None
     assert audit_event.organization_id == organization.id
     assert audit_event.actor_id == principal.subject_id
-    assert audit_event.details == {"include_descendants": True}
+    assert audit_event.details["connector_id"]
+    assert audit_event.details["root_folder_ref"]
+    assert audit_event.details["connection_identity_ref"]
+    assert audit_event.details["include_descendants"] is True
+    assert audit_event.details["changed_fields"]["root_folder_ref"]["before"] is None
+    assert audit_event.details["changed_fields"]["root_folder_ref"]["after"] == audit_event.details[
+        "root_folder_ref"
+    ]
+    assert "test-only-refresh-token" not in str(audit_event.details)
 
 
 @pytest.mark.asyncio
