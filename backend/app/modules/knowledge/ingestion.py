@@ -3,9 +3,11 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import UUID
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.jobs.models import JobIntent
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
+from app.modules.jobs.service import JobLeaseService
 from app.modules.knowledge.chunking import DeterministicChunker
 from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import (
@@ -26,32 +28,65 @@ class DocumentIngestionService:
         *,
         chunker: DeterministicChunker | None = None,
         knowledge_source_service: KnowledgeSourceService | None = None,
+        worker_id: str | None = None,
+        job_lease_seconds: int = 300,
     ) -> None:
         self._db_session = db_session
         self._chunker = chunker or DeterministicChunker()
         self._knowledge_source_service = knowledge_source_service
+        self._worker_id = worker_id
+        self._job_lease_seconds = job_lease_seconds
 
     async def parse(self, job_id: UUID) -> DocumentVersion:
         """Parse one durable job through the existing authorized Drive download boundary."""
         if self._knowledge_source_service is None:
             raise RuntimeError("an authorized knowledge source service is required")
-        job = await self._db_session.get(JobIntent, job_id)
-        if job is None or job.kind != "knowledge.document.parse":
+        if self._worker_id is None:
+            raise RuntimeError("a unique document parse worker identity is required")
+        lease_service = JobLeaseService(self._db_session)
+        job = await lease_service.claim(job_id, self._worker_id, self._job_lease_seconds)
+        if job is None:
+            return await self._completed_job_version_or_raise(job_id)
+        if job.kind != "knowledge.document.parse":
+            await self._fail_terminal(lease_service, job, "INVALID_DOCUMENT_PARSE_JOB")
             raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
-        document_id = self._document_id_from_payload(job.payload)
-        document = await self._db_session.get(Document, document_id)
-        if document is None:
-            raise DocumentParseError("DOCUMENT_NOT_FOUND")
-        source = await self._db_session.get(DriveSource, document.source_id)
-        if source is None or source.organization_id != document.organization_id:
-            raise DocumentParseError("DOCUMENT_SOURCE_NOT_FOUND")
-        drive_file = self._drive_file_from_payload(job.payload)
-        content = await self._knowledge_source_service.download_authorized(
-            self._db_session,
-            source=source,
-            file=drive_file,
-        )
-        return await self.parse_bytes(document, content, drive_file.mime_type)
+        try:
+            document_id = self._document_id_from_payload(job.payload)
+            document = await self._db_session.get(Document, document_id)
+            if document is None:
+                raise DocumentParseError("DOCUMENT_NOT_FOUND")
+            source = await self._db_session.get(DriveSource, document.source_id)
+            if source is None or source.organization_id != document.organization_id:
+                raise DocumentParseError("DOCUMENT_SOURCE_NOT_FOUND")
+            drive_file = self._drive_file_from_payload(job.payload)
+            if drive_file.id != document.external_id:
+                raise DocumentParseError("DOCUMENT_FILE_MISMATCH")
+            content = await self._knowledge_source_service.download_authorized(
+                self._db_session,
+                source=source,
+                file=drive_file,
+            )
+            version = await self.parse_bytes(document, content, drive_file.mime_type)
+            job.payload = {**job.payload, "document_version_id": str(version.id)}
+            await self._db_session.flush()
+            await lease_service.complete(job.id, self._worker_id)
+            return version
+        except (DocumentParseError, HTTPException) as exc:
+            error_code = (
+                exc.code
+                if isinstance(exc, DocumentParseError)
+                else "DOCUMENT_DOWNLOAD_FORBIDDEN"
+            )
+            await self._fail_terminal(lease_service, job, error_code)
+            raise
+        except Exception:
+            await lease_service.retry(
+                job.id,
+                self._worker_id,
+                error_code="DOCUMENT_PARSE_TRANSIENT_FAILURE",
+                error_class=ErrorClass.RETRYABLE,
+            )
+            raise
 
     async def parse_bytes(
         self,
@@ -167,4 +202,33 @@ class DocumentIngestionService:
             parent_ids=tuple(parent_ids),
             web_view_link=raw_link,
             removed=removed,
+        )
+
+    async def _completed_job_version_or_raise(self, job_id: UUID) -> DocumentVersion:
+        job = await self._db_session.get(JobIntent, job_id)
+        if job is None or job.state is not JobState.SUCCEEDED:
+            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
+        raw_version_id = job.payload.get("document_version_id")
+        if not isinstance(raw_version_id, str):
+            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
+        try:
+            version_id = UUID(raw_version_id)
+        except ValueError as exc:
+            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE") from exc
+        version = await self._db_session.get(DocumentVersion, version_id)
+        if version is None:
+            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
+        return version
+
+    async def _fail_terminal(
+        self,
+        lease_service: JobLeaseService,
+        job: JobIntent,
+        error_code: str,
+    ) -> None:
+        await lease_service.retry(
+            job.id,
+            self._worker_id or "",
+            error_code=error_code,
+            error_class=ErrorClass.NON_RETRYABLE,
         )

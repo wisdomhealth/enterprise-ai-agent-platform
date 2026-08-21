@@ -9,7 +9,8 @@ from sqlalchemy import select
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.models import Organization
-from app.modules.jobs.service import JobService
+from app.modules.jobs.models import JobState
+from app.modules.jobs.service import JobLeaseService, JobService
 from app.modules.knowledge.drive_gateway import DriveConnection, DriveGateway
 from app.modules.knowledge.ingestion import DocumentIngestionService
 from app.modules.knowledge.models import (
@@ -32,13 +33,16 @@ class FailingParser:
 
 
 class FakeDriveGateway(DriveGateway):
-    def __init__(self, content: bytes) -> None:
+    def __init__(self, content: bytes, *, error: Exception | None = None) -> None:
         super().__init__()
         self._content = content
+        self._error = error
         self.download_calls: list[str] = []
 
     async def download(self, file_id: str) -> bytes:
         self.download_calls.append(file_id)
+        if self._error is not None:
+            raise self._error
         return self._content
 
 
@@ -70,7 +74,7 @@ async def _document(db_session, *, current_is_retrievable: bool) -> Document:
         organization_id=organization.id,
         knowledge_base_id=knowledge_base.id,
         source_id=source.id,
-        external_id=f"drive-{uuid4()}",
+        external_id="drive-file-1",
         title="Customer policy",
         mime_type="application/pdf",
     )
@@ -89,7 +93,14 @@ async def _document(db_session, *, current_is_retrievable: bool) -> Document:
     return document
 
 
-async def _authorized_ingestion_service(db_session, document: Document, tmp_path: Path):
+async def _authorized_ingestion_service(
+    db_session,
+    document: Document,
+    tmp_path: Path,
+    *,
+    content: bytes | None = None,
+    download_error: Exception | None = None,
+):
     key_path = tmp_path / "connector-master-key"
     key_path.write_bytes(b"k" * 32)
     connector_service = ConnectorService.for_file_key(key_path, app_env="development")
@@ -107,13 +118,17 @@ async def _authorized_ingestion_service(db_session, document: Document, tmp_path
         )
     )
     await db_session.flush()
-    gateway = FakeDriveGateway((FIXTURE_DIRECTORY / "sample.pdf").read_bytes())
+    gateway = FakeDriveGateway(
+        content or (FIXTURE_DIRECTORY / "sample.pdf").read_bytes(),
+        error=download_error,
+    )
     source_service = KnowledgeSourceService(
         connector_service, FakeDriveGatewayFactory(gateway)
     )
     return DocumentIngestionService(
         db_session,
         knowledge_source_service=source_service,
+        worker_id="task-8-test-worker",
     ), gateway
 
 
@@ -193,9 +208,12 @@ async def test_parse_job_downloads_authorized_file_and_persists_processing_chunk
 
     version = await service.parse(job.id)
 
+    await db_session.refresh(job)
     assert gateway.download_calls == ["drive-file-1"]
     assert version.state is DocumentVersionState.PROCESSING
     assert document.current_version_id != version.id
+    assert job.state is JobState.SUCCEEDED
+    assert job.payload["document_version_id"] == str(version.id)
     chunks = (
         await db_session.scalars(
             select(DocumentChunk).where(DocumentChunk.document_version_id == version.id)
@@ -223,5 +241,124 @@ async def test_parse_job_rejects_unauthorized_file_before_drive_download(
     with pytest.raises(HTTPException) as error:
         await service.parse(job.id)
 
+    await db_session.refresh(job)
     assert error.value.status_code == 403
     assert gateway.download_calls == []
+    assert job.state is JobState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_parse_job_rejects_payload_file_id_that_does_not_match_document(
+    db_session, tmp_path
+) -> None:
+    document = await _document(db_session, current_is_retrievable=False)
+    service, gateway = await _authorized_ingestion_service(db_session, document, tmp_path)
+    mismatched_payload = _drive_file_payload(parent_id="source-root")
+    mismatched_payload["id"] = "unrelated-file"
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        "document-parse-mismatched-file",
+        {
+            "document_id": str(document.id),
+            "drive_file": mismatched_payload,
+        },
+    )
+
+    with pytest.raises(DocumentParseError) as error:
+        await service.parse(job.id)
+
+    await db_session.refresh(job)
+    assert error.value.code == "DOCUMENT_FILE_MISMATCH"
+    assert gateway.download_calls == []
+    assert job.state is JobState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_parse_job_marks_parser_failure_terminal(db_session, tmp_path) -> None:
+    document = await _document(db_session, current_is_retrievable=False)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    service, gateway = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        content=b"not-a-pdf",
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        "document-parse-invalid-pdf",
+        {
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+
+    with pytest.raises(DocumentParseError):
+        await service.parse(job.id)
+
+    await db_session.refresh(job)
+    assert gateway.download_calls == ["drive-file-1"]
+    assert job.state is JobState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_parse_job_does_not_duplicate_an_active_lease(db_session, tmp_path) -> None:
+    document = await _document(db_session, current_is_retrievable=False)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    service, gateway = await _authorized_ingestion_service(db_session, document, tmp_path)
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        "document-parse-duplicate-lease",
+        {
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+    claimed = await JobLeaseService(db_session).claim(job.id, "another-worker", lease_seconds=60)
+    assert claimed is not None
+
+    with pytest.raises(DocumentParseError) as error:
+        await service.parse(job.id)
+
+    await db_session.refresh(job)
+    assert error.value.code == "DOCUMENT_PARSE_JOB_UNAVAILABLE"
+    assert gateway.download_calls == []
+    assert job.state is JobState.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_parse_job_records_retryable_download_failure(db_session, tmp_path) -> None:
+    document = await _document(db_session, current_is_retrievable=False)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    service, gateway = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        download_error=RuntimeError("temporary Drive outage"),
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        "document-parse-retryable-download-failure",
+        {
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="temporary Drive outage"):
+        await service.parse(job.id)
+
+    await db_session.refresh(job)
+    assert gateway.download_calls == ["drive-file-1"]
+    assert job.state is JobState.PENDING
+    assert job.last_error_code == "DOCUMENT_PARSE_TRANSIENT_FAILURE"
+    assert job.next_attempt_at is not None
