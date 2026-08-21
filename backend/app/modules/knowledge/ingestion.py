@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
-from app.modules.jobs.service import JobLeaseService
+from app.modules.jobs.service import JobLeaseLost, JobLeaseService
 from app.modules.knowledge.chunking import DeterministicChunker
 from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import (
@@ -30,12 +30,14 @@ class DocumentIngestionService:
         knowledge_source_service: KnowledgeSourceService | None = None,
         worker_id: str | None = None,
         job_lease_seconds: int = 300,
+        job_lease_service: JobLeaseService | None = None,
     ) -> None:
         self._db_session = db_session
         self._chunker = chunker or DeterministicChunker()
         self._knowledge_source_service = knowledge_source_service
         self._worker_id = worker_id
         self._job_lease_seconds = job_lease_seconds
+        self._job_lease_service = job_lease_service
 
     async def parse(self, job_id: UUID) -> DocumentVersion:
         """Parse one durable job through the existing authorized Drive download boundary."""
@@ -43,7 +45,7 @@ class DocumentIngestionService:
             raise RuntimeError("an authorized knowledge source service is required")
         if self._worker_id is None:
             raise RuntimeError("a unique document parse worker identity is required")
-        lease_service = JobLeaseService(self._db_session)
+        lease_service = self._job_lease_service or JobLeaseService(self._db_session)
         job = await lease_service.claim(job_id, self._worker_id, self._job_lease_seconds)
         if job is None:
             return await self._completed_job_version_or_raise(job_id)
@@ -51,6 +53,10 @@ class DocumentIngestionService:
             await self._fail_terminal(lease_service, job, "INVALID_DOCUMENT_PARSE_JOB")
             raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
         try:
+            recovered_version = await self._persisted_processing_version(job)
+            if recovered_version is not None:
+                await lease_service.complete(job.id, self._worker_id)
+                return recovered_version
             document_id = self._document_id_from_payload(job.payload)
             document = await self._db_session.get(Document, document_id)
             if document is None:
@@ -71,6 +77,8 @@ class DocumentIngestionService:
             await self._db_session.flush()
             await lease_service.complete(job.id, self._worker_id)
             return version
+        except JobLeaseLost:
+            raise
         except (DocumentParseError, HTTPException) as exc:
             error_code = (
                 exc.code
@@ -208,16 +216,25 @@ class DocumentIngestionService:
         job = await self._db_session.get(JobIntent, job_id)
         if job is None or job.state is not JobState.SUCCEEDED:
             raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
+        version = await self._persisted_processing_version(job)
+        if version is None:
+            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
+        return version
+
+    async def _persisted_processing_version(self, job: JobIntent) -> DocumentVersion | None:
         raw_version_id = job.payload.get("document_version_id")
         if not isinstance(raw_version_id, str):
-            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
+            return None
         try:
             version_id = UUID(raw_version_id)
         except ValueError as exc:
-            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE") from exc
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB") from exc
         version = await self._db_session.get(DocumentVersion, version_id)
-        if version is None:
-            raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
+        if version is None or version.state is not DocumentVersionState.PROCESSING:
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        document_id = self._document_id_from_payload(job.payload)
+        if version.document_id != document_id:
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
         return version
 
     async def _fail_terminal(

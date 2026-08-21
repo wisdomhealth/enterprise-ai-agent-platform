@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,7 +10,7 @@ from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSta
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.models import Organization
 from app.modules.jobs.models import JobState
-from app.modules.jobs.service import JobLeaseService, JobService
+from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.knowledge.drive_gateway import DriveConnection, DriveGateway
 from app.modules.knowledge.ingestion import DocumentIngestionService
 from app.modules.knowledge.models import (
@@ -52,6 +52,18 @@ class FakeDriveGatewayFactory:
 
     async def create(self, *, refresh_token: str) -> DriveConnection:
         return DriveConnection(gateway=self._gateway, connection_identity="reader@example.test")
+
+
+class LeaseLostOnceService(JobLeaseService):
+    def __init__(self, db_session) -> None:
+        super().__init__(db_session)
+        self._lose_next_completion = True
+
+    async def complete(self, job_id, worker_id):  # type: ignore[no-untyped-def]
+        if self._lose_next_completion:
+            self._lose_next_completion = False
+            raise JobLeaseLost(job_id)
+        return await super().complete(job_id, worker_id)
 
 
 async def _document(db_session, *, current_is_retrievable: bool) -> Document:
@@ -100,6 +112,7 @@ async def _authorized_ingestion_service(
     *,
     content: bytes | None = None,
     download_error: Exception | None = None,
+    job_lease_service: JobLeaseService | None = None,
 ):
     key_path = tmp_path / "connector-master-key"
     key_path.write_bytes(b"k" * 32)
@@ -129,6 +142,7 @@ async def _authorized_ingestion_service(
         db_session,
         knowledge_source_service=source_service,
         worker_id="task-8-test-worker",
+        job_lease_service=job_lease_service,
     ), gateway
 
 
@@ -207,9 +221,11 @@ async def test_parse_job_downloads_authorized_file_and_persists_processing_chunk
     )
 
     version = await service.parse(job.id)
+    repeated_version = await service.parse(job.id)
 
     await db_session.refresh(job)
     assert gateway.download_calls == ["drive-file-1"]
+    assert repeated_version.id == version.id
     assert version.state is DocumentVersionState.PROCESSING
     assert document.current_version_id != version.id
     assert job.state is JobState.SUCCEEDED
@@ -362,3 +378,64 @@ async def test_parse_job_records_retryable_download_failure(db_session, tmp_path
     assert job.state is JobState.PENDING
     assert job.last_error_code == "DOCUMENT_PARSE_TRANSIENT_FAILURE"
     assert job.next_attempt_at is not None
+
+
+@pytest.mark.asyncio
+async def test_parse_job_recovers_after_completion_lease_loss_without_duplicate_ingestion(
+    db_session, tmp_path
+) -> None:
+    document = await _document(db_session, current_is_retrievable=False)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    lease_service = LeaseLostOnceService(db_session)
+    service, gateway = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        job_lease_service=lease_service,
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        "document-parse-completion-lease-loss",
+        {
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+
+    with pytest.raises(JobLeaseLost):
+        await service.parse(job.id)
+
+    await db_session.refresh(job)
+    version_id = job.payload["document_version_id"]
+    assert job.state is JobState.RUNNING
+    assert isinstance(version_id, str)
+    versions = (
+        await db_session.scalars(
+            select(DocumentVersion).where(DocumentVersion.document_id == document.id)
+        )
+    ).all()
+    assert len(versions) == 1
+    chunks_before = (
+        await db_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_version_id == versions[0].id)
+        )
+    ).all()
+    job.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    await db_session.flush()
+
+    recovered_version = await service.parse(job.id)
+
+    await db_session.refresh(job)
+    chunks_after = (
+        await db_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_version_id == versions[0].id)
+        )
+    ).all()
+    assert recovered_version.id == versions[0].id
+    assert str(recovered_version.id) == version_id
+    assert job.state is JobState.SUCCEEDED
+    assert gateway.download_calls == ["drive-file-1"]
+    assert len(chunks_after) == len(chunks_before)
