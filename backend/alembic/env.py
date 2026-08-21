@@ -14,6 +14,7 @@ from app.modules.connectors import models as connector_models  # noqa: F401
 from app.modules.identity import models  # noqa: F401
 from app.modules.idempotency import models as idempotency_models  # noqa: F401
 from app.modules.jobs import models as job_models  # noqa: F401
+from app.modules.knowledge import models as knowledge_models  # noqa: F401
 from app.modules.outbox import models as outbox_models  # noqa: F401
 
 config = context.config
