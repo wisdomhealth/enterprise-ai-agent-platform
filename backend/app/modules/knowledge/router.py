@@ -1,9 +1,17 @@
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.dependencies import Principal, get_db_session, require_staff_csrf
-from app.modules.knowledge.schemas import DriveSourceConfigure, DriveSourceRead
+from app.modules.knowledge.operations import DriveSyncOperations
+from app.modules.knowledge.schemas import (
+    DriveSourceConfigure,
+    DriveSourceRead,
+    DriveSyncEnqueued,
+    DriveSyncStatusRead,
+)
 from app.modules.knowledge.service import KnowledgeSourceService
 
 router = APIRouter(prefix="/api/v1/admin/knowledge-sources", tags=["knowledge-sources"])
@@ -18,6 +26,13 @@ def _knowledge_source_service(request: Request) -> KnowledgeSourceService:
             detail="Google Drive read-only connector is not configured",
         )
     return KnowledgeSourceService(connector_service, gateway_factory)
+
+
+def _drive_sync_operations(
+    db_session: AsyncSession = Depends(get_db_session),
+    service: KnowledgeSourceService = Depends(_knowledge_source_service),
+) -> DriveSyncOperations:
+    return DriveSyncOperations(db_session, service)
 
 
 @router.put("/drive", response_model=DriveSourceRead)
@@ -35,3 +50,38 @@ async def configure_drive_source(
     )
     await db_session.commit()
     return DriveSourceRead.model_validate(source)
+
+
+@router.post(
+    "/{source_id}/sync",
+    response_model=DriveSyncEnqueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def request_drive_sync(
+    source_id: UUID,
+    db_session: AsyncSession = Depends(get_db_session),
+    principal: Principal = Depends(require_staff_csrf),
+    operations: DriveSyncOperations = Depends(_drive_sync_operations),
+) -> DriveSyncEnqueued:
+    job = await operations.enqueue_sync(principal=principal, source_id=source_id)
+    await db_session.commit()
+    return DriveSyncEnqueued(job_id=job.id, state=job.state.value)
+
+
+@router.get("/{source_id}/status", response_model=DriveSyncStatusRead)
+async def drive_sync_status(
+    source_id: UUID,
+    principal: Principal = Depends(require_staff_csrf),
+    operations: DriveSyncOperations = Depends(_drive_sync_operations),
+) -> DriveSyncStatusRead:
+    sync_status = await operations.status(principal=principal, source_id=source_id)
+    return DriveSyncStatusRead(
+        source_id=sync_status.source_id,
+        cursor=sync_status.cursor,
+        source_status=sync_status.source_status,
+        last_success_at=sync_status.last_success_at,
+        backlog=sync_status.backlog,
+        isolated_files=sync_status.isolated_files,
+        retry_count=sync_status.retry_count,
+        recent_error_codes=sync_status.recent_error_codes,
+    )

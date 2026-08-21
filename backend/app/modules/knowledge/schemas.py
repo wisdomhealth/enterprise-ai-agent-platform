@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -21,3 +22,19 @@ class DriveSourceRead(BaseModel):
     sync_cursor: str | None
     status: DriveSourceStatus
     connection_identity: str
+
+
+class DriveSyncEnqueued(BaseModel):
+    job_id: UUID
+    state: str
+
+
+class DriveSyncStatusRead(BaseModel):
+    source_id: UUID
+    cursor: str | None
+    source_status: str
+    last_success_at: datetime | None
+    backlog: int
+    isolated_files: int
+    retry_count: int
+    recent_error_codes: list[str]

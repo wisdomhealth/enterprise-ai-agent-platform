@@ -14,5 +14,11 @@ def create_celery(settings: Settings | None = None) -> Celery:
         task_acks_late=True,
         task_reject_on_worker_lost=True,
         broker_connection_retry_on_startup=True,
+        beat_schedule={
+            "knowledge-drive-source-sync": {
+                "task": "app.modules.knowledge.tasks.drive_source_sync",
+                "schedule": 15 * 60,
+            }
+        },
     )
     return celery_app
