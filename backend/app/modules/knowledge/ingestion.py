@@ -4,6 +4,7 @@ from hashlib import sha256
 from uuid import UUID
 
 from fastapi import HTTPException
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
@@ -56,6 +57,7 @@ class DocumentIngestionService:
             recovered_version = await self._persisted_processing_version(job)
             if recovered_version is not None:
                 await lease_service.complete(job.id, self._worker_id)
+                await self._db_session.commit()
                 return recovered_version
             document_id = self._document_id_from_payload(job.payload)
             document = await self._db_session.get(Document, document_id)
@@ -73,11 +75,7 @@ class DocumentIngestionService:
                 file=drive_file,
             )
             version = await self.parse_bytes(document, content, drive_file.mime_type)
-            job.payload = {**job.payload, "document_version_id": str(version.id)}
-            await self._db_session.flush()
-            # The parsed PROCESSING outcome and its durable job association must survive a
-            # lease-loss failure during finalization so another worker can complete it.
-            await self._db_session.commit()
+            await self._commit_processing_checkpoint(job, version)
             await lease_service.complete(job.id, self._worker_id)
             await self._db_session.commit()
             return version
@@ -224,6 +222,34 @@ class DocumentIngestionService:
         if version is None:
             raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
         return version
+
+    async def _commit_processing_checkpoint(
+        self,
+        job: JobIntent,
+        version: DocumentVersion,
+    ) -> None:
+        job_id = job.id
+        claimed_job_version = job.version
+        checkpoint_payload = {**job.payload, "document_version_id": str(version.id)}
+        checkpointed_job_id = await self._db_session.scalar(
+            update(JobIntent)
+            .where(
+                JobIntent.id == job_id,
+                JobIntent.state == JobState.RUNNING,
+                JobIntent.lease_owner == self._worker_id,
+                JobIntent.version == claimed_job_version,
+            )
+            .values(payload=checkpoint_payload)
+            .returning(JobIntent.id)
+        )
+        if checkpointed_job_id is None:
+            await self._db_session.rollback()
+            raise JobLeaseLost(job_id)
+        # Claim and checkpoint share one transaction in the normal worker path. The
+        # owner/version fence prevents a worker whose committed claim was superseded
+        # from publishing, while allowing an expired-but-not-yet-reclaimed owner to
+        # persist work exactly once before a waiting reclaimer takes over.
+        await self._db_session.commit()
 
     async def _persisted_processing_version(self, job: JobIntent) -> DocumentVersion | None:
         raw_version_id = job.payload.get("document_version_id")

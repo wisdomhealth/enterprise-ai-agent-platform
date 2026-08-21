@@ -1,12 +1,15 @@
+import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.core.database import async_sessionmaker
+from app.core.database import async_sessionmaker, engine
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.models import Organization
@@ -22,10 +25,18 @@ from app.modules.knowledge.models import (
     DriveSource,
     KnowledgeBase,
 )
-from app.modules.knowledge.parsers import DocumentParseError
+from app.modules.knowledge.parsers import DocumentParseError, PdfParser
 from app.modules.knowledge.service import KnowledgeSourceService
 
 FIXTURE_DIRECTORY = Path("tests/fixtures/documents")
+
+
+@pytest_asyncio.fixture
+async def independent_sessions() -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        await engine.dispose()
 
 
 class FailingParser:
@@ -65,6 +76,59 @@ class LeaseLostOnceService(JobLeaseService):
             self._lose_next_completion = False
             raise JobLeaseLost(job_id)
         return await super().complete(job_id, worker_id)
+
+
+class CommitClaimLeaseService(JobLeaseService):
+    async def claim(self, job_id, worker_id, lease_seconds):  # type: ignore[no-untyped-def]
+        claimed = await super().claim(job_id, worker_id, lease_seconds)
+        await self._db_session.commit()
+        return claimed
+
+
+class BlockingDriveGateway(FakeDriveGateway):
+    def __init__(self, content: bytes) -> None:
+        super().__init__(content)
+        self.download_started = asyncio.Event()
+        self.release_download = asyncio.Event()
+
+    async def download(self, file_id: str) -> bytes:
+        self.download_calls.append(file_id)
+        self.download_started.set()
+        await self.release_download.wait()
+        return self._content
+
+
+class LeaseTransferDriveGateway(FakeDriveGateway):
+    def __init__(self, content: bytes, job_id) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(content)
+        self._job_id = job_id
+
+    async def download(self, file_id: str) -> bytes:
+        self.download_calls.append(file_id)
+        async with async_sessionmaker() as takeover_session:
+            await takeover_session.execute(
+                update(JobIntent)
+                .where(JobIntent.id == self._job_id)
+                .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            await takeover_session.commit()
+            claimed = await JobLeaseService(takeover_session).claim(
+                self._job_id,
+                "takeover-worker-b",
+                lease_seconds=60,
+            )
+            assert claimed is not None
+            await takeover_session.commit()
+        return self._content
+
+
+class CountingPdfParser:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def parse(self, content: bytes):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        return PdfParser().parse(content)
 
 
 async def _document(db_session, *, current_is_retrievable: bool) -> Document:
@@ -443,7 +507,9 @@ async def test_parse_job_recovers_after_completion_lease_loss_without_duplicate_
 
 
 @pytest.mark.asyncio
-async def test_parse_job_commits_processing_outcome_before_completion_lease_loss(tmp_path) -> None:
+async def test_parse_job_commits_processing_outcome_before_completion_lease_loss(
+    tmp_path, monkeypatch, independent_sessions
+) -> None:
     key_path = tmp_path / "connector-master-key"
     async with async_sessionmaker() as first_session:
         document = await _document(first_session, current_is_retrievable=False)
@@ -495,6 +561,14 @@ async def test_parse_job_commits_processing_outcome_before_completion_lease_loss
         await inspection_session.commit()
 
     async with async_sessionmaker() as recovery_session:
+        def fail_if_reparsed(_mime_type: str):  # type: ignore[no-untyped-def]
+            raise AssertionError("durable recovery must not invoke the parser")
+
+        monkeypatch.setattr(
+            DocumentIngestionService,
+            "_parser_for",
+            staticmethod(fail_if_reparsed),
+        )
         connector_service = ConnectorService.for_file_key(key_path, app_env="development")
         recovery_gateway = FakeDriveGateway((FIXTURE_DIRECTORY / "sample.pdf").read_bytes())
         recovery_service = DocumentIngestionService(
@@ -512,4 +586,169 @@ async def test_parse_job_commits_processing_outcome_before_completion_lease_loss
         assert str(recovered_version.id) == persisted_version_id
         assert recovery_gateway.download_calls == []
 
+    async with async_sessionmaker() as final_session:
+        durably_completed_job = await final_session.get(JobIntent, job_id)
+        assert durably_completed_job is not None
+        assert durably_completed_job.state is JobState.SUCCEEDED
+
     assert first_gateway.download_calls == ["drive-file-1"]
+
+
+@pytest.mark.asyncio
+async def test_expired_worker_checkpoints_before_waiting_reclaimer_without_duplicate_work(
+    tmp_path, monkeypatch, independent_sessions
+) -> None:
+    key_path = tmp_path / "connector-master-key"
+    fixture_content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    async with async_sessionmaker() as setup_session:
+        document = await _document(setup_session, current_is_retrievable=False)
+        source = await setup_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        await _authorized_ingestion_service(setup_session, document, tmp_path)
+        job = await JobService().enqueue(
+            setup_session,
+            "knowledge.document.parse",
+            f"document-parse-expired-worker-fencing-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+        document_id = document.id
+        await setup_session.commit()
+
+    parser = CountingPdfParser()
+    monkeypatch.setattr(
+        DocumentIngestionService,
+        "_parser_for",
+        staticmethod(lambda _mime_type: parser),
+    )
+    first_gateway = BlockingDriveGateway(fixture_content)
+    second_gateway = FakeDriveGateway(fixture_content)
+
+    async with (
+        async_sessionmaker() as first_session,
+        async_sessionmaker() as second_session,
+    ):
+        connector_service = ConnectorService.for_file_key(key_path, app_env="development")
+        first_service = DocumentIngestionService(
+            first_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(first_gateway),
+            ),
+            worker_id="expired-worker-a",
+            job_lease_seconds=1,
+            job_lease_service=LeaseLostOnceService(first_session),
+        )
+        second_service = DocumentIngestionService(
+            second_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(second_gateway),
+            ),
+            worker_id="reclaimer-worker-b",
+            job_lease_seconds=60,
+        )
+
+        first_attempt = asyncio.create_task(first_service.parse(job_id))
+        await first_gateway.download_started.wait()
+        await asyncio.sleep(1.1)
+        recovery_attempt = asyncio.create_task(second_service.parse(job_id))
+        await asyncio.sleep(0.05)
+        assert second_gateway.download_calls == []
+
+        first_gateway.release_download.set()
+        with pytest.raises(JobLeaseLost):
+            await first_attempt
+        recovered_version = await recovery_attempt
+
+    async with async_sessionmaker() as verification_session:
+        persisted_job = await verification_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.SUCCEEDED
+        versions = (
+            await verification_session.scalars(
+                select(DocumentVersion).where(DocumentVersion.document_id == document_id)
+            )
+        ).all()
+        chunks = (
+            await verification_session.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_version_id == recovered_version.id
+                )
+            )
+        ).all()
+        assert len(versions) == 1
+        assert chunks
+
+    assert first_gateway.download_calls == ["drive-file-1"]
+    assert second_gateway.download_calls == []
+    assert parser.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_cannot_publish_checkpoint_after_another_worker_claims(
+    tmp_path, monkeypatch, independent_sessions
+) -> None:
+    key_path = tmp_path / "connector-master-key"
+    fixture_content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    async with async_sessionmaker() as setup_session:
+        document = await _document(setup_session, current_is_retrievable=False)
+        source = await setup_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        await _authorized_ingestion_service(setup_session, document, tmp_path)
+        job = await JobService().enqueue(
+            setup_session,
+            "knowledge.document.parse",
+            f"document-parse-stale-checkpoint-fencing-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+        document_id = document.id
+        await setup_session.commit()
+
+    parser = CountingPdfParser()
+    monkeypatch.setattr(
+        DocumentIngestionService,
+        "_parser_for",
+        staticmethod(lambda _mime_type: parser),
+    )
+    stale_gateway = LeaseTransferDriveGateway(fixture_content, job_id)
+    async with async_sessionmaker() as stale_session:
+        connector_service = ConnectorService.for_file_key(key_path, app_env="development")
+        stale_service = DocumentIngestionService(
+            stale_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(stale_gateway),
+            ),
+            worker_id="stale-worker-a",
+            job_lease_seconds=60,
+            job_lease_service=CommitClaimLeaseService(stale_session),
+        )
+
+        with pytest.raises(JobLeaseLost):
+            await stale_service.parse(job_id)
+
+    async with async_sessionmaker() as verification_session:
+        persisted_job = await verification_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.RUNNING
+        assert persisted_job.lease_owner == "takeover-worker-b"
+        assert "document_version_id" not in persisted_job.payload
+        versions = (
+            await verification_session.scalars(
+                select(DocumentVersion).where(DocumentVersion.document_id == document_id)
+            )
+        ).all()
+        assert versions == []
+
+    assert stale_gateway.download_calls == ["drive-file-1"]
+    assert parser.calls == 1
