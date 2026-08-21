@@ -75,7 +75,11 @@ class DocumentIngestionService:
             version = await self.parse_bytes(document, content, drive_file.mime_type)
             job.payload = {**job.payload, "document_version_id": str(version.id)}
             await self._db_session.flush()
+            # The parsed PROCESSING outcome and its durable job association must survive a
+            # lease-loss failure during finalization so another worker can complete it.
+            await self._db_session.commit()
             await lease_service.complete(job.id, self._worker_id)
+            await self._db_session.commit()
             return version
         except JobLeaseLost:
             raise

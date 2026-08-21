@@ -6,10 +6,11 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
+from app.core.database import async_sessionmaker
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.models import Organization
-from app.modules.jobs.models import JobState
+from app.modules.jobs.models import JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.knowledge.drive_gateway import DriveConnection, DriveGateway
 from app.modules.knowledge.ingestion import DocumentIngestionService
@@ -439,3 +440,76 @@ async def test_parse_job_recovers_after_completion_lease_loss_without_duplicate_
     assert job.state is JobState.SUCCEEDED
     assert gateway.download_calls == ["drive-file-1"]
     assert len(chunks_after) == len(chunks_before)
+
+
+@pytest.mark.asyncio
+async def test_parse_job_commits_processing_outcome_before_completion_lease_loss(tmp_path) -> None:
+    key_path = tmp_path / "connector-master-key"
+    async with async_sessionmaker() as first_session:
+        document = await _document(first_session, current_is_retrievable=False)
+        source = await first_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        lease_service = LeaseLostOnceService(first_session)
+        service, first_gateway = await _authorized_ingestion_service(
+            first_session,
+            document,
+            tmp_path,
+            job_lease_service=lease_service,
+        )
+        job = await JobService().enqueue(
+            first_session,
+            "knowledge.document.parse",
+            f"document-parse-cross-session-recovery-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+        document_id = document.id
+
+        with pytest.raises(JobLeaseLost):
+            await service.parse(job_id)
+        await first_session.rollback()
+
+    async with async_sessionmaker() as inspection_session:
+        persisted_job = await inspection_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.RUNNING
+        persisted_version_id = persisted_job.payload["document_version_id"]
+        assert isinstance(persisted_version_id, str)
+        versions = (
+            await inspection_session.scalars(
+                select(DocumentVersion).where(DocumentVersion.document_id == document_id)
+            )
+        ).all()
+        assert len(versions) == 1
+        persisted_chunks = (
+            await inspection_session.scalars(
+                select(DocumentChunk).where(DocumentChunk.document_version_id == versions[0].id)
+            )
+        ).all()
+        assert persisted_chunks
+        persisted_job.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await inspection_session.commit()
+
+    async with async_sessionmaker() as recovery_session:
+        connector_service = ConnectorService.for_file_key(key_path, app_env="development")
+        recovery_gateway = FakeDriveGateway((FIXTURE_DIRECTORY / "sample.pdf").read_bytes())
+        recovery_service = DocumentIngestionService(
+            recovery_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(recovery_gateway),
+            ),
+            worker_id="task-8-recovery-worker",
+        )
+        recovered_version = await recovery_service.parse(job_id)
+        recovered_job = await recovery_session.get(JobIntent, job_id)
+        assert recovered_job is not None
+        assert recovered_job.state is JobState.SUCCEEDED
+        assert str(recovered_version.id) == persisted_version_id
+        assert recovery_gateway.download_calls == []
+
+    assert first_gateway.download_calls == ["drive-file-1"]
