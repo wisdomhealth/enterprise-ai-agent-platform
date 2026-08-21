@@ -159,6 +159,7 @@ class JobLeaseService:
         *,
         error_code: str,
         error_class: ErrorClass,
+        expected_version: int | None = None,
         retry_after_seconds: int | None = None,
         organization_id: UUID | None = None,
         actor_id: UUID | None = None,
@@ -167,15 +168,19 @@ class JobLeaseService:
             organization_id is None or actor_id is None
         ):
             raise ValueError("security job failures require organization_id and actor_id")
-        database_now = func.current_timestamp()
+        database_now = func.clock_timestamp()
+        lease_fence = [
+            JobIntent.id == job_id,
+            JobIntent.state == JobState.RUNNING,
+            JobIntent.lease_owner == worker_id,
+            JobIntent.lease_expires_at.is_not(None),
+            JobIntent.lease_expires_at > database_now,
+        ]
+        if expected_version is not None:
+            lease_fence.append(JobIntent.version == expected_version)
         attempts = await self._db_session.scalar(
             select(JobIntent.attempts)
-            .where(
-                JobIntent.id == job_id,
-                JobIntent.state == JobState.RUNNING,
-                JobIntent.lease_owner == worker_id,
-                JobIntent.lease_expires_at > database_now,
-            )
+            .where(*lease_fence)
             .with_for_update()
         )
         if attempts is None:
@@ -196,12 +201,7 @@ class JobLeaseService:
 
         job = await self._db_session.scalar(
             update(JobIntent)
-            .where(
-                JobIntent.id == job_id,
-                JobIntent.state == JobState.RUNNING,
-                JobIntent.lease_owner == worker_id,
-                JobIntent.lease_expires_at > database_now,
-            )
+            .where(*lease_fence)
             .values(
                 state=state,
                 lease_owner=None,

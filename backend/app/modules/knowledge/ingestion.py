@@ -98,7 +98,9 @@ class DocumentIngestionService:
                 self._worker_id,
                 error_code="DOCUMENT_PARSE_TRANSIENT_FAILURE",
                 error_class=ErrorClass.RETRYABLE,
+                expected_version=job.version,
             )
+            await self._db_session.commit()
             raise
 
     async def parse_bytes(
@@ -283,4 +285,6 @@ class DocumentIngestionService:
             self._worker_id or "",
             error_code=error_code,
             error_class=ErrorClass.NON_RETRYABLE,
+            expected_version=job.version,
         )
+        await self._db_session.commit()

@@ -98,6 +98,20 @@ class BlockingDriveGateway(FakeDriveGateway):
         return self._content
 
 
+class BlockingFailingDriveGateway(FakeDriveGateway):
+    def __init__(self, error: Exception) -> None:
+        super().__init__(b"", error=error)
+        self.download_started = asyncio.Event()
+        self.release_download = asyncio.Event()
+
+    async def download(self, file_id: str) -> bytes:
+        self.download_calls.append(file_id)
+        self.download_started.set()
+        await self.release_download.wait()
+        assert self._error is not None
+        raise self._error
+
+
 class LeaseTransferDriveGateway(FakeDriveGateway):
     def __init__(self, content: bytes, job_id) -> None:  # type: ignore[no-untyped-def]
         super().__init__(content)
@@ -443,6 +457,142 @@ async def test_parse_job_records_retryable_download_failure(db_session, tmp_path
     assert job.state is JobState.PENDING
     assert job.last_error_code == "DOCUMENT_PARSE_TRANSIENT_FAILURE"
     assert job.next_attempt_at is not None
+
+
+@pytest.mark.asyncio
+async def test_handled_retryable_failure_is_committed_for_a_fresh_session(
+    tmp_path, independent_sessions
+) -> None:
+    async with async_sessionmaker() as worker_session:
+        document = await _document(worker_session, current_is_retrievable=False)
+        source = await worker_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        service, gateway = await _authorized_ingestion_service(
+            worker_session,
+            document,
+            tmp_path,
+            download_error=RuntimeError("temporary Drive outage"),
+        )
+        job = await JobService().enqueue(
+            worker_session,
+            "knowledge.document.parse",
+            f"document-parse-durable-retryable-failure-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+
+        with pytest.raises(RuntimeError, match="temporary Drive outage"):
+            await service.parse(job_id)
+
+        assert gateway.download_calls == ["drive-file-1"]
+
+    async with async_sessionmaker() as inspection_session:
+        persisted_job = await inspection_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.PENDING
+        assert persisted_job.lease_owner is None
+        assert persisted_job.lease_expires_at is None
+        assert persisted_job.last_error_code == "DOCUMENT_PARSE_TRANSIENT_FAILURE"
+        assert persisted_job.next_attempt_at is not None
+
+
+@pytest.mark.asyncio
+async def test_stale_failure_handler_cannot_overwrite_new_lease_generation(
+    tmp_path, independent_sessions
+) -> None:
+    key_path = tmp_path / "connector-master-key"
+    async with async_sessionmaker() as setup_session:
+        document = await _document(setup_session, current_is_retrievable=False)
+        source = await setup_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        await _authorized_ingestion_service(setup_session, document, tmp_path)
+        job = await JobService().enqueue(
+            setup_session,
+            "knowledge.document.parse",
+            f"document-parse-stale-failure-fence-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+        await setup_session.commit()
+
+    gateway = BlockingFailingDriveGateway(RuntimeError("late Drive failure"))
+    async with async_sessionmaker() as stale_session:
+        connector_service = ConnectorService.for_file_key(key_path, app_env="development")
+        stale_service = DocumentIngestionService(
+            stale_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(gateway),
+            ),
+            worker_id="reused-worker-identity",
+            job_lease_seconds=1,
+        )
+        stale_attempt = asyncio.create_task(stale_service.parse(job_id))
+        await gateway.download_started.wait()
+        await asyncio.sleep(1.2)
+
+        async with async_sessionmaker() as takeover_session:
+            takeover = await JobLeaseService(takeover_session).claim(
+                job_id,
+                "reused-worker-identity",
+                lease_seconds=60,
+            )
+            assert takeover is not None
+            takeover_version = takeover.version
+            await takeover_session.commit()
+
+        gateway.release_download.set()
+        with pytest.raises(JobLeaseLost):
+            await stale_attempt
+
+    async with async_sessionmaker() as inspection_session:
+        persisted_job = await inspection_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.RUNNING
+        assert persisted_job.lease_owner == "reused-worker-identity"
+        assert persisted_job.version == takeover_version
+        assert persisted_job.last_error_code is None
+
+
+@pytest.mark.asyncio
+async def test_hard_crash_before_failure_handler_leaves_claim_for_lease_recovery(
+    tmp_path, independent_sessions
+) -> None:
+    async with async_sessionmaker() as claim_session:
+        document = await _document(claim_session, current_is_retrievable=False)
+        await _authorized_ingestion_service(claim_session, document, tmp_path)
+        job = await JobService().enqueue(
+            claim_session,
+            "knowledge.document.parse",
+            f"document-parse-hard-crash-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="source-root"),
+            },
+        )
+        job_id = job.id
+        claimed = await JobLeaseService(claim_session).claim(
+            job_id,
+            "crashed-worker",
+            lease_seconds=60,
+        )
+        assert claimed is not None
+        await claim_session.commit()
+
+    async with async_sessionmaker() as inspection_session:
+        persisted_job = await inspection_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.RUNNING
+        assert persisted_job.lease_owner == "crashed-worker"
+        assert persisted_job.lease_expires_at is not None
 
 
 @pytest.mark.asyncio
