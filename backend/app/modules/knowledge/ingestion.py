@@ -4,7 +4,7 @@ from hashlib import sha256
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
@@ -53,6 +53,9 @@ class DocumentIngestionService:
         if job.kind != "knowledge.document.parse":
             await self._fail_terminal(lease_service, job, "INVALID_DOCUMENT_PARSE_JOB")
             raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        # Publish the claim before external I/O so an expired lease can be taken over
+        # without waiting for this worker's parse transaction to end.
+        await self._db_session.commit()
         try:
             recovered_version = await self._persisted_processing_version(job)
             if recovered_version is not None:
@@ -238,6 +241,10 @@ class DocumentIngestionService:
                 JobIntent.state == JobState.RUNNING,
                 JobIntent.lease_owner == self._worker_id,
                 JobIntent.version == claimed_job_version,
+                JobIntent.lease_expires_at.is_not(None),
+                # clock_timestamp() is the PostgreSQL wall clock. CURRENT_TIMESTAMP
+                # is fixed at transaction start and cannot fence a long parse.
+                JobIntent.lease_expires_at > func.clock_timestamp(),
             )
             .values(payload=checkpoint_payload)
             .returning(JobIntent.id)
@@ -245,10 +252,8 @@ class DocumentIngestionService:
         if checkpointed_job_id is None:
             await self._db_session.rollback()
             raise JobLeaseLost(job_id)
-        # Claim and checkpoint share one transaction in the normal worker path. The
-        # owner/version fence prevents a worker whose committed claim was superseded
-        # from publishing, while allowing an expired-but-not-yet-reclaimed owner to
-        # persist work exactly once before a waiting reclaimer takes over.
+        # The conditional UPDATE and version/chunk inserts commit together. PostgreSQL
+        # row locking plus predicate re-evaluation fences both expiry and takeover.
         await self._db_session.commit()
 
     async def _persisted_processing_version(self, job: JobIntent) -> DocumentVersion | None:

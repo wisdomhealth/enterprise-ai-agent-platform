@@ -595,7 +595,7 @@ async def test_parse_job_commits_processing_outcome_before_completion_lease_loss
 
 
 @pytest.mark.asyncio
-async def test_expired_worker_checkpoints_before_waiting_reclaimer_without_duplicate_work(
+async def test_expired_worker_cannot_checkpoint_after_reclaimer_takes_over(
     tmp_path, monkeypatch, independent_sessions
 ) -> None:
     key_path = tmp_path / "connector-master-key"
@@ -626,7 +626,7 @@ async def test_expired_worker_checkpoints_before_waiting_reclaimer_without_dupli
         staticmethod(lambda _mime_type: parser),
     )
     first_gateway = BlockingDriveGateway(fixture_content)
-    second_gateway = FakeDriveGateway(fixture_content)
+    second_gateway = BlockingDriveGateway(fixture_content)
 
     async with (
         async_sessionmaker() as first_session,
@@ -641,7 +641,6 @@ async def test_expired_worker_checkpoints_before_waiting_reclaimer_without_dupli
             ),
             worker_id="expired-worker-a",
             job_lease_seconds=1,
-            job_lease_service=LeaseLostOnceService(first_session),
         )
         second_service = DocumentIngestionService(
             second_session,
@@ -655,14 +654,14 @@ async def test_expired_worker_checkpoints_before_waiting_reclaimer_without_dupli
 
         first_attempt = asyncio.create_task(first_service.parse(job_id))
         await first_gateway.download_started.wait()
-        await asyncio.sleep(1.1)
+        await asyncio.sleep(1.2)
         recovery_attempt = asyncio.create_task(second_service.parse(job_id))
-        await asyncio.sleep(0.05)
-        assert second_gateway.download_calls == []
+        await asyncio.wait_for(second_gateway.download_started.wait(), timeout=5)
 
         first_gateway.release_download.set()
         with pytest.raises(JobLeaseLost):
             await first_attempt
+        second_gateway.release_download.set()
         recovered_version = await recovery_attempt
 
     async with async_sessionmaker() as verification_session:
@@ -685,8 +684,128 @@ async def test_expired_worker_checkpoints_before_waiting_reclaimer_without_dupli
         assert chunks
 
     assert first_gateway.download_calls == ["drive-file-1"]
-    assert second_gateway.download_calls == []
-    assert parser.calls == 1
+    assert second_gateway.download_calls == ["drive-file-1"]
+    assert parser.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_worker_cannot_checkpoint_before_takeover(
+    tmp_path, independent_sessions
+) -> None:
+    fixture_content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    async with async_sessionmaker() as setup_session:
+        document = await _document(setup_session, current_is_retrievable=False)
+        source = await setup_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        await _authorized_ingestion_service(setup_session, document, tmp_path)
+        job = await JobService().enqueue(
+            setup_session,
+            "knowledge.document.parse",
+            f"document-parse-expired-before-takeover-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+        document_id = document.id
+        await setup_session.commit()
+
+    gateway = BlockingDriveGateway(fixture_content)
+    async with async_sessionmaker() as expired_session:
+        connector_service = ConnectorService.for_file_key(
+            tmp_path / "connector-master-key", app_env="development"
+        )
+        service = DocumentIngestionService(
+            expired_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(gateway),
+            ),
+            worker_id="expired-before-takeover-worker-a",
+            job_lease_seconds=1,
+        )
+        attempt = asyncio.create_task(service.parse(job_id))
+        await gateway.download_started.wait()
+        await asyncio.sleep(1.2)
+        gateway.release_download.set()
+        with pytest.raises(JobLeaseLost):
+            await attempt
+
+    async with async_sessionmaker() as verification_session:
+        persisted_job = await verification_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.RUNNING
+        assert persisted_job.lease_owner == "expired-before-takeover-worker-a"
+        assert "document_version_id" not in persisted_job.payload
+        versions = (
+            await verification_session.scalars(
+                select(DocumentVersion).where(DocumentVersion.document_id == document_id)
+            )
+        ).all()
+        assert versions == []
+
+
+@pytest.mark.asyncio
+async def test_unexpired_worker_can_publish_processing_checkpoint(
+    tmp_path, independent_sessions
+) -> None:
+    fixture_content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    async with async_sessionmaker() as setup_session:
+        document = await _document(setup_session, current_is_retrievable=False)
+        source = await setup_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        await _authorized_ingestion_service(setup_session, document, tmp_path)
+        job = await JobService().enqueue(
+            setup_session,
+            "knowledge.document.parse",
+            f"document-parse-unexpired-checkpoint-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+        document_id = document.id
+        await setup_session.commit()
+
+    gateway = FakeDriveGateway(fixture_content)
+    async with async_sessionmaker() as worker_session:
+        connector_service = ConnectorService.for_file_key(
+            tmp_path / "connector-master-key", app_env="development"
+        )
+        service = DocumentIngestionService(
+            worker_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(gateway),
+            ),
+            worker_id="unexpired-worker-a",
+            job_lease_seconds=60,
+        )
+        version = await service.parse(job_id)
+
+    async with async_sessionmaker() as verification_session:
+        persisted_job = await verification_session.get(JobIntent, job_id)
+        assert persisted_job is not None
+        assert persisted_job.state is JobState.SUCCEEDED
+        assert persisted_job.payload["document_version_id"] == str(version.id)
+        versions = (
+            await verification_session.scalars(
+                select(DocumentVersion).where(DocumentVersion.document_id == document_id)
+            )
+        ).all()
+        chunks = (
+            await verification_session.scalars(
+                select(DocumentChunk).where(DocumentChunk.document_version_id == version.id)
+            )
+        ).all()
+        assert [persisted_version.id for persisted_version in versions] == [version.id]
+        assert chunks
+
+    assert gateway.download_calls == ["drive-file-1"]
 
 
 @pytest.mark.asyncio
