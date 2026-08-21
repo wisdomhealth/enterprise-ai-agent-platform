@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,8 +23,7 @@ class FakeDriveGateway(DriveGateway):
         self.download_calls: list[str] = []
 
     async def resolve_descendant_folder_ids(self, root_folder_id: str) -> set[str]:
-        assert root_folder_id == "approved-root"
-        return {"approved-child"}
+        return {f"{root_folder_id}-child"}
 
     async def download(self, file_id: str) -> bytes:
         self.download_calls.append(file_id)
@@ -34,12 +34,13 @@ class FakeDriveGatewayFactory:
     def __init__(self, gateway: FakeDriveGateway) -> None:
         self._gateway = gateway
         self.refresh_tokens: list[str] = []
+        self.connection_identity = "knowledge-reader@example.test"
 
     async def create(self, *, refresh_token: str) -> DriveConnection:
         self.refresh_tokens.append(refresh_token)
         return DriveConnection(
             gateway=self._gateway,
-            connection_identity="knowledge-reader@example.test",
+            connection_identity=self.connection_identity,
         )
 
 
@@ -131,7 +132,7 @@ async def test_admin_configuration_uses_connector_identity_and_writes_safe_audit
     )
     assert source.organization_id == organization.id
     assert source.root_folder_id == "approved-root"
-    assert source.allowed_descendant_ids == ["approved-child"]
+    assert source.allowed_descendant_ids == ["approved-root-child"]
     assert source.connection_identity == "knowledge-reader@example.test"
     assert factory.refresh_tokens == ["test-only-refresh-token"]
     assert audit_event is not None
@@ -146,6 +147,71 @@ async def test_admin_configuration_uses_connector_identity_and_writes_safe_audit
         "root_folder_ref"
     ]
     assert "test-only-refresh-token" not in str(audit_event.details)
+
+
+@pytest.mark.asyncio
+async def test_reconfiguration_audit_reconstructs_actual_old_and_new_safe_references(
+    db_session, tmp_path
+) -> None:
+    organization = Organization(name="Knowledge source audit update")
+    db_session.add(organization)
+    await db_session.flush()
+    principal = await _principal_for(
+        db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
+    )
+    connector_service = await _drive_connector_service(db_session, organization, tmp_path)
+    factory = FakeDriveGatewayFactory(FakeDriveGateway())
+    service = KnowledgeSourceService(connector_service, factory)
+    await _configuration_grant(db_session, principal, service)
+    source = await service.configure_drive_source(
+        db_session,
+        principal=principal,
+        root_folder_id="approved-root",
+    )
+    factory.connection_identity = "rotated-reader@example.test"
+    await service.configure_drive_source(
+        db_session,
+        principal=principal,
+        root_folder_id="replacement-root",
+        include_descendants=False,
+    )
+
+    events = (
+        await db_session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.object_id == source.id,
+                AuditEvent.action == "knowledge.drive_source.configure",
+            )
+        )
+    ).all()
+    replacement_root_ref = sha256(b"replacement-root").hexdigest()[:16]
+    first = next(
+        event for event in events if event.details["root_folder_ref"] != replacement_root_ref
+    )
+    second = next(
+        event for event in events if event.details["root_folder_ref"] == replacement_root_ref
+    )
+    changed = second.details["changed_fields"]
+
+    assert second.organization_id == organization.id
+    assert second.actor_id == principal.subject_id
+    assert second.object_id == source.id
+    assert changed["root_folder_ref"] == {
+        "before": first.details["root_folder_ref"],
+        "after": second.details["root_folder_ref"],
+    }
+    assert changed["connection_identity_ref"] == {
+        "before": first.details["connection_identity_ref"],
+        "after": second.details["connection_identity_ref"],
+    }
+    assert changed["connector_id"] == {
+        "before": first.details["connector_id"],
+        "after": second.details["connector_id"],
+    }
+    serialized = str(second.details).lower()
+    for forbidden in ("refresh", "access_token", "client_secret", "authorization"):
+        assert forbidden not in serialized
 
 
 @pytest.mark.asyncio
@@ -228,7 +294,7 @@ async def test_active_source_downloads_only_after_scope_authorization(db_session
         name="shared.docx",
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         modified_time=datetime.now(UTC),
-        parent_ids=("approved-child",),
+        parent_ids=("approved-root-child",),
         web_view_link=None,
         removed=False,
     )

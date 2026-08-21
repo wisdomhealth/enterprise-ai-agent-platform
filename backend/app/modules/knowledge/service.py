@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.audit.models import AuditEvent
 from app.modules.audit.service import AuditService
 from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
 from app.modules.authorization.types import ResourceRef, ResourceState
@@ -66,6 +67,7 @@ class KnowledgeSourceService:
         previous_root_folder_ref = self._safe_reference(source.root_folder_id) if source else None
         previous_identity_ref = self._safe_reference(source.connection_identity) if source else None
         previous_include_descendants = source.include_descendants if source else None
+        previous_connector_id = await self._previous_connector_id(db_session, source)
         active_connection = await self._load_drive_connection(db_session, principal.organization_id)
         descendant_ids = (
             await active_connection.connection.gateway.resolve_descendant_folder_ids(root_folder_id)
@@ -116,6 +118,10 @@ class KnowledgeSourceService:
                     "include_descendants": {
                         "before": previous_include_descendants,
                         "after": include_descendants,
+                    },
+                    "connector_id": {
+                        "before": previous_connector_id,
+                        "after": str(active_connection.connector_id),
                     },
                 },
             },
@@ -192,3 +198,34 @@ class KnowledgeSourceService:
     @staticmethod
     def _safe_reference(value: str) -> str:
         return sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    async def _previous_connector_id(
+        db_session: AsyncSession, source: DriveSource | None
+    ) -> str | None:
+        if source is None:
+            return None
+        previous_root_folder_ref = KnowledgeSourceService._safe_reference(source.root_folder_id)
+        previous_identity_ref = KnowledgeSourceService._safe_reference(source.connection_identity)
+        previous_events = (
+            await db_session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.organization_id == source.organization_id,
+                AuditEvent.object_id == source.id,
+                AuditEvent.action == "knowledge.drive_source.configure",
+            )
+            )
+        ).all()
+        matching_connector_ids: set[str] = set()
+        for event in previous_events:
+            connector_id = event.details.get("connector_id")
+            if (
+                event.details.get("root_folder_ref") == previous_root_folder_ref
+                and event.details.get("connection_identity_ref") == previous_identity_ref
+                and isinstance(connector_id, str)
+            ):
+                matching_connector_ids.add(connector_id)
+        if len(matching_connector_ids) != 1:
+            return None
+        return matching_connector_ids.pop()
