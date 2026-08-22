@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import func, select
 
+from app.core.database import async_sessionmaker, engine
 from app.modules.identity.models import Organization
 from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.drive_gateway import DriveFile
@@ -28,6 +29,11 @@ class FakeDriveChangeBoundary:
     @staticmethod
     def is_file_authorized(source, drive_file):  # type: ignore[no-untyped-def]
         return source.root_folder_id in drive_file.parent_ids
+
+
+class FailingAfterBootstrapBoundary(FakeDriveChangeBoundary):
+    async def list_changes(self, _db_session, *, source, sync_cursor):  # type: ignore[no-untyped-def]
+        raise RuntimeError("temporary Drive page failure")
 
 
 async def _source(db_session, *, cursor: str | None = "cursor-1") -> DriveSource:  # type: ignore[no-untyped-def]
@@ -111,12 +117,63 @@ async def test_first_sync_bootstraps_and_persists_a_drive_cursor(db_session) -> 
 @pytest.mark.asyncio
 async def test_next_periodic_run_uses_a_new_intent_after_prior_success(db_session) -> None:  # type: ignore[no-untyped-def]
     source = await _source(db_session)
-    first = await enqueue_drive_sync_intent(db_session, source)
+    first = (await enqueue_drive_sync_intent(db_session, source)).job
     first.state = JobState.SUCCEEDED
     first.version += 1
     await db_session.commit()
 
-    second = await enqueue_drive_sync_intent(db_session, source)
+    second = (await enqueue_drive_sync_intent(db_session, source)).job
 
     assert second.id != first.id
     assert second.state is JobState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_cursor_is_committed_before_page_failure(db_session) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session, cursor=None)
+    source_id = source.id
+    boundary = FailingAfterBootstrapBoundary([], None)
+
+    with pytest.raises(RuntimeError, match="temporary Drive page failure"):
+        await DriveSyncService(db_session, page_gateway=boundary).sync(source_id)
+
+    db_session.expire_all()
+    persisted = await db_session.get(DriveSource, source_id)
+    assert persisted is not None
+    assert persisted.sync_cursor == "start-cursor"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_cursor_survives_page_failure_in_a_new_database_session() -> None:
+    async with async_sessionmaker() as session_a:
+        organization = Organization(name="Cross-session bootstrap owner")
+        session_a.add(organization)
+        await session_a.flush()
+        knowledge_base = KnowledgeBase(organization_id=organization.id)
+        session_a.add(knowledge_base)
+        await session_a.flush()
+        source = DriveSource(
+            organization_id=organization.id,
+            knowledge_base_id=knowledge_base.id,
+            root_folder_id="root",
+            allowed_descendant_ids=[],
+            connection_identity="reader@example.test",
+        )
+        session_a.add(source)
+        await session_a.commit()
+        source_id = source.id
+        organization_id = organization.id
+        with pytest.raises(RuntimeError, match="temporary Drive page failure"):
+            await DriveSyncService(
+                session_a, page_gateway=FailingAfterBootstrapBoundary([], None)
+            ).sync(source_id)
+
+    async with async_sessionmaker() as session_b:
+        persisted = await session_b.get(DriveSource, source_id)
+        assert persisted is not None
+        assert persisted.sync_cursor == "start-cursor"
+        organization = await session_b.get(Organization, organization_id)
+        assert organization is not None
+        await session_b.delete(organization)
+        await session_b.commit()
+    await engine.dispose()

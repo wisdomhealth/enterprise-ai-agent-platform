@@ -63,9 +63,13 @@ async def request_drive_sync(
     principal: Principal = Depends(require_staff_csrf),
     operations: DriveSyncOperations = Depends(_drive_sync_operations),
 ) -> DriveSyncEnqueued:
-    job = await operations.enqueue_sync(principal=principal, source_id=source_id)
+    enqueued = await operations.enqueue_sync_for_dispatch(principal=principal, source_id=source_id)
     await db_session.commit()
-    return DriveSyncEnqueued(job_id=job.id, state=job.state.value)
+    from app.modules.knowledge.tasks import dispatch_drive_sync_outbox_event
+
+    if enqueued.outbox_event_id is not None:
+        dispatch_drive_sync_outbox_event.delay(str(enqueued.outbox_event_id))
+    return DriveSyncEnqueued(job_id=enqueued.job.id, state=enqueued.job.state.value)
 
 
 @router.get("/{source_id}/status", response_model=DriveSyncStatusRead)

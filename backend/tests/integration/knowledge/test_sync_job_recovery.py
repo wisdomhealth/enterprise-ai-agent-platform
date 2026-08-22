@@ -12,7 +12,12 @@ from app.modules.knowledge.models import DriveSource, KnowledgeBase
 from app.modules.knowledge.operations import DriveSyncOperations
 from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.knowledge.sync import drive_sync_job_key
-from app.modules.knowledge.tasks import drive_source_sync
+from app.modules.knowledge.tasks import (
+    _dispatch_drive_sync_outbox_event,
+    dispatch_drive_sync_outbox_event,
+    drive_source_sync,
+)
+from app.modules.outbox.models import OutboxEvent
 
 
 @pytest.mark.asyncio
@@ -45,6 +50,41 @@ def test_manual_and_scheduled_sync_share_one_durable_intent_key() -> None:
 
 def test_periodic_celery_sync_task_is_registered_under_the_scheduled_name() -> None:
     assert drive_source_sync.name == "app.modules.knowledge.tasks.drive_source_sync"
+
+
+def test_outbox_dispatcher_is_registered_for_drive_sync_delivery() -> None:
+    assert (
+        dispatch_drive_sync_outbox_event.name
+        == "app.modules.knowledge.tasks.dispatch_drive_sync_outbox_event"
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbox_delivery_dispatches_once_to_the_drive_sync_consumer(
+    db_session, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    job_id = uuid4()
+    event = OutboxEvent(
+        event_type="knowledge.drive_source.sync.requested",
+        aggregate_type="job",
+        aggregate_id=job_id,
+        payload={"source_id": str(uuid4())},
+    )
+    db_session.add(event)
+    await db_session.flush()
+    dispatched: list[str] = []
+
+    def record_delay(job_id_value: str) -> None:
+        dispatched.append(job_id_value)
+
+    monkeypatch.setattr(drive_source_sync, "delay", record_delay)
+
+    first = await _dispatch_drive_sync_outbox_event(event.event_id, db_session=db_session)
+    second = await _dispatch_drive_sync_outbox_event(event.event_id, db_session=db_session)
+
+    assert first is True
+    assert second is False
+    assert dispatched == [str(job_id)]
 
 
 class _ConfigurationBoundary:

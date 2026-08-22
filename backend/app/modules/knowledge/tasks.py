@@ -6,6 +6,7 @@ from uuid import UUID
 
 from celery import shared_task  # type: ignore[import-untyped]
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.database import async_sessionmaker
@@ -16,10 +17,13 @@ from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.models import Document, DocumentVersion, DriveSource, DriveSourceStatus
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.sync import DriveSyncService
+from app.modules.outbox.models import OutboxEvent
+from app.modules.outbox.service import OutboxService
 
 DRIVE_SYNC_TASK_NAME = "app.modules.knowledge.tasks.drive_source_sync"
 DRIVE_SYNC_WORKER_ID = "celery-drive-sync"
 DRIVE_SYNC_LEASE_SECONDS = 300
+DRIVE_SYNC_OUTBOX_CONSUMER = "celery-drive-sync-dispatcher"
 
 
 class DocumentParseTask:
@@ -45,6 +49,33 @@ def drive_source_sync(job_id: str | None = None) -> None:
     asyncio.run(_run_drive_sync(job_id))
 
 
+@shared_task(name="app.modules.knowledge.tasks.dispatch_drive_sync_outbox_event")  # type: ignore[untyped-decorator]
+def dispatch_drive_sync_outbox_event(event_id: str) -> None:
+    """At-least-once outbox delivery into the one Drive sync job consumer."""
+    asyncio.run(_dispatch_drive_sync_outbox_event(UUID(event_id)))
+
+
+async def _dispatch_drive_sync_outbox_event(
+    event_id: UUID, *, db_session: AsyncSession | None = None
+) -> bool:
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            return await _dispatch_drive_sync_outbox_event(event_id, db_session=owned_session)
+    event = await db_session.get(OutboxEvent, event_id)
+    if event is None or event.event_type != "knowledge.drive_source.sync.requested":
+        return False
+    accepted = await OutboxService().begin_processing(
+        db_session, DRIVE_SYNC_OUTBOX_CONSUMER, event.event_id
+    )
+    if not accepted:
+        await db_session.commit()
+        return False
+    job_id = event.aggregate_id
+    await db_session.commit()
+    drive_source_sync.delay(str(job_id))
+    return True
+
+
 async def _run_drive_sync(job_id: str | None) -> None:
     if job_id is not None:
         await _consume_drive_sync_intent(UUID(job_id))
@@ -63,7 +94,7 @@ async def _run_drive_sync(job_id: str | None) -> None:
             if source is None:
                 continue
             intent = await enqueue_drive_sync_intent(db_session, source)
-            intent_ids.append(intent.id)
+            intent_ids.append(intent.job.id)
         await db_session.commit()
     for intent_id in intent_ids:
         await _consume_drive_sync_intent(intent_id)

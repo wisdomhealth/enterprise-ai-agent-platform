@@ -104,6 +104,11 @@ class DriveSyncService:
         try:
             if cursor is None:
                 cursor = await self._get_start_page_token(source)
+                # A restart after an unavailable page must resume from a
+                # durable Google-issued cursor, never repeat the empty-cursor
+                # bootstrap request.
+                source.sync_cursor = cursor
+                await self._db_session.commit()
             files, next_cursor = await self._list_changes(source, cursor)
         except Exception as exc:
             if self._is_invalid_credential_error(exc):

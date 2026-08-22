@@ -37,6 +37,12 @@ class DriveSyncStatus:
     recent_error_codes: list[str]
 
 
+@dataclass(frozen=True, slots=True)
+class EnqueuedDriveSync:
+    job: JobIntent
+    outbox_event_id: UUID | None
+
+
 class DriveSyncOperations:
     def __init__(
         self,
@@ -52,6 +58,11 @@ class DriveSyncOperations:
         self._outbox_service = outbox_service or OutboxService()
 
     async def enqueue_sync(self, *, principal: Principal, source_id: UUID) -> JobIntent:
+        return (await self.enqueue_sync_for_dispatch(principal=principal, source_id=source_id)).job
+
+    async def enqueue_sync_for_dispatch(
+        self, *, principal: Principal, source_id: UUID
+    ) -> EnqueuedDriveSync:
         if principal.role is not UserRole.ADMIN:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
         await self._require_configuration_authorization(principal)
@@ -149,7 +160,7 @@ async def enqueue_drive_sync_intent(
     *,
     job_service: JobService | None = None,
     outbox_service: OutboxService | None = None,
-) -> JobIntent:
+) -> EnqueuedDriveSync:
     """One durable intent producer shared by staff and periodic scheduling."""
     job_service = job_service or JobService()
     outbox_service = outbox_service or OutboxService()
@@ -169,7 +180,7 @@ async def enqueue_drive_sync_intent(
         JobState.RUNNING,
         JobState.RECONCILIATION,
     ):
-        return existing
+        return EnqueuedDriveSync(job=existing, outbox_event_id=None)
     idempotency_key = (
         base_key
         if existing is None
@@ -181,11 +192,11 @@ async def enqueue_drive_sync_intent(
         idempotency_key,
         {"source_id": str(source.id), "page_token": source.sync_cursor},
     )
-    await outbox_service.add(
+    outbox_event = await outbox_service.add(
         db_session,
         "knowledge.drive_source.sync.requested",
         "job",
         job.id,
         {"source_id": str(source.id)},
     )
-    return job
+    return EnqueuedDriveSync(job=job, outbox_event_id=outbox_event.event_id)
