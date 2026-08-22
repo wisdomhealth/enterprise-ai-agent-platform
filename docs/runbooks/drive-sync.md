@@ -7,10 +7,11 @@ second concurrent page application.
 ## Inspect a source
 
 Use `GET /api/v1/admin/knowledge-sources/{source_id}/status` as an authorized
-administrator. The response exposes the current cursor, last successful
-cursor update, queue backlog, revoked/isolation count, retry count, and recent
-safe error codes. It deliberately never returns a Google token or connector
-secret.
+administrator. The response exposes the current cursor, the completion time
+of the last durably successful sync intent, queue backlog, revoked/isolation
+count, retry count, and recent safe error codes. A failed attempt is not
+reported as a successful sync merely because it changed a source record. The
+response deliberately never returns a Google token or connector secret.
 
 ## Safe retry
 

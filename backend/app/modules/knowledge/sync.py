@@ -102,6 +102,8 @@ class DriveSyncService:
 
         cursor = page_token if page_token is not None else source.sync_cursor
         try:
+            if cursor is None:
+                cursor = await self._get_start_page_token(source)
             files, next_cursor = await self._list_changes(source, cursor)
         except Exception as exc:
             if self._is_invalid_credential_error(exc):
@@ -156,6 +158,31 @@ class DriveSyncService:
         )
         connection = await self._drive_gateway_factory.create(refresh_token=refresh_token)
         return await connection.gateway.list_changes(sync_cursor)
+
+    async def _get_start_page_token(self, source: DriveSource) -> str:
+        assert self._db_session is not None
+        if self._page_gateway is not None:
+            get_start_page_token = getattr(self._page_gateway, "get_start_page_token")
+            token = await get_start_page_token(self._db_session, source=source)
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("Drive change cursor bootstrap returned no token")
+            return token
+        if self._connector_service is None or self._drive_gateway_factory is None:
+            raise RuntimeError("an encrypted Drive connector and readonly gateway are required")
+        connector = await self._db_session.scalar(
+            select(Connector).where(
+                Connector.organization_id == source.organization_id,
+                Connector.kind == ConnectorKind.DRIVE,
+                Connector.status == ConnectorStatus.ACTIVE,
+            )
+        )
+        if connector is None:
+            raise RuntimeError("an active Google Drive connector is required")
+        refresh_token = await self._connector_service.load_refresh_token(
+            self._db_session, connector
+        )
+        connection = await self._drive_gateway_factory.create(refresh_token=refresh_token)
+        return await connection.gateway.get_start_page_token()
 
     def _is_file_authorized(self, source: DriveSource, drive_file: DriveFile) -> bool:
         boundary = self._knowledge_source_service or KnowledgeSourceService

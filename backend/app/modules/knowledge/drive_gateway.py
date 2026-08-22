@@ -22,6 +22,8 @@ class DriveFile:
 
 
 class DriveReadClient(Protocol):
+    def get_start_page_token(self) -> Awaitable[str]: ...
+
     def list_changes(
         self, sync_cursor: str | None
     ) -> Awaitable[tuple[list[DriveFile], str | None]]: ...
@@ -58,6 +60,9 @@ class DriveGateway:
             raise RuntimeError("Google Drive read-only client is not configured")
         return self._client
 
+    async def get_start_page_token(self) -> str:
+        return await self._require_client().get_start_page_token()
+
     async def list_changes(
         self, sync_cursor: str | None = None
     ) -> tuple[list[DriveFile], str | None]:
@@ -92,6 +97,15 @@ class GoogleDriveReadClient:
         if not isinstance(identity, str) or not identity:
             raise RuntimeError("Google Drive connection identity is unavailable")
         return identity
+
+    async def get_start_page_token(self) -> str:
+        response = await asyncio.to_thread(
+            lambda: self._drive_api.changes().getStartPageToken().execute()
+        )
+        page_token = response.get("startPageToken")
+        if not isinstance(page_token, str) or not page_token:
+            raise RuntimeError("Google Drive start-page token is unavailable")
+        return page_token
 
     async def list_changes(self, sync_cursor: str | None) -> tuple[list[DriveFile], str | None]:
         if sync_cursor is None:

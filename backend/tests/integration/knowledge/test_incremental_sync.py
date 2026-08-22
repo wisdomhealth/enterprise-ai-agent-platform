@@ -4,9 +4,10 @@ import pytest
 from sqlalchemy import func, select
 
 from app.modules.identity.models import Organization
-from app.modules.jobs.models import JobIntent
+from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import Document, DriveSource, KnowledgeBase
+from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.sync import DriveSyncService
 
 
@@ -19,6 +20,10 @@ class FakeDriveChangeBoundary:
     async def list_changes(self, _db_session, *, source, sync_cursor):  # type: ignore[no-untyped-def]
         self.calls.append((str(source.id), sync_cursor))
         return self.files, self.next_cursor
+
+    async def get_start_page_token(self, _db_session, *, source):  # type: ignore[no-untyped-def]
+        self.calls.append((str(source.id), "bootstrap"))
+        return "start-cursor"
 
     @staticmethod
     def is_file_authorized(source, drive_file):  # type: ignore[no-untyped-def]
@@ -86,3 +91,32 @@ async def test_duplicate_change_page_creates_one_parse_intent(db_session) -> Non
     await service.sync(source.id, "cursor-1")
 
     assert await db_session.scalar(select(func.count(JobIntent.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_sync_bootstraps_and_persists_a_drive_cursor(db_session) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session, cursor=None)
+    source_id = source.id
+    boundary = FakeDriveChangeBoundary([_authorized_file()], "cursor-2")
+
+    await DriveSyncService(db_session, page_gateway=boundary).sync(source_id)
+
+    db_session.expire_all()
+    persisted = await db_session.get(DriveSource, source_id)
+    assert persisted is not None
+    assert persisted.sync_cursor == "cursor-2"
+    assert boundary.calls == [(str(source_id), "bootstrap"), (str(source_id), "start-cursor")]
+
+
+@pytest.mark.asyncio
+async def test_next_periodic_run_uses_a_new_intent_after_prior_success(db_session) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session)
+    first = await enqueue_drive_sync_intent(db_session, source)
+    first.state = JobState.SUCCEEDED
+    first.version += 1
+    await db_session.commit()
+
+    second = await enqueue_drive_sync_intent(db_session, source)
+
+    assert second.id != first.id
+    assert second.state is JobState.PENDING

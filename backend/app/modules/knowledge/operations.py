@@ -63,20 +63,12 @@ class DriveSyncOperations:
         )
         if source is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        job = await self._job_service.enqueue(
+        return await enqueue_drive_sync_intent(
             self._db_session,
-            "knowledge.drive_source.sync",
-            drive_sync_job_key(source.id, source.sync_cursor),
-            {"source_id": str(source.id), "page_token": source.sync_cursor},
+            source,
+            job_service=self._job_service,
+            outbox_service=self._outbox_service,
         )
-        await self._outbox_service.add(
-            self._db_session,
-            "knowledge.drive_source.sync.requested",
-            "job",
-            job.id,
-            {"source_id": str(source.id)},
-        )
-        return job
 
     async def status(self, *, principal: Principal, source_id: UUID) -> DriveSyncStatus:
         if principal.role is not UserRole.ADMIN:
@@ -117,12 +109,17 @@ class DriveSyncOperations:
                 )
                 or 0
             )
+        successful_jobs = [job for job in source_jobs if job.state is JobState.SUCCEEDED]
+        last_success = max(
+            (job.updated_at for job in successful_jobs),
+            default=None,
+        )
         errors = [job.last_error_code for job in source_jobs if job.last_error_code][-5:]
         return DriveSyncStatus(
             source_id=source.id,
             cursor=source.sync_cursor,
             source_status=source.status.value,
-            last_success_at=source.updated_at if source.sync_cursor else None,
+            last_success_at=last_success,
             backlog=sum(job.state in (JobState.PENDING, JobState.RUNNING) for job in source_jobs),
             isolated_files=isolated,
             retry_count=sum(job.attempts for job in source_jobs),
@@ -144,3 +141,51 @@ class DriveSyncOperations:
             )
         except AuthorizationDenied as exc:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from exc
+
+
+async def enqueue_drive_sync_intent(
+    db_session: AsyncSession,
+    source: DriveSource,
+    *,
+    job_service: JobService | None = None,
+    outbox_service: OutboxService | None = None,
+) -> JobIntent:
+    """One durable intent producer shared by staff and periodic scheduling."""
+    job_service = job_service or JobService()
+    outbox_service = outbox_service or OutboxService()
+    base_key = drive_sync_job_key(source.id, source.sync_cursor)
+    existing = await db_session.scalar(
+        select(JobIntent)
+        .where(
+            JobIntent.kind == "knowledge.drive_source.sync",
+            (JobIntent.idempotency_key == base_key)
+            | JobIntent.idempotency_key.like(f"{base_key}:run:%"),
+        )
+        .order_by(JobIntent.created_at.desc())
+        .limit(1)
+    )
+    if existing is not None and existing.state in (
+        JobState.PENDING,
+        JobState.RUNNING,
+        JobState.RECONCILIATION,
+    ):
+        return existing
+    idempotency_key = (
+        base_key
+        if existing is None
+        else f"{base_key}:run:{existing.version}"
+    )
+    job = await job_service.enqueue(
+        db_session,
+        "knowledge.drive_source.sync",
+        idempotency_key,
+        {"source_id": str(source.id), "page_token": source.sync_cursor},
+    )
+    await outbox_service.add(
+        db_session,
+        "knowledge.drive_source.sync.requested",
+        "job",
+        job.id,
+        {"source_id": str(source.id)},
+    )
+    return job
