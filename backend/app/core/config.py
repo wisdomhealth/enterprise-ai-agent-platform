@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
     anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
+    reranker_enabled: bool = Field(default=False, validation_alias="RERANKER_ENABLED")
     google_oidc_client_id: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_OIDC_CLIENT_ID"
     )

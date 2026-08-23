@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -20,6 +21,9 @@ from app.modules.knowledge.models import (
 )
 from app.modules.knowledge.parsers import DocumentParseError, DocumentParser, PdfParser, WordParser
 from app.modules.knowledge.service import KnowledgeSourceService
+
+if TYPE_CHECKING:
+    from app.modules.rag.types import EmbeddingProvider
 
 
 class DocumentIngestionService:
@@ -111,6 +115,12 @@ class DocumentIngestionService:
         parser: DocumentParser | None = None,
     ) -> DocumentVersion:
         return await self.ingest_bytes(document, content, mime_type, parser)
+
+    async def publish_embeddings(self, version_id: UUID, provider: "EmbeddingProvider") -> DocumentVersion:
+        """Publish a completed parse only through the atomic embedding boundary."""
+        from app.modules.rag.embeddings import EmbeddingPublicationService
+
+        return await EmbeddingPublicationService(self._db_session, provider).publish(version_id)
 
     async def ingest_bytes(
         self,

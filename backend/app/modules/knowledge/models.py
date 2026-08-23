@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     Boolean,
+    Computed,
     DateTime,
     Enum,
     ForeignKey,
@@ -15,9 +16,10 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy import text as sql_text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 
 from app.db.base import Base
 
@@ -205,6 +207,18 @@ class DocumentChunk(Base):
         UniqueConstraint(
             "document_version_id", "ordinal", name="uq_document_chunks_version_ordinal"
         ),
+        Index(
+            "ix_document_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        Index(
+            "ix_document_chunks_search_vector_gin",
+            "search_vector",
+            postgresql_using="gin",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
@@ -220,6 +234,11 @@ class DocumentChunk(Base):
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     metadata_: Mapped[dict[str, object]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default=sql_text("'{}'::jsonb")
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
+    search_vector: Mapped[object] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', text)", persisted=True),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

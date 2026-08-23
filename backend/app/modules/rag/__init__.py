@@ -1,0 +1,1 @@
+"""Permission-filtered retrieval primitives."""
