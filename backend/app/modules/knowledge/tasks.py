@@ -141,11 +141,6 @@ async def _run_drive_sync(job_id: str | None) -> None:
 
 async def _consume_drive_sync_intent(job_id: UUID) -> None:
     """The only consumer path for scheduled and manual sync intents."""
-    settings = Settings()
-    connector_service = ConnectorService.from_settings(settings)
-    gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
-    if connector_service is None or gateway_factory is None:
-        raise RuntimeError("Google Drive connector credentials are not configured")
     async with async_sessionmaker() as db_session:
         lease_service = JobLeaseService(db_session)
         job = await lease_service.claim(job_id, DRIVE_SYNC_WORKER_ID, DRIVE_SYNC_LEASE_SECONDS)
@@ -154,6 +149,34 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
         await db_session.commit()
         try:
             source_id = UUID(str(job.payload["source_id"]))
+            source = await db_session.get(DriveSource, source_id)
+            if source is None:
+                raise LookupError("knowledge source not found")
+            if source.status is not DriveSourceStatus.ACTIVE:
+                # A source disabled for reauthorization (or by an operator) is
+                # not a successful no-op.  Fence the terminal state through
+                # the existing lease service before any credential lookup or
+                # Drive I/O, so a newly enqueued manual request cannot create
+                # false last-success evidence.
+                error_code = (
+                    "DRIVE_REAUTH_REQUIRED"
+                    if source.status is DriveSourceStatus.ERROR
+                    else "DRIVE_SOURCE_DISABLED"
+                )
+                await lease_service.retry(
+                    job.id,
+                    DRIVE_SYNC_WORKER_ID,
+                    error_code=error_code,
+                    error_class=ErrorClass.NON_RETRYABLE,
+                    expected_version=job.version,
+                )
+                await db_session.commit()
+                return
+            settings = Settings()
+            connector_service = ConnectorService.from_settings(settings)
+            gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
+            if connector_service is None or gateway_factory is None:
+                raise RuntimeError("Google Drive connector credentials are not configured")
             raw_page_token = job.payload.get("page_token")
             if raw_page_token is not None and not isinstance(raw_page_token, str):
                 raise ValueError("invalid Drive sync page token")
