@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 from celery import shared_task  # type: ignore[import-untyped]
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -18,12 +18,10 @@ from app.modules.knowledge.models import Document, DocumentVersion, DriveSource,
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.sync import DriveSyncService
 from app.modules.outbox.models import OutboxEvent
-from app.modules.outbox.service import OutboxService
 
 DRIVE_SYNC_TASK_NAME = "app.modules.knowledge.tasks.drive_source_sync"
 DRIVE_SYNC_WORKER_ID = "celery-drive-sync"
 DRIVE_SYNC_LEASE_SECONDS = 300
-DRIVE_SYNC_OUTBOX_CONSUMER = "celery-drive-sync-dispatcher"
 
 
 class DocumentParseTask:
@@ -55,25 +53,66 @@ def dispatch_drive_sync_outbox_event(event_id: str) -> None:
     asyncio.run(_dispatch_drive_sync_outbox_event(UUID(event_id)))
 
 
+@shared_task(name="app.modules.knowledge.tasks.dispatch_pending_drive_sync_outbox_events")  # type: ignore[untyped-decorator]
+def dispatch_pending_drive_sync_outbox_events() -> None:
+    """Retry durable events left behind by a post-commit broker wakeup failure."""
+    asyncio.run(_dispatch_pending_drive_sync_outbox_events())
+
+
 async def _dispatch_drive_sync_outbox_event(
     event_id: UUID, *, db_session: AsyncSession | None = None
 ) -> bool:
     if db_session is None:
         async with async_sessionmaker() as owned_session:
             return await _dispatch_drive_sync_outbox_event(event_id, db_session=owned_session)
-    event = await db_session.get(OutboxEvent, event_id)
-    if event is None or event.event_type != "knowledge.drive_source.sync.requested":
-        return False
-    accepted = await OutboxService().begin_processing(
-        db_session, DRIVE_SYNC_OUTBOX_CONSUMER, event.event_id
+    event = await db_session.scalar(
+        select(OutboxEvent)
+        .where(OutboxEvent.event_id == event_id)
+        .execution_options(populate_existing=True)
     )
-    if not accepted:
-        await db_session.commit()
+    if (
+        event is None
+        or event.event_type != "knowledge.drive_source.sync.requested"
+        or event.published_at is not None
+    ):
         return False
     job_id = event.aggregate_id
+    # Submit first. A broker failure leaves the row pending; a crash after a
+    # successful submit can duplicate delivery, which the leased JobIntent
+    # consumer safely absorbs.  Attempts are observable without turning a
+    # failed delivery into a processed event.
+    try:
+        drive_source_sync.delay(str(job_id))
+    except Exception:
+        event.publish_attempts += 1
+        await db_session.commit()
+        raise
+    event.publish_attempts += 1
+    event.published_at = func.clock_timestamp()
     await db_session.commit()
-    drive_source_sync.delay(str(job_id))
     return True
+
+
+async def _dispatch_pending_drive_sync_outbox_events(
+    *, db_session: AsyncSession | None = None
+) -> None:
+    """Sweep durable events left pending after a process or broker failure."""
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            await _dispatch_pending_drive_sync_outbox_events(db_session=owned_session)
+            return
+    event_ids = list(
+        (
+            await db_session.scalars(
+                select(OutboxEvent.event_id).where(
+                    OutboxEvent.event_type == "knowledge.drive_source.sync.requested",
+                    OutboxEvent.published_at.is_(None),
+                )
+            )
+        ).all()
+    )
+    for event_id in event_ids:
+        await _dispatch_drive_sync_outbox_event(event_id, db_session=db_session)
 
 
 async def _run_drive_sync(job_id: str | None) -> None:

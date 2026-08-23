@@ -45,6 +45,16 @@ class CredentialFailureBoundary:
         raise _CredentialRejected()
 
 
+class TransientFailureBoundary:
+    async def list_changes(self, _db_session, *, source, sync_cursor):  # type: ignore[no-untyped-def]
+        raise RuntimeError("temporary Drive failure")
+
+
+class EmptyRetryBoundary:
+    async def list_changes(self, _db_session, *, source, sync_cursor):  # type: ignore[no-untyped-def]
+        return [], "cursor-2"
+
+
 @pytest.mark.asyncio
 async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> None:  # type: ignore[no-untyped-def]
     organization = Organization(name="Authorization loss owner")
@@ -160,3 +170,38 @@ async def test_invalid_drive_credentials_require_reauthorization(db_session) -> 
     assert persisted_source.status.value == "ERROR"
     assert persisted_connector is not None
     assert persisted_connector.status is ConnectorStatus.REAUTH_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_transient_drive_failure_keeps_source_retryable(db_session) -> None:  # type: ignore[no-untyped-def]
+    organization = Organization(name="Transient sync owner")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(organization_id=organization.id)
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    source = DriveSource(
+        organization_id=organization.id,
+        knowledge_base_id=knowledge_base.id,
+        root_folder_id="root",
+        allowed_descendant_ids=[],
+        connection_identity="reader@example.test",
+        sync_cursor="cursor-1",
+    )
+    db_session.add(source)
+    await db_session.commit()
+    source_id = source.id
+
+    with pytest.raises(RuntimeError, match="temporary Drive failure"):
+        await DriveSyncService(db_session, page_gateway=TransientFailureBoundary()).sync(
+            source_id, "cursor-1"
+        )
+    await db_session.rollback()
+    persisted = await db_session.get(DriveSource, source_id)
+    assert persisted is not None
+    assert persisted.status.value == "ACTIVE"
+
+    retried = await DriveSyncService(db_session, page_gateway=EmptyRetryBoundary()).sync(
+        source_id, "cursor-1"
+    )
+    assert retried.cursor == "cursor-2"

@@ -115,8 +115,8 @@ class DriveSyncService:
                 await self._mark_reauth_required(source)
                 await self._db_session.commit()
                 return SyncResult(source.id, source.sync_cursor, 0, 0, 0, reauth_required=True)
-            source.status = DriveSourceStatus.ERROR
-            await self._db_session.commit()
+            # The durable sync JobIntent records a retryable failure.  Keep the
+            # source active so its later job retry performs real Drive I/O.
             raise
 
         enqueued = revoked = isolated = 0

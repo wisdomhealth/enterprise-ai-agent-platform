@@ -18,7 +18,11 @@ def create_celery(settings: Settings | None = None) -> Celery:
             "knowledge-drive-source-sync": {
                 "task": "app.modules.knowledge.tasks.drive_source_sync",
                 "schedule": 15 * 60,
-            }
+            },
+            "knowledge-drive-sync-outbox-dispatch": {
+                "task": "app.modules.knowledge.tasks.dispatch_pending_drive_sync_outbox_events",
+                "schedule": 60,
+            },
         },
     )
     return celery_app

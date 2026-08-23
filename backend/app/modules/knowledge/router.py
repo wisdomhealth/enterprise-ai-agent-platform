@@ -68,7 +68,12 @@ async def request_drive_sync(
     from app.modules.knowledge.tasks import dispatch_drive_sync_outbox_event
 
     if enqueued.outbox_event_id is not None:
-        dispatch_drive_sync_outbox_event.delay(str(enqueued.outbox_event_id))
+        try:
+            dispatch_drive_sync_outbox_event.delay(str(enqueued.outbox_event_id))
+        except Exception:
+            # The committed outbox row remains authoritative; the periodic
+            # dispatcher sweep redelivers this best-effort wakeup.
+            pass
     return DriveSyncEnqueued(job_id=enqueued.job.id, state=enqueued.job.state.value)
 
 

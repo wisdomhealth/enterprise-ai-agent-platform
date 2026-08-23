@@ -14,7 +14,9 @@ from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.knowledge.sync import drive_sync_job_key
 from app.modules.knowledge.tasks import (
     _dispatch_drive_sync_outbox_event,
+    _dispatch_pending_drive_sync_outbox_events,
     dispatch_drive_sync_outbox_event,
+    dispatch_pending_drive_sync_outbox_events,
     drive_source_sync,
 )
 from app.modules.outbox.models import OutboxEvent
@@ -59,6 +61,13 @@ def test_outbox_dispatcher_is_registered_for_drive_sync_delivery() -> None:
     )
 
 
+def test_pending_outbox_sweeper_is_registered_for_restart_recovery() -> None:
+    assert (
+        dispatch_pending_drive_sync_outbox_events.name
+        == "app.modules.knowledge.tasks.dispatch_pending_drive_sync_outbox_events"
+    )
+
+
 @pytest.mark.asyncio
 async def test_outbox_delivery_dispatches_once_to_the_drive_sync_consumer(
     db_session, monkeypatch
@@ -85,6 +94,69 @@ async def test_outbox_delivery_dispatches_once_to_the_drive_sync_consumer(
     assert first is True
     assert second is False
     assert dispatched == [str(job_id)]
+
+
+@pytest.mark.asyncio
+async def test_broker_failure_leaves_outbox_event_pending_for_safe_redelivery(
+    db_session, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    job_id = uuid4()
+    event = OutboxEvent(
+        event_type="knowledge.drive_source.sync.requested",
+        aggregate_type="job",
+        aggregate_id=job_id,
+        payload={"source_id": str(uuid4())},
+    )
+    db_session.add(event)
+    await db_session.commit()
+    event_id = event.event_id
+
+    def broker_down(_job_id_value: str) -> None:
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(drive_source_sync, "delay", broker_down)
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        await _dispatch_drive_sync_outbox_event(event_id, db_session=db_session)
+    db_session.expire_all()
+    pending = await db_session.get(OutboxEvent, event_id)
+    assert pending is not None
+    assert pending.published_at is None
+    assert pending.publish_attempts == 1
+
+    delivered: list[str] = []
+    monkeypatch.setattr(drive_source_sync, "delay", delivered.append)
+    assert await _dispatch_drive_sync_outbox_event(event_id, db_session=db_session) is True
+    assert delivered == [str(job_id)]
+
+
+@pytest.mark.asyncio
+async def test_pending_outbox_sweeper_redelivers_after_post_commit_wakeup_loss(
+    db_session, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    job_id = uuid4()
+    event = OutboxEvent(
+        event_type="knowledge.drive_source.sync.requested",
+        aggregate_type="job",
+        aggregate_id=job_id,
+        payload={"source_id": str(uuid4())},
+    )
+    db_session.add(event)
+    await db_session.commit()
+    event_id = event.event_id
+
+    delivered: list[str] = []
+    monkeypatch.setattr(drive_source_sync, "delay", delivered.append)
+
+    # This is the restart path: the request transaction committed, but no
+    # post-commit broker wakeup was observed before the process disappeared.
+    await _dispatch_pending_drive_sync_outbox_events(db_session=db_session)
+    db_session.expire_all()
+    persisted = await db_session.get(OutboxEvent, event_id)
+
+    assert delivered == [str(job_id)]
+    assert persisted is not None
+    assert persisted.published_at is not None
+    assert persisted.publish_attempts == 1
 
 
 class _ConfigurationBoundary:
