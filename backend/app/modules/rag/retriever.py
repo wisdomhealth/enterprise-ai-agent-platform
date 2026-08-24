@@ -1,6 +1,8 @@
 import asyncio
 from uuid import UUID
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from app.modules.identity.dependencies import Principal
 from app.modules.rag.rrf import reciprocal_rank_fusion
 from app.modules.rag.types import (
@@ -31,6 +33,31 @@ class HybridRetriever(Retriever):
         self._reranker = reranker
         self._reranker_enabled = reranker_enabled
 
+    @classmethod
+    def from_session_factory(
+        cls,
+        session_factory: async_sessionmaker[AsyncSession],
+        embedding_provider: EmbeddingProvider,
+        *,
+        reranker: Reranker | None = None,
+        reranker_enabled: bool = False,
+    ) -> "HybridRetriever":
+        """Build parallel PostgreSQL branches with a fresh session per branch."""
+        from app.modules.rag.text_search import (
+            TextCandidateSource as PostgreSQLTextCandidateSource,
+        )
+        from app.modules.rag.vector_search import (
+            VectorCandidateSource as PostgreSQLVectorCandidateSource,
+        )
+
+        return cls(
+            PostgreSQLVectorCandidateSource(session_factory),
+            PostgreSQLTextCandidateSource(session_factory),
+            embedding_provider,
+            reranker=reranker,
+            reranker_enabled=reranker_enabled,
+        )
+
     async def retrieve(
         self,
         principal: Principal,
@@ -43,6 +70,12 @@ class HybridRetriever(Retriever):
         vectors = await self._embedding_provider.embed([query])
         if len(vectors) != 1:
             raise ValueError("embedding provider did not return one query vector")
+        vector_session = getattr(self._vector_source, "bound_session", None)
+        text_session = getattr(self._text_source, "bound_session", None)
+        if vector_session is not None and vector_session is text_session:
+            raise RuntimeError(
+                "parallel hybrid retrieval requires independently scoped database sessions"
+            )
         vector, text = await asyncio.gather(
             self._vector_source.search(
                 principal, knowledge_base_id, query, limit, query_embedding=vectors[0]

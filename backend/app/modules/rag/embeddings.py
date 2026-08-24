@@ -1,5 +1,5 @@
 import math
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -77,7 +77,12 @@ class EmbeddingPublicationService:
         self._db_session = db_session
         self._provider = provider
 
-    async def publish(self, version_id: UUID) -> DocumentVersion:
+    async def publish(
+        self,
+        version_id: UUID,
+        *,
+        before_publish: Callable[[], Awaitable[None]] | None = None,
+    ) -> DocumentVersion:
         version = await self._db_session.scalar(
             select(DocumentVersion)
             .where(DocumentVersion.id == version_id)
@@ -104,6 +109,8 @@ class EmbeddingPublicationService:
         vectors = await self._provider.embed([chunk.text for chunk in chunks])
         if len(vectors) != len(chunks) or not all(_valid_vector(vector) for vector in vectors):
             raise ValueError("embedding provider returned an invalid vector batch")
+        if before_publish is not None:
+            await before_publish()
         for chunk, vector in zip(chunks, vectors, strict=True):
             chunk.embedding = vector
         document = await self._db_session.get(Document, version.document_id, with_for_update=True)

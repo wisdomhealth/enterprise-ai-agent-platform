@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
@@ -145,6 +145,27 @@ class CountingPdfParser:
         return PdfParser().parse(content)
 
 
+class ValidEmbeddingProvider:
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0] * 1536 for _ in texts]
+
+
+class InvalidEmbeddingProvider:
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0] * 1535 for _ in texts]
+
+
+@pytest.fixture(autouse=True)
+def configured_embedding_provider(monkeypatch):  # type: ignore[no-untyped-def]
+    from app.modules.rag.embeddings import OpenAIEmbeddingProvider
+
+    monkeypatch.setattr(
+        OpenAIEmbeddingProvider,
+        "from_settings",
+        classmethod(lambda cls, settings: ValidEmbeddingProvider()),
+    )
+
+
 async def _document(db_session, *, current_is_retrievable: bool) -> Document:
     organization = Organization(name=f"document ingestion {uuid4()}")
     db_session.add(organization)
@@ -192,6 +213,7 @@ async def _authorized_ingestion_service(
     content: bytes | None = None,
     download_error: Exception | None = None,
     job_lease_service: JobLeaseService | None = None,
+    embedding_provider: object | None = None,
 ):
     key_path = tmp_path / "connector-master-key"
     key_path.write_bytes(b"k" * 32)
@@ -222,6 +244,7 @@ async def _authorized_ingestion_service(
         knowledge_source_service=source_service,
         worker_id="task-8-test-worker",
         job_lease_service=job_lease_service,
+        embedding_provider=embedding_provider,
     ), gateway
 
 
@@ -281,14 +304,19 @@ async def test_parsed_version_is_not_retrievable_before_embedding(db_session) ->
 
 
 @pytest.mark.asyncio
-async def test_parse_job_downloads_authorized_file_and_persists_processing_chunks(
+async def test_parse_job_embeds_authorized_file_and_publishes_complete_version(
     db_session, tmp_path
 ) -> None:
     document = await _document(db_session, current_is_retrievable=False)
     source = await db_session.get(DriveSource, document.source_id)
     assert source is not None
     source.allowed_descendant_ids = ["authorized-folder"]
-    service, gateway = await _authorized_ingestion_service(db_session, document, tmp_path)
+    service, gateway = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        embedding_provider=ValidEmbeddingProvider(),
+    )
     job = await JobService().enqueue(
         db_session,
         "knowledge.document.parse",
@@ -305,8 +333,8 @@ async def test_parse_job_downloads_authorized_file_and_persists_processing_chunk
     await db_session.refresh(job)
     assert gateway.download_calls == ["drive-file-1"]
     assert repeated_version.id == version.id
-    assert version.state is DocumentVersionState.PROCESSING
-    assert document.current_version_id != version.id
+    assert version.state is DocumentVersionState.RETRIEVABLE
+    assert document.current_version_id == version.id
     assert job.state is JobState.SUCCEEDED
     assert job.payload["document_version_id"] == str(version.id)
     chunks = (
@@ -315,6 +343,53 @@ async def test_parse_job_downloads_authorized_file_and_persists_processing_chunk
         )
     ).all()
     assert chunks
+    assert all(chunk.embedding is not None for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_parse_job_keeps_prior_current_version_when_embeddings_are_invalid(
+    db_session, tmp_path
+) -> None:
+    document = await _document(db_session, current_is_retrievable=True)
+    prior_version_id = document.current_version_id
+    assert prior_version_id is not None
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    service, _ = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        embedding_provider=InvalidEmbeddingProvider(),
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        "document-parse-invalid-embeddings",
+        {
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+
+    with pytest.raises(ValueError, match="invalid vector batch"):
+        await service.parse(job.id)
+
+    await db_session.refresh(document)
+    await db_session.refresh(job)
+    version_id = job.payload["document_version_id"]
+    assert document.current_version_id == prior_version_id
+    assert job.state is JobState.PENDING
+    assert isinstance(version_id, str)
+    version = await db_session.get(DocumentVersion, UUID(version_id))
+    assert version is not None
+    assert version.state is DocumentVersionState.PROCESSING
+    chunks = (
+        await db_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_version_id == version.id)
+        )
+    ).all()
+    assert all(chunk.embedding is None for chunk in chunks)
 
 
 @pytest.mark.asyncio
@@ -600,6 +675,7 @@ async def test_parse_job_recovers_after_completion_lease_loss_without_duplicate_
     db_session, tmp_path
 ) -> None:
     document = await _document(db_session, current_is_retrievable=False)
+    document_id = document.id
     source = await db_session.get(DriveSource, document.source_id)
     assert source is not None
     source.allowed_descendant_ids = ["authorized-folder"]
@@ -629,7 +705,7 @@ async def test_parse_job_recovers_after_completion_lease_loss_without_duplicate_
     assert isinstance(version_id, str)
     versions = (
         await db_session.scalars(
-            select(DocumentVersion).where(DocumentVersion.document_id == document.id)
+            select(DocumentVersion).where(DocumentVersion.document_id == document_id)
         )
     ).all()
     assert len(versions) == 1

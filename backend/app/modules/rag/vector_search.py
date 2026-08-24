@@ -2,7 +2,7 @@ from typing import cast
 from uuid import UUID
 
 from sqlalchemy import Select, and_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.authorization.models import ResourceGrant
 from app.modules.identity.dependencies import Principal
@@ -23,11 +23,16 @@ class VectorCandidateSource:
 
     def __init__(
         self,
-        db_session: AsyncSession,
+        db_session: AsyncSession | async_sessionmaker[AsyncSession],
         embedding_provider: EmbeddingProvider | None = None,
     ) -> None:
         self._db_session = db_session
         self._embedding_provider = embedding_provider
+
+    @property
+    def bound_session(self) -> AsyncSession | None:
+        """Expose session affinity so HybridRetriever can reject unsafe sharing."""
+        return self._db_session if isinstance(self._db_session, AsyncSession) else None
 
     async def search(
         self,
@@ -47,7 +52,24 @@ class VectorCandidateSource:
             if len(vectors) != 1:
                 raise ValueError("embedding provider did not return one query vector")
             query_embedding = vectors[0]
-        rows = await self._db_session.execute(
+        if isinstance(self._db_session, AsyncSession):
+            return await self._search_with_session(
+                self._db_session, principal, knowledge_base_id, query_embedding, limit
+            )
+        async with self._db_session() as db_session:
+            return await self._search_with_session(
+                db_session, principal, knowledge_base_id, query_embedding, limit
+            )
+
+    async def _search_with_session(
+        self,
+        db_session: AsyncSession,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        query_embedding: list[float],
+        limit: int,
+    ) -> list[RetrievedChunk]:
+        rows = await db_session.execute(
             _authorized_chunks_query(principal, knowledge_base_id)
             .where(DocumentChunk.embedding.is_not(None))
             .order_by(DocumentChunk.embedding.cosine_distance(query_embedding), DocumentChunk.id)

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
@@ -36,6 +36,7 @@ class DocumentIngestionService:
         worker_id: str | None = None,
         job_lease_seconds: int = 300,
         job_lease_service: JobLeaseService | None = None,
+        embedding_provider: "EmbeddingProvider | None" = None,
     ) -> None:
         self._db_session = db_session
         self._chunker = chunker or DeterministicChunker()
@@ -43,6 +44,7 @@ class DocumentIngestionService:
         self._worker_id = worker_id
         self._job_lease_seconds = job_lease_seconds
         self._job_lease_service = job_lease_service
+        self._embedding_provider = embedding_provider
 
     async def parse(self, job_id: UUID) -> DocumentVersion:
         """Parse one durable job through the existing authorized Drive download boundary."""
@@ -61,32 +63,37 @@ class DocumentIngestionService:
         # without waiting for this worker's parse transaction to end.
         await self._db_session.commit()
         try:
-            recovered_version = await self._persisted_processing_version(job)
-            if recovered_version is not None:
+            version = await self._version_from_job(job)
+            if version is not None and version.state is DocumentVersionState.RETRIEVABLE:
                 await lease_service.complete(job.id, self._worker_id)
                 await self._db_session.commit()
-                return recovered_version
-            document_id = self._document_id_from_payload(job.payload)
-            document = await self._db_session.get(Document, document_id)
-            if document is None:
-                raise DocumentParseError("DOCUMENT_NOT_FOUND")
-            source = await self._db_session.get(DriveSource, document.source_id)
-            if source is None or source.organization_id != document.organization_id:
-                raise DocumentParseError("DOCUMENT_SOURCE_NOT_FOUND")
-            drive_file = self._drive_file_from_payload(job.payload)
-            if drive_file.id != document.external_id:
-                raise DocumentParseError("DOCUMENT_FILE_MISMATCH")
-            content = await self._knowledge_source_service.download_authorized(
-                self._db_session,
-                source=source,
-                file=drive_file,
-            )
-            version = await self.parse_bytes(document, content, drive_file.mime_type)
-            await self._commit_processing_checkpoint(job, version)
+                return version
+            if version is not None and version.state is not DocumentVersionState.PROCESSING:
+                raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+            if version is None:
+                document_id = self._document_id_from_payload(job.payload)
+                document = await self._db_session.get(Document, document_id)
+                if document is None:
+                    raise DocumentParseError("DOCUMENT_NOT_FOUND")
+                source = await self._db_session.get(DriveSource, document.source_id)
+                if source is None or source.organization_id != document.organization_id:
+                    raise DocumentParseError("DOCUMENT_SOURCE_NOT_FOUND")
+                drive_file = self._drive_file_from_payload(job.payload)
+                if drive_file.id != document.external_id:
+                    raise DocumentParseError("DOCUMENT_FILE_MISMATCH")
+                content = await self._knowledge_source_service.download_authorized(
+                    self._db_session,
+                    source=source,
+                    file=drive_file,
+                )
+                version = await self.parse_bytes(document, content, drive_file.mime_type)
+                await self._commit_processing_checkpoint(job, version)
+            version = await self._publish_processing_version(job, version)
             await lease_service.complete(job.id, self._worker_id)
             await self._db_session.commit()
             return version
         except JobLeaseLost:
+            await self._db_session.rollback()
             raise
         except (DocumentParseError, HTTPException) as exc:
             error_code = (
@@ -116,11 +123,44 @@ class DocumentIngestionService:
     ) -> DocumentVersion:
         return await self.ingest_bytes(document, content, mime_type, parser)
 
-    async def publish_embeddings(self, version_id: UUID, provider: "EmbeddingProvider") -> DocumentVersion:
+    async def publish_embeddings(
+        self, version_id: UUID, provider: "EmbeddingProvider"
+    ) -> DocumentVersion:
         """Publish a completed parse only through the atomic embedding boundary."""
         from app.modules.rag.embeddings import EmbeddingPublicationService
 
         return await EmbeddingPublicationService(self._db_session, provider).publish(version_id)
+
+    async def _publish_processing_version(
+        self,
+        job: JobIntent,
+        version: DocumentVersion,
+    ) -> DocumentVersion:
+        """Embed a durable checkpoint, retaining the Task 8 lease fence at publication."""
+        from app.core.config import Settings
+        from app.modules.rag.embeddings import EmbeddingPublicationService, OpenAIEmbeddingProvider
+
+        provider = self._embedding_provider or OpenAIEmbeddingProvider.from_settings(Settings())
+        return await EmbeddingPublicationService(self._db_session, provider).publish(
+            version.id,
+            before_publish=lambda: self._assert_active_lease(job),
+        )
+
+    async def _assert_active_lease(self, job: JobIntent) -> None:
+        lease_owner = await self._db_session.scalar(
+            select(JobIntent.id)
+            .where(
+                JobIntent.id == job.id,
+                JobIntent.state == JobState.RUNNING,
+                JobIntent.lease_owner == self._worker_id,
+                JobIntent.version == job.version,
+                JobIntent.lease_expires_at.is_not(None),
+                JobIntent.lease_expires_at > func.clock_timestamp(),
+            )
+            .with_for_update()
+        )
+        if lease_owner is None:
+            raise JobLeaseLost(job.id)
 
     async def ingest_bytes(
         self,
@@ -233,8 +273,8 @@ class DocumentIngestionService:
         job = await self._db_session.get(JobIntent, job_id)
         if job is None or job.state is not JobState.SUCCEEDED:
             raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
-        version = await self._persisted_processing_version(job)
-        if version is None:
+        version = await self._version_from_job(job)
+        if version is None or version.state is not DocumentVersionState.RETRIEVABLE:
             raise DocumentParseError("DOCUMENT_PARSE_JOB_UNAVAILABLE")
         return version
 
@@ -268,7 +308,7 @@ class DocumentIngestionService:
         # row locking plus predicate re-evaluation fences both expiry and takeover.
         await self._db_session.commit()
 
-    async def _persisted_processing_version(self, job: JobIntent) -> DocumentVersion | None:
+    async def _version_from_job(self, job: JobIntent) -> DocumentVersion | None:
         raw_version_id = job.payload.get("document_version_id")
         if not isinstance(raw_version_id, str):
             return None
@@ -277,7 +317,7 @@ class DocumentIngestionService:
         except ValueError as exc:
             raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB") from exc
         version = await self._db_session.get(DocumentVersion, version_id)
-        if version is None or version.state is not DocumentVersionState.PROCESSING:
+        if version is None:
             raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
         document_id = self._document_id_from_payload(job.payload)
         if version.document_id != document_id:
