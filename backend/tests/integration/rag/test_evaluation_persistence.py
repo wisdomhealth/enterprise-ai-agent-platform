@@ -67,6 +67,7 @@ async def test_evaluation_runs_append_immutable_case_evidence_without_overwritin
         retrieved_document_version_ids=[uuid4()],
         citation_chunk_ids=[uuid4()],
         citation_document_version_ids=[uuid4()],
+        snapshot={"input": {"expected_claims": ["Refunds take five business days."]}},
     )
     repository = EvaluationRunRepository(db_session)
 
@@ -84,6 +85,7 @@ async def test_evaluation_runs_append_immutable_case_evidence_without_overwritin
     assert stored_case is not None
     assert stored_case.retrieved_chunk_ids == case.retrieved_chunk_ids
     assert stored_case.citation_document_version_ids == case.citation_document_version_ids
+    assert stored_case.snapshot == case.snapshot
 
     with pytest.raises(IntegrityError):
         await repository.append(run, [case])

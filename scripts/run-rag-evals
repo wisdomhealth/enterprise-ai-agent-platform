@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from uuid import UUID, uuid4
 
+PERSIST_DATABASE_URL = os.environ.get("DATABASE_URL")
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = SCRIPT_ROOT / "backend"
 PROJECT_PYTHON = BACKEND_ROOT / ".venv" / "bin" / "python"
@@ -23,14 +24,13 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 # The deterministic fake provider makes no database calls, but Principal imports the
 # application dependency module whose engine configuration is intentionally strict.
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql+asyncpg://postgres@localhost:5432/platform_test"
-)
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres@localhost:5432/platform_test")
 
 from app.modules.identity.dependencies import Principal  # noqa: E402
 from app.modules.identity.models import UserRole  # noqa: E402
 from app.modules.rag.answer_service import AnswerExecution  # noqa: E402
 from app.modules.rag.evaluation import (  # noqa: E402
+    EvaluationRunRepository,
     EvaluationProvenance,
     RAGEvaluationRunner,
     load_evaluation_dataset,
@@ -66,10 +66,12 @@ class DeterministicFakeAnswerService:
     async def answer_with_evidence(
         self, principal: Principal, knowledge_base_id: UUID, query: str, audience: AnswerAudience
     ) -> AnswerExecution:
-        return AnswerExecution(await self.answer(principal, knowledge_base_id, query, audience), [], 0, 0)
+        return AnswerExecution(
+            await self.answer(principal, knowledge_base_id, query, audience), [], 0, 0
+        )
 
 
-async def _run(dataset_path: Path) -> int:
+async def _run(dataset_path: Path, *, persist: bool) -> int:
     dataset = load_evaluation_dataset(dataset_path)
     principal = Principal(
         subject_id=uuid4(),
@@ -87,9 +89,19 @@ async def _run(dataset_path: Path) -> int:
         prompt_version="grounded-answer-v1",
         llm_model="fake-rag-evaluation-v1",
     )
-    run = await RAGEvaluationRunner(DeterministicFakeAnswerService()).run(
-        principal, uuid4(), dataset, provenance
-    )
+    knowledge_base_id = uuid4()
+    if persist:
+        from app.core.database import async_sessionmaker  # noqa: E402
+
+        async with async_sessionmaker() as session:
+            async with session.begin():
+                run = await RAGEvaluationRunner(
+                    DeterministicFakeAnswerService(), EvaluationRunRepository(session)
+                ).run(principal, knowledge_base_id, dataset, provenance)
+    else:
+        run = await RAGEvaluationRunner(DeterministicFakeAnswerService()).run(
+            principal, knowledge_base_id, dataset, provenance
+        )
     payload = run.model_dump(mode="json")
     payload["quality_targets"] = {
         "recall_at_10": 0.85,
@@ -111,8 +123,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument("--provider", required=True, choices=["fake"])
+    parser.add_argument("--no-persist", action="store_true")
     args = parser.parse_args()
-    return asyncio.run(_run(args.dataset))
+    return asyncio.run(
+        _run(args.dataset, persist=bool(PERSIST_DATABASE_URL) and not args.no_persist)
+    )
 
 
 if __name__ == "__main__":

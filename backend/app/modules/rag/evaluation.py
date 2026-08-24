@@ -272,6 +272,7 @@ class EvaluationCaseProvenance(BaseModel):
     retrieved_document_version_ids: list[UUID]
     citation_chunk_ids: list[UUID]
     citation_document_version_ids: list[UUID]
+    snapshot: dict[str, object]
 
 
 class EvaluationRunRepository:
@@ -417,6 +418,14 @@ class RAGEvaluationRunner:
                         for citation in answer.citations
                         if isinstance(citation, SourceCitation)
                     ],
+                    snapshot={
+                        "input": case.model_dump(mode="json"),
+                        "result": answer.model_dump(mode="json"),
+                        "claims": [claim.model_dump(mode="json") for claim in claims],
+                        "citation_mapping": citation_mapping,
+                        "candidate_authorized": candidate_authorized,
+                        "forbidden_document": candidate_forbidden or cited_forbidden,
+                    },
                 )
             )
 

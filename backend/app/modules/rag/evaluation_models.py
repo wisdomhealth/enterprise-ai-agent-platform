@@ -79,3 +79,4 @@ class RAGEvaluationCase(Base):
     citation_document_version_ids: Mapped[list[UUID]] = mapped_column(
         ARRAY(PostgreSQLUUID(as_uuid=True)), nullable=False
     )
+    snapshot: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
