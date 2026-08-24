@@ -1,5 +1,4 @@
 import re
-from collections.abc import Iterable
 from uuid import UUID
 
 from app.modules.identity.dependencies import Principal
@@ -8,30 +7,6 @@ from app.modules.rag.types import RetrievedChunk
 
 _WORD = re.compile(r"[a-z0-9]+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
-_STOP_WORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "by",
-        "for",
-        "from",
-        "in",
-        "is",
-        "it",
-        "of",
-        "on",
-        "or",
-        "that",
-        "the",
-        "to",
-        "with",
-    }
-)
 
 
 class GroundednessError(ValueError):
@@ -87,16 +62,22 @@ class CitationValidator:
             raise GroundednessError("claim cites unauthorized or revoked source")
 
 
-def _claim_supported(claim: str, chunks: Iterable[RetrievedChunk]) -> bool:
-    meaningful_words = {
-        word
-        for word in _WORD.findall(claim.casefold())
-        if word not in _STOP_WORDS and len(word) > 1
-    }
-    if not meaningful_words:
+def _claim_supported(claim: str, chunks: list[RetrievedChunk]) -> bool:
+    """Accept only a complete, directly stated claim in one cited evidence sentence.
+
+    Token-set overlap cannot distinguish a statement from its negation, qualifier, or a
+    sentence assembled from unrelated evidence. This intentionally narrow contract fails
+    closed for paraphrases and other semantic uncertainty until a stronger independent
+    entailment check is available.
+    """
+    normalized_claim = _normalized(claim)
+    if not normalized_claim:
         return False
-    source_words = {word for chunk in chunks for word in _WORD.findall(chunk.text.casefold())}
-    return meaningful_words.issubset(source_words)
+    return any(
+        normalized_claim == _normalized(sentence)
+        for chunk in chunks
+        for sentence in _sentences(chunk.text)
+    )
 
 
 def _sentences(text: str) -> list[str]:
