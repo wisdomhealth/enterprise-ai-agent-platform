@@ -3,6 +3,7 @@ import time
 from collections.abc import Callable
 from uuid import UUID
 
+from app.core.config import Settings
 from app.core.telemetry import record_grounded_answer
 from app.modules.identity.dependencies import Principal
 from app.modules.rag.citations import project_citations
@@ -43,6 +44,49 @@ class GroundedAnswerService:
         self._refusal_message = refusal_message
         self._retrieval_limit = retrieval_limit
         self._telemetry = telemetry
+
+    @classmethod
+    def from_settings(cls, settings: "Settings") -> "GroundedAnswerService":
+        """Build the live read-only RAG path from explicitly configured providers."""
+        from redis.asyncio import from_url
+
+        from app.core.database import async_sessionmaker
+        from app.modules.rag.embeddings import OpenAIEmbeddingProvider
+        from app.modules.rag.llm import AnthropicGenerationProvider, RedisCircuitStore
+        from app.modules.rag.retriever import HybridRetriever
+
+        if (
+            settings.openai_api_key is None
+            or settings.anthropic_api_key is None
+            or settings.redis_url is None
+        ):
+            raise RuntimeError(
+                "OPENAI_API_KEY, ANTHROPIC_API_KEY, and REDIS_URL are required for Staff Assist"
+            )
+        embedding_provider = OpenAIEmbeddingProvider.from_settings(settings)
+        retriever = HybridRetriever.from_session_factory(
+            async_sessionmaker,
+            embedding_provider,
+            reranker_enabled=settings.reranker_enabled,
+        )
+        provider = AnthropicGenerationProvider(
+            settings.anthropic_api_key.get_secret_value(),
+            model=settings.anthropic_model,
+        )
+        circuit_breaker = ProviderCircuitBreaker(
+            RedisCircuitStore(
+                from_url(str(settings.redis_url))  # type: ignore[no-untyped-call]
+            ),
+            failure_threshold=settings.provider_circuit_failure_threshold,
+            reset_seconds=settings.provider_circuit_reset_seconds,
+        )
+        return cls(
+            retriever,
+            provider,
+            CitationValidator(),
+            circuit_breaker,
+            refusal_message=settings.grounded_refusal_message,
+        )
 
     async def answer(
         self,

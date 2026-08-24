@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Run versioned RAG evaluation fixtures without sending labels to a prompt or provider."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from uuid import UUID, uuid4
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+BACKEND_ROOT = SCRIPT_ROOT / "backend"
+PROJECT_PYTHON = BACKEND_ROOT / ".venv" / "bin" / "python"
+if PROJECT_PYTHON.is_file() and Path(sys.prefix).resolve() != (BACKEND_ROOT / ".venv").resolve():
+    os.execv(
+        str(PROJECT_PYTHON),
+        [str(PROJECT_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+# The deterministic fake provider makes no database calls, but Principal imports the
+# application dependency module whose engine configuration is intentionally strict.
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://postgres@localhost:5432/platform_test"
+)
+
+from app.modules.identity.dependencies import Principal  # noqa: E402
+from app.modules.identity.models import UserRole  # noqa: E402
+from app.modules.rag.evaluation import (  # noqa: E402
+    EvaluationProvenance,
+    RAGEvaluationRunner,
+    load_evaluation_dataset,
+)
+from app.modules.rag.types import AnswerAudience, ValidatedAnswer  # noqa: E402
+
+
+class DeterministicFakeRetriever:
+    """A no-network fixture boundary: it never reads labels or returns documents."""
+
+    async def retrieve(
+        self,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        query: str,
+        limit: int,
+    ) -> list[object]:
+        _ = (principal, knowledge_base_id, query, limit)
+        return []
+
+
+class DeterministicFakeAnswerService:
+    """A deterministic refusal baseline that receives only the question string."""
+
+    async def answer(
+        self,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        query: str,
+        audience: AnswerAudience,
+    ) -> ValidatedAnswer:
+        _ = (principal, knowledge_base_id, query, audience)
+        return ValidatedAnswer(
+            text="I don't know based on the available information.",
+            claims=[],
+            citations=[],
+            segments=["I don't know based on the available information."],
+            refused=True,
+            model="fake-rag-evaluation-v1",
+            prompt_version="grounded-answer-v1",
+            latency_ms=0,
+            input_tokens=0,
+            output_tokens=0,
+            estimated_cost=0.0,
+        )
+
+
+async def _run(dataset_path: Path) -> int:
+    dataset = load_evaluation_dataset(dataset_path)
+    principal = Principal(
+        subject_id=uuid4(),
+        organization_id=uuid4(),
+        email="evaluation@example.test",
+        role=UserRole.MEMBER,
+        session_id=uuid4(),
+        csrf_hash="evaluation",
+    )
+    provenance = EvaluationProvenance(
+        document_version_set="fixture-document-set-v1",
+        chunking_version="chunking-v1",
+        embedding_model="fake-embedding-v1",
+        retrieval_config={"retrieval_limit": "10", "rrf_k": "60", "reranker": "disabled"},
+        prompt_version="grounded-answer-v1",
+        llm_model="fake-rag-evaluation-v1",
+    )
+    run = await RAGEvaluationRunner(
+        DeterministicFakeRetriever(), DeterministicFakeAnswerService()
+    ).run(principal, uuid4(), dataset, provenance)
+    payload = run.model_dump(mode="json")
+    payload["quality_targets"] = {
+        "recall_at_10": 0.85,
+        "citation_support_rate": 0.95,
+        "abstention_rate": 0.90,
+    }
+    payload["quality_targets_met"] = {
+        "recall_at_10": run.metrics.recall_at_10 >= 0.85,
+        "citation_support_rate": run.metrics.citation_support_rate >= 0.95,
+        "abstention_rate": run.metrics.abstention_rate >= 0.90,
+    }
+    print(f"hard-gates: {'PASS' if run.hard_gates.passed else 'FAIL'}")
+    print("quality-targets: informational (not release gates)")
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if run.hard_gates.passed else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument("--provider", required=True, choices=["fake"])
+    args = parser.parse_args()
+    return asyncio.run(_run(args.dataset))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

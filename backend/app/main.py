@@ -11,6 +11,8 @@ from app.modules.identity.oidc import configure_google_oidc
 from app.modules.identity.router import router as identity_router
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.router import router as knowledge_router
+from app.modules.rag.answer_service import GroundedAnswerService
+from app.modules.rag.router import router as rag_router
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -22,6 +24,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.google_oidc_client = None
     app.state.connector_service = ConnectorService.from_settings(settings)
     app.state.drive_gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
+    app.state.grounded_answer_service = (
+        GroundedAnswerService.from_settings(settings)
+        if (
+            settings.openai_api_key is not None
+            and settings.anthropic_api_key is not None
+            and settings.redis_url is not None
+        )
+        else None
+    )
 
     if settings.session_secret is not None:
         app.add_middleware(
@@ -46,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(identity_router)
     app.include_router(connectors_router)
     app.include_router(knowledge_router)
+    app.include_router(rag_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
