@@ -140,6 +140,47 @@ def test_validator_accepts_claim_explicitly_stated_in_one_cited_evidence_sentenc
     ) == [chunk]
 
 
+@pytest.mark.parametrize(
+    ("evidence", "claim"),
+    [
+        ("The account balance is -5.", "The account balance is 5."),
+        ("The refund threshold is < 5 days.", "The refund threshold is > 5 days."),
+    ],
+)
+def test_validator_rejects_claim_when_normalization_would_remove_semantic_symbols(
+    evidence: str, claim: str
+) -> None:
+    principal = _principal()
+    chunk = _chunk(principal, text=evidence)
+    generation = GeneratedAnswer(
+        text=claim,
+        claims=[ClaimSupport(text=claim, citation_ids=[chunk.chunk_id])],
+        model="claude-test",
+        input_tokens=10,
+        output_tokens=8,
+    )
+
+    with pytest.raises(GroundednessError, match="support"):
+        CitationValidator().validate(generation, [chunk], principal, chunk.knowledge_base_id)
+
+
+def test_validator_accepts_exact_claim_with_case_and_whitespace_variation() -> None:
+    principal = _principal()
+    chunk = _chunk(principal, text="Refunds take five business days.")
+    claim = "  REFUNDS\n take   five business days. "
+    generation = GeneratedAnswer(
+        text=claim,
+        claims=[ClaimSupport(text=claim, citation_ids=[chunk.chunk_id])],
+        model="claude-test",
+        input_tokens=10,
+        output_tokens=8,
+    )
+
+    assert CitationValidator().validate(
+        generation, [chunk], principal, chunk.knowledge_base_id
+    ) == [chunk]
+
+
 def test_validator_requires_citations_even_when_model_marks_claim_non_material() -> None:
     principal = _principal()
     chunk = _chunk(principal)

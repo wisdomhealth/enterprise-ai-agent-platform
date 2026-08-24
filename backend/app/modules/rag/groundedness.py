@@ -5,8 +5,8 @@ from app.modules.identity.dependencies import Principal
 from app.modules.rag.llm import GeneratedAnswer
 from app.modules.rag.types import RetrievedChunk
 
-_WORD = re.compile(r"[a-z0-9]+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
+_WHITESPACE = re.compile(r"\s+")
 
 
 class GroundednessError(ValueError):
@@ -85,4 +85,5 @@ def _sentences(text: str) -> list[str]:
 
 
 def _normalized(text: str) -> str:
-    return " ".join(_WORD.findall(text.casefold()))
+    """Normalize presentation only; retain every fact-bearing character."""
+    return _WHITESPACE.sub(" ", text.casefold()).strip()
