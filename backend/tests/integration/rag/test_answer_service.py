@@ -7,7 +7,12 @@ from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
 from app.modules.rag.answer_service import GroundedAnswerService
 from app.modules.rag.groundedness import CitationValidator
-from app.modules.rag.llm import GeneratedAnswer, InMemoryRedisCircuitStore, ProviderCircuitBreaker
+from app.modules.rag.llm import (
+    GeneratedAnswer,
+    InMemoryRedisCircuitStore,
+    ProviderCircuitBreaker,
+    ProviderResponseError,
+)
 from app.modules.rag.types import AnswerAudience, ClaimSupport, RetrievedChunk
 
 
@@ -27,6 +32,19 @@ class FakeLLM:
     async def generate(self, prompt):  # type: ignore[no-untyped-def]
         self.prompts.append(prompt)
         return self.answer
+
+
+class RaisingLLM:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def generate(self, prompt):  # type: ignore[no-untyped-def]
+        raise self.error
+
+
+class MalformedLLM:
+    async def generate(self, prompt):  # type: ignore[no-untyped-def]
+        return object()
 
 
 def _principal() -> Principal:
@@ -60,6 +78,38 @@ def _service(chunk: RetrievedChunk, llm: FakeLLM) -> GroundedAnswerService:
         CitationValidator(),
         ProviderCircuitBreaker(InMemoryRedisCircuitStore()),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "llm",
+    [
+        RaisingLLM(ProviderResponseError("private provider detail")),
+        RaisingLLM(RuntimeError("non-transient provider failure")),
+        MalformedLLM(),
+    ],
+)
+async def test_provider_failures_return_configured_refusal_without_leaking_details(
+    llm: object,
+) -> None:
+    principal = _principal()
+    chunk = _chunk(principal)
+    service = GroundedAnswerService(
+        FakeRetriever([chunk]),
+        llm,  # type: ignore[arg-type]
+        CitationValidator(),
+        ProviderCircuitBreaker(InMemoryRedisCircuitStore()),
+        refusal_message="Please contact support.",
+    )
+
+    answer = await service.answer(
+        principal, chunk.knowledge_base_id, "How long do refunds take?", AnswerAudience.CUSTOMER
+    )
+
+    assert answer.refused is True
+    assert answer.text == "Please contact support."
+    assert "provider" not in answer.text.casefold()
+    assert answer.citations == []
 
 
 @pytest.mark.asyncio

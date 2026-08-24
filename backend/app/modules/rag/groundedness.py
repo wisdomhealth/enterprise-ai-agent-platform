@@ -59,8 +59,8 @@ class CitationValidator:
             raise GroundednessError("answer sentence is not covered by an atomic claim")
         cited_ids: list[UUID] = []
         for claim in generation.claims:
-            if claim.material and not claim.citation_ids:
-                raise GroundednessError("material claim omitted supporting citations")
+            if not claim.citation_ids:
+                raise GroundednessError("claim omitted supporting citations")
             supporting_chunks: list[RetrievedChunk] = []
             for citation_id in claim.citation_ids:
                 chunk = indexed.get(citation_id)
@@ -70,8 +70,8 @@ class CitationValidator:
                 supporting_chunks.append(chunk)
                 if citation_id not in cited_ids:
                     cited_ids.append(citation_id)
-            if claim.material and not _claim_supported(claim.text, supporting_chunks):
-                raise GroundednessError("material claim lacks textual source support")
+            if not _claim_supported(claim.text, supporting_chunks):
+                raise GroundednessError("claim lacks textual source support")
         return [indexed[citation_id] for citation_id in cited_ids]
 
     @staticmethod

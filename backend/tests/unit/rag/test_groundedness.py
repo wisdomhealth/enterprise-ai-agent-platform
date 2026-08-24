@@ -93,6 +93,27 @@ def test_validator_rejects_material_claim_not_supported_by_cited_text() -> None:
         CitationValidator().validate(generation, [chunk], principal, chunk.knowledge_base_id)
 
 
+def test_validator_requires_citations_even_when_model_marks_claim_non_material() -> None:
+    principal = _principal()
+    chunk = _chunk(principal)
+    generation = GeneratedAnswer(
+        text="Refunds take one hour.",
+        claims=[
+            ClaimSupport(
+                text="Refunds take one hour.",
+                citation_ids=[],
+                material=False,
+            )
+        ],
+        model="claude-test",
+        input_tokens=10,
+        output_tokens=8,
+    )
+
+    with pytest.raises(GroundednessError, match="supporting citations"):
+        CitationValidator().validate(generation, [chunk], principal, chunk.knowledge_base_id)
+
+
 def test_validator_rejects_answer_sentence_not_covered_by_an_atomic_claim() -> None:
     principal = _principal()
     chunk = _chunk(principal, text="Refunds take five business days.")

@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 
 from app.modules.rag.types import RetrievedChunk
@@ -27,10 +28,27 @@ class GroundedPrompt:
 
 
 def _render_chunk(chunk: RetrievedChunk) -> str:
+    encoded_chunk = json.dumps(
+        {
+            "chunk_id": str(chunk.chunk_id),
+            "content": chunk.text,
+            "page_number": chunk.page_number,
+            "section": chunk.section,
+            "title": chunk.title,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    encoded_chunk = (
+        encoded_chunk.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
     return (
-        f'<chunk id="{chunk.chunk_id}" title="{chunk.title}" section="{chunk.section or ""}" '
-        f'page="{chunk.page_number if chunk.page_number is not None else ""}">\n'
-        f"{chunk.text}\n</chunk>"
+        "<untrusted_chunk_json>\n"
+        f"{encoded_chunk}\n"
+        "</untrusted_chunk_json>"
     )
 
 

@@ -7,7 +7,12 @@ from app.core.telemetry import record_grounded_answer
 from app.modules.identity.dependencies import Principal
 from app.modules.rag.citations import project_citations
 from app.modules.rag.groundedness import CitationValidator, GroundednessError
-from app.modules.rag.llm import GenerationProvider, ProviderCircuitBreaker, ProviderTransientError
+from app.modules.rag.llm import (
+    GeneratedAnswer,
+    GenerationProvider,
+    ProviderCircuitBreaker,
+    ProviderTransientError,
+)
 from app.modules.rag.prompts import PROMPT_VERSION, build_grounded_prompt
 from app.modules.rag.types import AnswerAudience, Retriever, ValidatedAnswer
 
@@ -56,10 +61,15 @@ class GroundedAnswerService:
             return self._refusal(audience, started, provider_name, "refused", len(chunks))
         try:
             generation = await self._provider.generate(prompt)
-            citations = self._validator.validate(generation, chunks, principal, knowledge_base_id)
         except ProviderTransientError:
             await self._circuit_breaker.record_transient_failure(provider_name)
             return self._refusal(audience, started, provider_name, "provider_error", len(chunks))
+        except Exception:
+            return self._refusal(audience, started, provider_name, "provider_error", len(chunks))
+        if not isinstance(generation, GeneratedAnswer):
+            return self._refusal(audience, started, provider_name, "provider_error", len(chunks))
+        try:
+            citations = self._validator.validate(generation, chunks, principal, knowledge_base_id)
         except (GroundednessError, ValueError):
             return self._refusal(
                 audience, started, provider_name, "validation_refusal", len(chunks)
