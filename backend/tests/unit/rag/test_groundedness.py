@@ -143,8 +143,15 @@ def test_validator_accepts_claim_explicitly_stated_in_one_cited_evidence_sentenc
 @pytest.mark.parametrize(
     ("evidence", "claim"),
     [
-        ("The account balance is -5.", "The account balance is 5."),
-        ("The refund threshold is < 5 days.", "The refund threshold is > 5 days."),
+        ("The account balance is -5%.", "The account balance is 5%."),
+        ("The account balance is 5%.", "The account balance is -5%."),
+        ("The account balance is -5.25%.", "The account balance is 5.25%."),
+        ("The refund threshold is x < 100.", "The refund threshold is x > 100."),
+        ("The refund threshold is x <= 100.", "The refund threshold is x >= 100."),
+        ("The refund threshold is x <= 100.", "The refund threshold is x < = 100."),
+        ("The refund threshold is x != 100.", "The refund threshold is x = 100."),
+        ("The refund window is 5-10 days.", "The refund window is 5-11 days."),
+        ("The refund rate is 5%.", "The refund rate is 5."),
     ],
 )
 def test_validator_rejects_claim_when_normalization_would_remove_semantic_symbols(
@@ -162,6 +169,34 @@ def test_validator_rejects_claim_when_normalization_would_remove_semantic_symbol
 
     with pytest.raises(GroundednessError, match="support"):
         CitationValidator().validate(generation, [chunk], principal, chunk.knowledge_base_id)
+
+
+@pytest.mark.parametrize(
+    ("evidence", "claim"),
+    [
+        ("The refund threshold is x < 100.", "the refund threshold is x<100 ."),
+        ("The refund threshold is x <= 100.", "the refund threshold is x<=100 ."),
+        ("The refund rate is 5%.", "the refund rate is 5 %."),
+        ("The loss was -5.25%.", "the loss was - 5.25 %."),
+        ("The refund window is 5-10 days.", "the refund window is 5 - 10 days ."),
+    ],
+)
+def test_validator_accepts_matching_numeric_claim_with_formatting_variation(
+    evidence: str, claim: str
+) -> None:
+    principal = _principal()
+    chunk = _chunk(principal, text=evidence)
+    generation = GeneratedAnswer(
+        text=claim,
+        claims=[ClaimSupport(text=claim, citation_ids=[chunk.chunk_id])],
+        model="claude-test",
+        input_tokens=10,
+        output_tokens=8,
+    )
+
+    assert CitationValidator().validate(
+        generation, [chunk], principal, chunk.knowledge_base_id
+    ) == [chunk]
 
 
 def test_validator_accepts_exact_claim_with_case_and_whitespace_variation() -> None:

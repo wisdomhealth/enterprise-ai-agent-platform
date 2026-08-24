@@ -6,7 +6,7 @@ from app.modules.rag.llm import GeneratedAnswer
 from app.modules.rag.types import RetrievedChunk
 
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
-_WHITESPACE = re.compile(r"\s+")
+_TOKEN = re.compile(r"<=|>=|!=|\w+|[^\w\s]")
 
 
 class GroundednessError(ValueError):
@@ -85,5 +85,5 @@ def _sentences(text: str) -> list[str]:
 
 
 def _normalized(text: str) -> str:
-    """Normalize presentation only; retain every fact-bearing character."""
-    return _WHITESPACE.sub(" ", text.casefold()).strip()
+    """Normalize token spacing and case while retaining semantic punctuation."""
+    return " ".join(_TOKEN.findall(text.casefold()))
