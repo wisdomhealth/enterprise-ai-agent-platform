@@ -56,6 +56,8 @@ class DocumentIngestionService:
         job = await lease_service.claim(job_id, self._worker_id, self._job_lease_seconds)
         if job is None:
             return await self._completed_job_version_or_raise(job_id)
+        claimed_job_id = job.id
+        claimed_job_version = job.version
         if job.kind != "knowledge.document.parse":
             await self._fail_terminal(lease_service, job, "INVALID_DOCUMENT_PARSE_JOB")
             raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
@@ -104,12 +106,15 @@ class DocumentIngestionService:
             await self._fail_terminal(lease_service, job, error_code)
             raise
         except Exception:
+            # A failed embedding flush leaves SQLAlchemy rollback-required.  Restore
+            # the session before applying the existing lease-fenced retry transition.
+            await self._db_session.rollback()
             await lease_service.retry(
-                job.id,
+                claimed_job_id,
                 self._worker_id,
                 error_code="DOCUMENT_PARSE_TRANSIENT_FAILURE",
                 error_class=ErrorClass.RETRYABLE,
-                expected_version=job.version,
+                expected_version=claimed_job_version,
             )
             await self._db_session.commit()
             raise

@@ -7,7 +7,8 @@ from uuid import UUID, uuid4
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import async_sessionmaker, engine
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
@@ -390,6 +391,130 @@ async def test_parse_job_keeps_prior_current_version_when_embeddings_are_invalid
         )
     ).all()
     assert all(chunk.embedding is None for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_embedding_flush_failure_recovers_the_checkpoint_as_a_retryable_job(
+    tmp_path, independent_sessions
+) -> None:
+    """A PostgreSQL flush failure cannot strand the lease in a failed session."""
+    fixture_content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    async with async_sessionmaker() as first_session:
+        document = await _document(first_session, current_is_retrievable=False)
+        source = await first_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        service, gateway = await _authorized_ingestion_service(
+            first_session,
+            document,
+            tmp_path,
+            content=fixture_content,
+            embedding_provider=ValidEmbeddingProvider(),
+        )
+        job = await JobService().enqueue(
+            first_session,
+            "knowledge.document.parse",
+            f"document-parse-embedding-flush-failure-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        job_id = job.id
+        document_id = document.id
+        injected_failure = False
+
+        def fail_final_embedding_flush(sync_session, _flush_context, _instances):  # type: ignore[no-untyped-def]
+            nonlocal injected_failure
+            if injected_failure or not any(
+                isinstance(item, DocumentVersion)
+                and item.state is DocumentVersionState.RETRIEVABLE
+                for item in sync_session.dirty
+            ):
+                return
+            injected_failure = True
+            version = next(
+                item
+                for item in sync_session.dirty
+                if isinstance(item, DocumentVersion)
+                and item.state is DocumentVersionState.RETRIEVABLE
+            )
+            sync_session.add(
+                DocumentChunk(
+                    id=uuid4(),
+                    document_version_id=version.id,
+                    ordinal=0,
+                    text="duplicate ordinal forces PostgreSQL flush failure",
+                    page_number=None,
+                    section=None,
+                    token_count=1,
+                    metadata_={},
+                )
+            )
+
+        event.listen(first_session.sync_session, "before_flush", fail_final_embedding_flush)
+        try:
+            with pytest.raises(IntegrityError):
+                await service.parse(job_id)
+        finally:
+            event.remove(first_session.sync_session, "before_flush", fail_final_embedding_flush)
+
+        assert injected_failure
+        assert gateway.download_calls == ["drive-file-1"]
+
+    async with async_sessionmaker() as inspection_session:
+        persisted_job = await inspection_session.get(JobIntent, job_id)
+        persisted_document = await inspection_session.get(Document, document_id)
+        assert persisted_job is not None
+        assert persisted_document is not None
+        checkpoint_version_id = persisted_job.payload["document_version_id"]
+        assert isinstance(checkpoint_version_id, str)
+        assert persisted_job.state is JobState.PENDING
+        assert persisted_document.current_version_id is None
+        checkpoint_version = await inspection_session.get(
+            DocumentVersion, UUID(checkpoint_version_id)
+        )
+        assert checkpoint_version is not None
+        assert checkpoint_version.state is DocumentVersionState.PROCESSING
+        checkpoint_chunks = (
+            await inspection_session.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_version_id == checkpoint_version.id
+                )
+            )
+        ).all()
+        assert checkpoint_chunks
+        assert all(chunk.embedding is None for chunk in checkpoint_chunks)
+        persisted_job.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await inspection_session.commit()
+
+    async with async_sessionmaker() as retry_session:
+        connector_service = ConnectorService.for_file_key(
+            tmp_path / "connector-master-key", app_env="development"
+        )
+        retry_gateway = FakeDriveGateway(fixture_content)
+        retry_service = DocumentIngestionService(
+            retry_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service, FakeDriveGatewayFactory(retry_gateway)
+            ),
+            worker_id="task-10-embedding-flush-retry-worker",
+            embedding_provider=ValidEmbeddingProvider(),
+        )
+        retried_version = await retry_service.parse(job_id)
+        retried_job = await retry_session.get(JobIntent, job_id)
+        assert retried_job is not None
+        assert retried_version.id == UUID(checkpoint_version_id)
+        assert retried_job.state is JobState.SUCCEEDED
+        assert retry_gateway.download_calls == []
+        retried_chunks = (
+            await retry_session.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_version_id == retried_version.id
+                )
+            )
+        ).all()
+        assert all(chunk.embedding is not None for chunk in retried_chunks)
 
 
 @pytest.mark.asyncio

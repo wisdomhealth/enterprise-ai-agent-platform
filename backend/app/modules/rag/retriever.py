@@ -76,12 +76,21 @@ class HybridRetriever(Retriever):
             raise RuntimeError(
                 "parallel hybrid retrieval requires independently scoped database sessions"
             )
-        vector, text = await asyncio.gather(
+        vector_task = asyncio.create_task(
             self._vector_source.search(
                 principal, knowledge_base_id, query, limit, query_embedding=vectors[0]
-            ),
-            self._text_source.search(principal, knowledge_base_id, query, limit),
+            )
         )
+        text_task = asyncio.create_task(
+            self._text_source.search(principal, knowledge_base_id, query, limit)
+        )
+        try:
+            vector, text = await asyncio.gather(vector_task, text_task)
+        except BaseException:
+            vector_task.cancel()
+            text_task.cancel()
+            await asyncio.gather(vector_task, text_task, return_exceptions=True)
+            raise
         fused = reciprocal_rank_fusion([vector, text])[:limit]
         if self._reranker_enabled and self._reranker is not None:
             return (await self._reranker.rerank(query, fused))[:limit]
