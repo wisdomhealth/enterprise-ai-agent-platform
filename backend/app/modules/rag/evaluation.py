@@ -9,18 +9,22 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.identity.dependencies import Principal
+from app.modules.rag.answer_service import AnswerExecution
+from app.modules.rag.evaluation_models import RAGEvaluationCase, RAGEvaluationRun
 from app.modules.rag.types import (
     AnswerAudience,
     RetrievedChunk,
-    Retriever,
     SourceCitation,
     ValidatedAnswer,
 )
@@ -229,34 +233,87 @@ class EvaluationRun(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    id: UUID = Field(default_factory=uuid4)
+    organization_id: UUID
+    knowledge_base_id: UUID
     dataset_version: str
     dataset_kind: EvaluationDatasetKind
+    dataset_digest: str = Field(min_length=64, max_length=64)
     document_version_set: str
     chunking_version: str
     embedding_model: str
     retrieval_config: dict[str, str]
     prompt_version: str
     llm_model: str
+    status: str = "COMPLETED"
+    completed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     metrics: EvaluationMetrics
     hard_gates: HardGateStatus
 
 
 class AnswerService(Protocol):
-    async def answer(
+    async def answer_with_evidence(
         self,
         principal: Principal,
         knowledge_base_id: UUID,
         query: str,
         audience: AnswerAudience,
-    ) -> ValidatedAnswer: ...
+    ) -> AnswerExecution: ...
+
+
+class EvaluationCaseProvenance(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    case_id: str
+    question_digest: str = Field(min_length=64, max_length=64)
+    answer_refused: bool
+    retrieved_chunk_ids: list[UUID]
+    retrieved_document_ids: list[UUID]
+    retrieved_document_version_ids: list[UUID]
+    citation_chunk_ids: list[UUID]
+    citation_document_version_ids: list[UUID]
+
+
+class EvaluationRunRepository:
+    def __init__(self, db_session: AsyncSession) -> None:
+        self._db_session = db_session
+
+    async def append(self, run: EvaluationRun, cases: Sequence[EvaluationCaseProvenance]) -> None:
+        self._db_session.add(
+            RAGEvaluationRun(
+                id=run.id,
+                organization_id=run.organization_id,
+                knowledge_base_id=run.knowledge_base_id,
+                dataset_version=run.dataset_version,
+                dataset_kind=run.dataset_kind.value,
+                dataset_digest=run.dataset_digest,
+                document_version_set=run.document_version_set,
+                chunking_version=run.chunking_version,
+                embedding_model=run.embedding_model,
+                retrieval_config=run.retrieval_config,
+                prompt_version=run.prompt_version,
+                llm_model=run.llm_model,
+                status=run.status,
+                metrics=run.metrics.model_dump(mode="json"),
+                hard_gates=run.hard_gates.model_dump(mode="json"),
+                completed_at=run.completed_at,
+            )
+        )
+        await self._db_session.flush()
+        self._db_session.add_all(
+            [RAGEvaluationCase(run_id=run.id, **case.model_dump()) for case in cases]
+        )
+        await self._db_session.flush()
 
 
 class RAGEvaluationRunner:
     """Runs labels after answering, keeping them out of the generation input path."""
 
-    def __init__(self, retriever: Retriever, answer_service: AnswerService) -> None:
-        self._retriever = retriever
+    def __init__(
+        self, answer_service: AnswerService, repository: EvaluationRunRepository | None = None
+    ) -> None:
         self._answer_service = answer_service
+        self._repository = repository
 
     async def run(
         self,
@@ -279,19 +336,20 @@ class RAGEvaluationRunner:
         authorized_candidates_only = True
         no_forbidden_documents = True
         citations_map_to_retrieval = True
+        case_provenance: list[EvaluationCaseProvenance] = []
 
         for case in dataset.cases:
             started = time.monotonic()
-            retrieval_started = time.monotonic()
-            chunks = await self._retriever.retrieve(principal, knowledge_base_id, case.question, 10)
-            retrieval_latencies.append(_elapsed_ms(retrieval_started))
             # Only the question crosses the answer boundary. Expected claims, authoritative
             # documents, forbidden documents, and tags never enter prompt construction.
-            answer = await self._answer_service.answer(
+            execution = await self._answer_service.answer_with_evidence(
                 principal, knowledge_base_id, case.question, AnswerAudience.STAFF
             )
+            answer = execution.answer
+            chunks = execution.retrieved_chunks
+            retrieval_latencies.append(float(execution.retrieval_latency_ms))
             end_to_end_latencies.append(_elapsed_ms(started))
-            model_latencies.append(float(answer.latency_ms))
+            model_latencies.append(float(execution.model_latency_ms))
             input_tokens += answer.input_tokens
             output_tokens += answer.output_tokens
             estimated_cost += answer.estimated_cost
@@ -341,6 +399,26 @@ class RAGEvaluationRunner:
                     float(bool(claims) and all(claim.supported for claim in claims))
                 )
             abstention_outcomes.append((case.answerable, answer.refused))
+            case_provenance.append(
+                EvaluationCaseProvenance(
+                    case_id=case.case_id,
+                    question_digest=_digest(case.question),
+                    answer_refused=answer.refused,
+                    retrieved_chunk_ids=[chunk.chunk_id for chunk in chunks],
+                    retrieved_document_ids=[chunk.document_id for chunk in chunks],
+                    retrieved_document_version_ids=[chunk.document_version_id for chunk in chunks],
+                    citation_chunk_ids=[
+                        citation.chunk_id
+                        for citation in answer.citations
+                        if isinstance(citation, SourceCitation)
+                    ],
+                    citation_document_version_ids=[
+                        citation.document_version_id
+                        for citation in answer.citations
+                        if isinstance(citation, SourceCitation)
+                    ],
+                )
+            )
 
         metrics = EvaluationMetrics(
             recall_at_10=_mean(recall_scores),
@@ -358,9 +436,12 @@ class RAGEvaluationRunner:
             output_tokens=output_tokens,
             estimated_cost=estimated_cost,
         )
-        return EvaluationRun(
+        run = EvaluationRun(
+            organization_id=principal.organization_id,
+            knowledge_base_id=knowledge_base_id,
             dataset_version=dataset.version,
             dataset_kind=dataset.kind,
+            dataset_digest=_digest(dataset.to_jsonl()),
             document_version_set=provenance.document_version_set,
             chunking_version=provenance.chunking_version,
             embedding_model=provenance.embedding_model,
@@ -374,6 +455,9 @@ class RAGEvaluationRunner:
                 citations_map_to_retrieval=citations_map_to_retrieval,
             ),
         )
+        if self._repository is not None:
+            await self._repository.append(run, case_provenance)
+        return run
 
 
 def _citation_chunks(
@@ -393,6 +477,10 @@ def _citation_chunks(
 
 def _normalized(text: str) -> str:
     return " ".join(text.casefold().split())
+
+
+def _digest(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
 
 
 def _elapsed_ms(started: float) -> float:

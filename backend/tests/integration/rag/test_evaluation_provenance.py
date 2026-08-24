@@ -4,6 +4,7 @@ import pytest
 
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
+from app.modules.rag.answer_service import AnswerExecution
 from app.modules.rag.evaluation import (
     EvaluationCase,
     EvaluationDataset,
@@ -61,12 +62,34 @@ class RecordingAnswerService:
         )
 
 
+class SingleRetrievalAnswerService(RecordingAnswerService):
+    def __init__(self, chunk: RetrievedChunk, citation: SourceCitation) -> None:
+        super().__init__(citation)
+        self.chunk = chunk
+        self.evidence_calls = 0
+
+    async def answer_with_evidence(
+        self,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        question: str,
+        audience: AnswerAudience,
+    ) -> AnswerExecution:
+        self.evidence_calls += 1
+        answer = await self.answer(principal, knowledge_base_id, question, audience)
+        return AnswerExecution(
+            answer=answer,
+            retrieved_chunks=[self.chunk],
+            retrieval_latency_ms=3,
+            model_latency_ms=4,
+        )
+
+
 @pytest.mark.asyncio
-async def test_evaluation_run_records_versioned_provenance_without_passing_labels_to_answers(
-) -> None:
-    principal = Principal(
-        uuid4(), uuid4(), "member@example.test", UserRole.MEMBER, uuid4(), "csrf"
-    )
+async def test_evaluation_run_records_versioned_provenance_without_passing_labels_to_answers() -> (
+    None
+):
+    principal = Principal(uuid4(), uuid4(), "member@example.test", UserRole.MEMBER, uuid4(), "csrf")
     knowledge_base_id = uuid4()
     document_id = uuid4()
     chunk = RetrievedChunk(
@@ -97,14 +120,15 @@ async def test_evaluation_run_records_versioned_provenance_without_passing_label
         version="rag-regression-v1",
         cases=[case],
     )
-    service = RecordingAnswerService(
+    service = SingleRetrievalAnswerService(
+        chunk,
         SourceCitation(
             chunk_id=chunk.chunk_id,
             document_version_id=chunk.document_version_id,
             title=chunk.title,
             section=chunk.section,
             page_number=chunk.page_number,
-        )
+        ),
     )
     provenance = EvaluationProvenance(
         document_version_set="documents-2026-08-24",
@@ -115,7 +139,7 @@ async def test_evaluation_run_records_versioned_provenance_without_passing_label
         llm_model="fake-evaluation-model",
     )
 
-    run = await RAGEvaluationRunner(FakeRetriever(chunk), service).run(
+    run = await RAGEvaluationRunner(service).run(
         principal,
         knowledge_base_id,
         dataset,
@@ -130,3 +154,62 @@ async def test_evaluation_run_records_versioned_provenance_without_passing_label
     assert run.metrics.citation_support_rate == 1.0
     assert run.metrics.claim_groundedness == 1.0
     assert service.questions == ["How long do refunds take?"]
+
+
+@pytest.mark.asyncio
+async def test_evaluation_uses_the_exact_retrieval_evidence_from_the_answer_service() -> None:
+    principal = Principal(uuid4(), uuid4(), "member@example.test", UserRole.MEMBER, uuid4(), "csrf")
+    knowledge_base_id = uuid4()
+    chunk = RetrievedChunk(
+        chunk_id=uuid4(),
+        stable_id="refund-policy-v1:0",
+        document_version_id=uuid4(),
+        document_id=uuid4(),
+        organization_id=principal.organization_id,
+        knowledge_base_id=knowledge_base_id,
+        ordinal=0,
+        text="Refunds take five business days.",
+        page_number=2,
+        section="Eligibility",
+        resource_authorized=True,
+        title="Refund policy",
+    )
+    dataset = EvaluationDataset(
+        kind=EvaluationDatasetKind.REGRESSION,
+        version="rag-regression-v1",
+        cases=[
+            EvaluationCase(
+                case_id="same-evidence",
+                question="How long do refunds take?",
+                answerable=True,
+                authoritative_document_ids=[chunk.document_id],
+                expected_claims=["Refunds take five business days."],
+                forbidden_document_ids=[],
+                tags=["regression"],
+            )
+        ],
+    )
+    service = SingleRetrievalAnswerService(
+        chunk,
+        SourceCitation(
+            chunk_id=chunk.chunk_id,
+            document_version_id=chunk.document_version_id,
+            title=chunk.title,
+            section=chunk.section,
+            page_number=chunk.page_number,
+        ),
+    )
+    provenance = EvaluationProvenance(
+        document_version_set="documents-v1",
+        chunking_version="chunking-v1",
+        embedding_model="embedding-v1",
+        retrieval_config={"limit": "10"},
+        prompt_version="grounded-answer-v1",
+        llm_model="fake",
+    )
+
+    run = await RAGEvaluationRunner(service).run(principal, knowledge_base_id, dataset, provenance)
+
+    assert service.evidence_calls == 1
+    assert run.metrics.retrieval_latency_ms == 3
+    assert run.metrics.model_latency_ms == 4

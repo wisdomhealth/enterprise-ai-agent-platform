@@ -1,4 +1,4 @@
-from typing import cast
+from typing import Protocol, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -8,10 +8,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.identity.dependencies import Principal, get_db_session, require_staff_session
 from app.modules.knowledge.models import KnowledgeBase
-from app.modules.rag.evaluation import AnswerService
 from app.modules.rag.types import AnswerAudience, ValidatedAnswer
 
 router = APIRouter(prefix="/api/v1/staff/knowledge", tags=["staff-assist"])
+
+
+class StaffAnswerService(Protocol):
+    async def answer(
+        self,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        query: str,
+        audience: AnswerAudience,
+    ) -> ValidatedAnswer: ...
 
 
 class StaffAssistRequest(BaseModel):
@@ -35,14 +44,14 @@ async def _staff_knowledge_base(
     return knowledge_base_id
 
 
-def _grounded_answer_service(request: Request) -> AnswerService:
+def _grounded_answer_service(request: Request) -> StaffAnswerService:
     service = getattr(request.app.state, "grounded_answer_service", None)
     if service is None or not callable(getattr(service, "answer", None)):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Staff Assist is not configured",
         )
-    return cast(AnswerService, service)
+    return cast(StaffAnswerService, service)
 
 
 @router.post("/search", response_model=ValidatedAnswer)
@@ -50,7 +59,7 @@ async def staff_assist_search(
     payload: StaffAssistRequest,
     principal: Principal = Depends(require_staff_session),
     knowledge_base_id: UUID = Depends(_staff_knowledge_base),
-    answer_service: AnswerService = Depends(_grounded_answer_service),
+    answer_service: StaffAnswerService = Depends(_grounded_answer_service),
 ) -> ValidatedAnswer:
     """Read-only employee reference lookup; it creates no events or workflow state."""
     return await answer_service.answer(

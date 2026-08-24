@@ -1,6 +1,7 @@
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from uuid import UUID
 
 from app.core.config import Settings
@@ -15,12 +16,20 @@ from app.modules.rag.llm import (
     ProviderTransientError,
 )
 from app.modules.rag.prompts import PROMPT_VERSION, build_grounded_prompt
-from app.modules.rag.types import AnswerAudience, Retriever, ValidatedAnswer
+from app.modules.rag.types import AnswerAudience, RetrievedChunk, Retriever, ValidatedAnswer
 
 _SENTENCES = re.compile(r"(?<=[.!?])\s+")
 _DEFAULT_REFUSAL = (
     "I don't know based on the available information. Please contact a team member for help."
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerExecution:
+    answer: ValidatedAnswer
+    retrieved_chunks: list[RetrievedChunk]
+    retrieval_latency_ms: int
+    model_latency_ms: int
 
 
 class GroundedAnswerService:
@@ -95,28 +104,66 @@ class GroundedAnswerService:
         query: str,
         audience: AnswerAudience,
     ) -> ValidatedAnswer:
+        return (
+            await self.answer_with_evidence(principal, knowledge_base_id, query, audience)
+        ).answer
+
+    async def answer_with_evidence(
+        self,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        query: str,
+        audience: AnswerAudience,
+    ) -> AnswerExecution:
         started = time.monotonic()
+        retrieval_started = time.monotonic()
         chunks = await self._retriever.retrieve(
             principal, knowledge_base_id, query, self._retrieval_limit
         )
+        retrieval_latency_ms = _latency_ms(retrieval_started)
         prompt = build_grounded_prompt(query, chunks)
         provider_name = "claude"
         if not chunks or not await self._circuit_breaker.allow(provider_name):
-            return self._refusal(audience, started, provider_name, "refused", len(chunks))
+            return AnswerExecution(
+                self._refusal(audience, started, provider_name, "refused", len(chunks)),
+                chunks,
+                retrieval_latency_ms,
+                0,
+            )
+        model_started = time.monotonic()
         try:
             generation = await self._provider.generate(prompt)
         except ProviderTransientError:
             await self._circuit_breaker.record_transient_failure(provider_name)
-            return self._refusal(audience, started, provider_name, "provider_error", len(chunks))
+            return AnswerExecution(
+                self._refusal(audience, started, provider_name, "provider_error", len(chunks)),
+                chunks,
+                retrieval_latency_ms,
+                _latency_ms(model_started),
+            )
         except Exception:
-            return self._refusal(audience, started, provider_name, "provider_error", len(chunks))
+            return AnswerExecution(
+                self._refusal(audience, started, provider_name, "provider_error", len(chunks)),
+                chunks,
+                retrieval_latency_ms,
+                _latency_ms(model_started),
+            )
+        model_latency_ms = _latency_ms(model_started)
         if not isinstance(generation, GeneratedAnswer):
-            return self._refusal(audience, started, provider_name, "provider_error", len(chunks))
+            return AnswerExecution(
+                self._refusal(audience, started, provider_name, "provider_error", len(chunks)),
+                chunks,
+                retrieval_latency_ms,
+                model_latency_ms,
+            )
         try:
             citations = self._validator.validate(generation, chunks, principal, knowledge_base_id)
         except (GroundednessError, ValueError):
-            return self._refusal(
-                audience, started, provider_name, "validation_refusal", len(chunks)
+            return AnswerExecution(
+                self._refusal(audience, started, provider_name, "validation_refusal", len(chunks)),
+                chunks,
+                retrieval_latency_ms,
+                model_latency_ms,
             )
         await self._circuit_breaker.record_success(provider_name)
         latency_ms = _latency_ms(started)
@@ -135,7 +182,7 @@ class GroundedAnswerService:
             estimated_cost=estimated_cost,
         )
         self._record(audience, generation.model, "validated", answer, len(chunks))
-        return answer
+        return AnswerExecution(answer, chunks, retrieval_latency_ms, model_latency_ms)
 
     def _refusal(
         self,

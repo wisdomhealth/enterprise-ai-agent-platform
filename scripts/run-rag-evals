@@ -29,26 +29,13 @@ os.environ.setdefault(
 
 from app.modules.identity.dependencies import Principal  # noqa: E402
 from app.modules.identity.models import UserRole  # noqa: E402
+from app.modules.rag.answer_service import AnswerExecution  # noqa: E402
 from app.modules.rag.evaluation import (  # noqa: E402
     EvaluationProvenance,
     RAGEvaluationRunner,
     load_evaluation_dataset,
 )
 from app.modules.rag.types import AnswerAudience, ValidatedAnswer  # noqa: E402
-
-
-class DeterministicFakeRetriever:
-    """A no-network fixture boundary: it never reads labels or returns documents."""
-
-    async def retrieve(
-        self,
-        principal: Principal,
-        knowledge_base_id: UUID,
-        query: str,
-        limit: int,
-    ) -> list[object]:
-        _ = (principal, knowledge_base_id, query, limit)
-        return []
 
 
 class DeterministicFakeAnswerService:
@@ -76,6 +63,11 @@ class DeterministicFakeAnswerService:
             estimated_cost=0.0,
         )
 
+    async def answer_with_evidence(
+        self, principal: Principal, knowledge_base_id: UUID, query: str, audience: AnswerAudience
+    ) -> AnswerExecution:
+        return AnswerExecution(await self.answer(principal, knowledge_base_id, query, audience), [], 0, 0)
+
 
 async def _run(dataset_path: Path) -> int:
     dataset = load_evaluation_dataset(dataset_path)
@@ -95,9 +87,9 @@ async def _run(dataset_path: Path) -> int:
         prompt_version="grounded-answer-v1",
         llm_model="fake-rag-evaluation-v1",
     )
-    run = await RAGEvaluationRunner(
-        DeterministicFakeRetriever(), DeterministicFakeAnswerService()
-    ).run(principal, uuid4(), dataset, provenance)
+    run = await RAGEvaluationRunner(DeterministicFakeAnswerService()).run(
+        principal, uuid4(), dataset, provenance
+    )
     payload = run.model_dump(mode="json")
     payload["quality_targets"] = {
         "recall_at_10": 0.85,

@@ -16,6 +16,7 @@ from app.modules.idempotency import models as idempotency_models  # noqa: F401
 from app.modules.jobs import models as job_models  # noqa: F401
 from app.modules.knowledge import models as knowledge_models  # noqa: F401
 from app.modules.outbox import models as outbox_models  # noqa: F401
+from app.modules.rag import evaluation_models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
