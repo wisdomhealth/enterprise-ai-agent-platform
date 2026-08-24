@@ -20,6 +20,22 @@ class Settings(BaseSettings):
     )
     redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
     anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
+    anthropic_model: str = Field(
+        default="claude-3-5-sonnet-latest", validation_alias="ANTHROPIC_MODEL"
+    )
+    grounded_refusal_message: str = Field(
+        default=(
+            "I don't know based on the available information. "
+            "Please contact a team member for help."
+        ),
+        validation_alias="GROUNDED_REFUSAL_MESSAGE",
+    )
+    provider_circuit_failure_threshold: int = Field(
+        default=5, ge=1, le=100, validation_alias="PROVIDER_CIRCUIT_FAILURE_THRESHOLD"
+    )
+    provider_circuit_reset_seconds: int = Field(
+        default=30, ge=1, le=3600, validation_alias="PROVIDER_CIRCUIT_RESET_SECONDS"
+    )
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     reranker_enabled: bool = Field(default=False, validation_alias="RERANKER_ENABLED")
     google_oidc_client_id: SecretStr | None = Field(

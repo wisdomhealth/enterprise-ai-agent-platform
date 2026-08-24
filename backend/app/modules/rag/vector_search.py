@@ -127,4 +127,6 @@ def _candidate(row: tuple[DocumentChunk, DocumentVersion, Document]) -> Retrieve
         page_number=chunk.page_number,
         section=chunk.section,
         resource_authorized=True,
+        title=document.title,
+        internal_drive_link=f"https://drive.google.com/open?id={document.external_id}",
     )
