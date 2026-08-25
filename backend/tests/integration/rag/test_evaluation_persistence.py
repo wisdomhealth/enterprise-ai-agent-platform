@@ -1,6 +1,8 @@
+import os
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -13,6 +15,11 @@ from app.modules.rag.evaluation import (
     HardGateStatus,
 )
 from app.modules.rag.evaluation_models import RAGEvaluationCase, RAGEvaluationRun
+
+
+def _application_dsn() -> str:
+    url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
+    return url.replace("postgres@", "platform_app@", 1)
 
 
 def _run(run_id):  # type: ignore[no-untyped-def]
@@ -90,3 +97,33 @@ async def test_evaluation_runs_append_immutable_case_evidence_without_overwritin
     with pytest.raises(IntegrityError):
         await repository.append(run, [case])
         await db_session.flush()
+
+
+@pytest.mark.asyncio
+async def test_application_role_can_append_but_cannot_update_or_delete_evaluation_history() -> None:
+    connection = await asyncpg.connect(_application_dsn())
+    run_id = uuid4()
+    try:
+        await connection.execute(
+            """
+            INSERT INTO rag_evaluation_runs
+            (id, organization_id, knowledge_base_id, dataset_version, dataset_kind, dataset_digest,
+             document_version_set, chunking_version, embedding_model, retrieval_config,
+             prompt_version,
+             llm_model, status, metrics, hard_gates, completed_at)
+            VALUES ($1, $2, $3, 'v1', 'regression', $4, 'docs', 'chunks', 'embedding',
+                    '{}'::jsonb, 'prompt', 'model', 'COMPLETED', '{}'::jsonb, '{}'::jsonb, now())
+            """,
+            run_id,
+            uuid4(),
+            uuid4(),
+            "c" * 64,
+        )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await connection.execute(
+                "UPDATE rag_evaluation_runs SET status = 'FAILED' WHERE id = $1", run_id
+            )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await connection.execute("DELETE FROM rag_evaluation_runs WHERE id = $1", run_id)
+    finally:
+        await connection.close()
