@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
+from app.modules.authorization.types import ResourceRef, ResourceState
 from app.modules.identity.dependencies import Principal, get_db_session, require_staff_session
 from app.modules.knowledge.models import KnowledgeBase
 from app.modules.rag.types import AnswerAudience, ValidatedAnswer
@@ -41,6 +43,19 @@ async def _staff_knowledge_base(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Knowledge base not found",
         )
+    try:
+        await AuthorizationService(db_session).require(
+            principal,
+            "knowledge.read",
+            ResourceRef(
+                organization_id=principal.organization_id,
+                resource_type="knowledge",
+                resource_id=knowledge_base_id,
+                state=ResourceState.ACTIVE,
+            ),
+        )
+    except AuthorizationDenied as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from error
     return knowledge_base_id
 
 

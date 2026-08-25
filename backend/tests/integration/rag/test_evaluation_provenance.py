@@ -1,9 +1,10 @@
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app.core.database import async_sessionmaker, engine
 from app.modules.authorization.models import ResourceGrant
@@ -30,6 +31,7 @@ from app.modules.rag.evaluation_models import RAGEvaluationCase
 from app.modules.rag.groundedness import CitationValidator
 from app.modules.rag.llm import GeneratedAnswer, InMemoryRedisCircuitStore, ProviderCircuitBreaker
 from app.modules.rag.retriever import HybridRetriever
+from app.modules.rag.text_search import TextCandidateSource as PostgreSQLTextCandidateSource
 from app.modules.rag.types import (
     AnswerAudience,
     ClaimSupport,
@@ -37,6 +39,7 @@ from app.modules.rag.types import (
     SourceCitation,
     ValidatedAnswer,
 )
+from app.modules.rag.vector_search import VectorCandidateSource as PostgreSQLVectorCandidateSource
 
 
 class StaticEmbeddingProvider:
@@ -74,6 +77,40 @@ class CountingHybridRetriever(HybridRetriever):
         return await super().retrieve(principal, knowledge_base_id, query, limit)
 
 
+class RecordingVectorSource(PostgreSQLVectorCandidateSource):
+    def __init__(self, barrier: asyncio.Barrier) -> None:
+        super().__init__(async_sessionmaker)
+        self._barrier = barrier
+        self.backend_pids: list[int] = []
+        self.results: list[list[RetrievedChunk]] = []
+
+    async def _search_with_session(self, db_session, *args, **kwargs):  # type: ignore[no-untyped-def]
+        backend_pid = await db_session.scalar(select(func.pg_backend_pid()))
+        assert isinstance(backend_pid, int)
+        self.backend_pids.append(backend_pid)
+        await asyncio.wait_for(self._barrier.wait(), timeout=2)
+        result = await super()._search_with_session(db_session, *args, **kwargs)
+        self.results.append(result)
+        return result
+
+
+class RecordingTextSource(PostgreSQLTextCandidateSource):
+    def __init__(self, barrier: asyncio.Barrier) -> None:
+        super().__init__(async_sessionmaker)
+        self._barrier = barrier
+        self.backend_pids: list[int] = []
+        self.results: list[list[RetrievedChunk]] = []
+
+    async def _search_with_session(self, db_session, *args, **kwargs):  # type: ignore[no-untyped-def]
+        backend_pid = await db_session.scalar(select(func.pg_backend_pid()))
+        assert isinstance(backend_pid, int)
+        self.backend_pids.append(backend_pid)
+        await asyncio.wait_for(self._barrier.wait(), timeout=2)
+        result = await super()._search_with_session(db_session, *args, **kwargs)
+        self.results.append(result)
+        return result
+
+
 @dataclass(frozen=True)
 class HistoricalEvidenceFixture:
     organization_id: UUID
@@ -82,6 +119,7 @@ class HistoricalEvidenceFixture:
     document_id: UUID
     version_a_id: UUID
     chunk_a_id: UUID
+    chunk_a_ids: tuple[UUID, UUID]
 
 
 async def _seed_historical_evidence() -> HistoricalEvidenceFixture:
@@ -132,19 +170,32 @@ async def _seed_historical_evidence() -> HistoricalEvidenceFixture:
         db_session.add(version_a)
         await db_session.flush()
         document.current_version_id = version_a.id
-        chunk_a_id = uuid4()
-        db_session.add(
-            DocumentChunk(
-                id=chunk_a_id,
-                document_version_id=version_a.id,
-                ordinal=0,
-                text="Refunds take five business days.",
-                page_number=2,
-                section="Eligibility",
-                token_count=5,
-                metadata_={},
-                embedding=[1.0] * 1536,
-            )
+        chunk_a_id, secondary_chunk_a_id = sorted((uuid4(), uuid4()))
+        db_session.add_all(
+            [
+                DocumentChunk(
+                    id=chunk_a_id,
+                    document_version_id=version_a.id,
+                    ordinal=0,
+                    text="Refunds take five business days.",
+                    page_number=2,
+                    section="Eligibility",
+                    token_count=5,
+                    metadata_={},
+                    embedding=[1.0] * 1536,
+                ),
+                DocumentChunk(
+                    id=secondary_chunk_a_id,
+                    document_version_id=version_a.id,
+                    ordinal=1,
+                    text="Refunds take five business days for eligible returns.",
+                    page_number=3,
+                    section="Details",
+                    token_count=8,
+                    metadata_={},
+                    embedding=[1.0] * 1536,
+                ),
+            ]
         )
         db_session.add(
             ResourceGrant(
@@ -170,6 +221,7 @@ async def _seed_historical_evidence() -> HistoricalEvidenceFixture:
             document_id=document.id,
             version_a_id=version_a.id,
             chunk_a_id=chunk_a_id,
+            chunk_a_ids=(chunk_a_id, secondary_chunk_a_id),
         )
 
 
@@ -180,6 +232,8 @@ class CorpusChangingAnswerService:
         self._answer_service = answer_service
         self._document_id = document_id
         self.calls = 0
+        self.version_b_id: UUID | None = None
+        self.chunk_b_ids: tuple[UUID, UUID] | None = None
 
     async def answer_with_evidence(
         self,
@@ -203,20 +257,36 @@ class CorpusChangingAnswerService:
             db_session.add(version_b)
             await db_session.flush()
             document.current_version_id = version_b.id
-            db_session.add(
-                DocumentChunk(
-                    id=uuid4(),
-                    document_version_id=version_b.id,
-                    ordinal=0,
-                    text="Refunds take ten business days.",
-                    page_number=2,
-                    section="Eligibility",
-                    token_count=5,
-                    metadata_={},
-                    embedding=[1.0] * 1536,
-                )
+            chunk_b_id, secondary_chunk_b_id = sorted((uuid4(), uuid4()))
+            db_session.add_all(
+                [
+                    DocumentChunk(
+                        id=chunk_b_id,
+                        document_version_id=version_b.id,
+                        ordinal=0,
+                        text="Refunds take ten business days.",
+                        page_number=2,
+                        section="Eligibility",
+                        token_count=5,
+                        metadata_={},
+                        embedding=[1.0] * 1536,
+                    ),
+                    DocumentChunk(
+                        id=secondary_chunk_b_id,
+                        document_version_id=version_b.id,
+                        ordinal=1,
+                        text="Refunds take ten business days for eligible returns.",
+                        page_number=3,
+                        section="Details",
+                        token_count=8,
+                        metadata_={},
+                        embedding=[1.0] * 1536,
+                    ),
+                ]
             )
             await db_session.commit()
+            self.version_b_id = version_b.id
+            self.chunk_b_ids = (chunk_b_id, secondary_chunk_b_id)
         return execution
 
 
@@ -364,7 +434,7 @@ async def test_evaluation_persists_task11_hybrid_evidence_from_history_a_after_c
         cases=[
             EvaluationCase(
                 case_id="same-evidence",
-                question="How long do refunds take?",
+                question="refunds take",
                 answerable=True,
                 authoritative_document_ids=[fixture.document_id],
                 expected_claims=["Refunds take five business days."],
@@ -373,8 +443,12 @@ async def test_evaluation_persists_task11_hybrid_evidence_from_history_a_after_c
             )
         ],
     )
-    retriever = CountingHybridRetriever.from_session_factory(
-        async_sessionmaker,
+    barrier = asyncio.Barrier(2)
+    vector_source = RecordingVectorSource(barrier)
+    text_source = RecordingTextSource(barrier)
+    retriever = CountingHybridRetriever(
+        vector_source,
+        text_source,
         StaticEmbeddingProvider(),
     )
     task11_service = GroundedAnswerService(
@@ -407,12 +481,64 @@ async def test_evaluation_persists_task11_hybrid_evidence_from_history_a_after_c
         assert service.calls == 1
         assert retriever.calls == 1
         assert run.metrics.recall_at_10 == 1.0
+        assert run.metrics.citation_mapping_rate == 1.0
+        assert run.metrics.citation_support_rate == 1.0
+        assert run.metrics.answer_groundedness == 1.0
+        assert run.metrics.claim_groundedness == 1.0
+        assert len(vector_source.backend_pids) == len(text_source.backend_pids) == 1
+        assert vector_source.backend_pids[0] != text_source.backend_pids[0]
+        assert {item.chunk_id for item in vector_source.results[0]} == set(
+            fixture.chunk_a_ids
+        )
+        assert {item.chunk_id for item in text_source.results[0]} == set(fixture.chunk_a_ids)
+        assert all(
+            item.document_version_id == fixture.version_a_id
+            and item.resource_authorized
+            and item.retrieval_eligible
+            for item in vector_source.results[0] + text_source.results[0]
+        )
         assert stored_case is not None
-        assert stored_case.retrieved_chunk_ids == [fixture.chunk_a_id]
-        assert stored_case.retrieved_document_version_ids == [fixture.version_a_id]
+        assert set(stored_case.retrieved_chunk_ids) == set(fixture.chunk_a_ids)
+        assert len(stored_case.retrieved_chunk_ids) == len(fixture.chunk_a_ids)
+        assert stored_case.retrieved_document_version_ids == [
+            fixture.version_a_id,
+            fixture.version_a_id,
+        ]
         assert stored_case.citation_chunk_ids == [fixture.chunk_a_id]
         assert stored_case.citation_document_version_ids == [fixture.version_a_id]
         assert stored_case.snapshot["result"]["text"] == "Refunds take five business days."
+        assert stored_case.snapshot["result"]["citations"][0]["chunk_id"] == str(
+            fixture.chunk_a_id
+        )
+        assert stored_case.snapshot["result"]["citations"][0][
+            "document_version_id"
+        ] == str(fixture.version_a_id)
+        assert stored_case.snapshot["claims"] == [
+            {"text": "Refunds take five business days.", "supported": True}
+        ]
+
+        assert service.version_b_id is not None
+        assert service.chunk_b_ids is not None
+        current_results = await retriever.retrieve(
+            fixture.principal,
+            fixture.knowledge_base_id,
+            "refunds take",
+            10,
+        )
+        assert retriever.calls == 2
+        assert len(vector_source.backend_pids) == len(text_source.backend_pids) == 2
+        assert vector_source.backend_pids[1] != text_source.backend_pids[1]
+        assert {item.chunk_id for item in vector_source.results[1]} == set(
+            service.chunk_b_ids
+        )
+        assert {item.chunk_id for item in text_source.results[1]} == set(service.chunk_b_ids)
+        assert {item.chunk_id for item in current_results} == set(service.chunk_b_ids)
+        assert len(current_results) == len(service.chunk_b_ids)
+        assert all(
+            item.document_version_id == service.version_b_id
+            and item.chunk_id not in fixture.chunk_a_ids
+            for item in current_results
+        )
 
         async with async_sessionmaker() as verification_session:
             document = await verification_session.get(Document, fixture.document_id)
@@ -424,7 +550,7 @@ async def test_evaluation_persists_task11_hybrid_evidence_from_history_a_after_c
                 )
             )
         assert current_chunk is not None
-        assert current_chunk.text == "Refunds take ten business days."
+        assert current_chunk.document_version_id == service.version_b_id
     finally:
         await _delete_organization(fixture.organization_id)
         await engine.dispose()

@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -18,8 +19,20 @@ from app.modules.rag.evaluation_models import RAGEvaluationCase, RAGEvaluationRu
 
 
 def _application_dsn() -> str:
-    url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
-    return url.replace("postgres@", "platform_app@", 1)
+    return _owner_dsn().replace("postgres@", "platform_app@", 1)
+
+
+def _owner_dsn() -> str:
+    return os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+async def _delete_evaluation_run(run_id) -> None:  # type: ignore[no-untyped-def]
+    connection = await asyncpg.connect(_owner_dsn())
+    try:
+        await connection.execute("DELETE FROM rag_evaluation_cases WHERE run_id = $1", run_id)
+        await connection.execute("DELETE FROM rag_evaluation_runs WHERE id = $1", run_id)
+    finally:
+        await connection.close()
 
 
 def _run(run_id):  # type: ignore[no-untyped-def]
@@ -94,6 +107,7 @@ async def test_evaluation_runs_append_immutable_case_evidence_without_overwritin
     assert stored_case.citation_document_version_ids == case.citation_document_version_ids
     assert stored_case.snapshot == case.snapshot
 
+    db_session.expunge(stored)
     with pytest.raises(IntegrityError):
         await repository.append(run, [case])
         await db_session.flush()
@@ -127,3 +141,90 @@ async def test_application_role_can_append_but_cannot_update_or_delete_evaluatio
             await connection.execute("DELETE FROM rag_evaluation_runs WHERE id = $1", run_id)
     finally:
         await connection.close()
+        await _delete_evaluation_run(run_id)
+
+
+@pytest.mark.asyncio
+async def test_application_role_cannot_update_or_delete_case_evidence_from_another_session() -> (
+    None
+):
+    run_id = uuid4()
+    case_id = uuid4()
+    retrieved_chunk_id = uuid4()
+    cited_chunk_id = uuid4()
+    retrieved_document_id = uuid4()
+    retrieved_version_id = uuid4()
+    cited_version_id = uuid4()
+    snapshot = {
+        "input": {"case_id": "legacy-case"},
+        "result": {"text": "Refunds take five business days."},
+    }
+    try:
+        writer = await asyncpg.connect(_application_dsn())
+        try:
+            await writer.execute(
+                """
+                INSERT INTO rag_evaluation_runs
+                (id, organization_id, knowledge_base_id, dataset_version, dataset_kind,
+                 dataset_digest, document_version_set, chunking_version, embedding_model,
+                 retrieval_config, prompt_version, llm_model, status, metrics, hard_gates,
+                 completed_at)
+                VALUES ($1, $2, $3, 'v1', 'regression', $4, 'docs', 'chunks', 'embedding',
+                        '{}'::jsonb, 'prompt', 'model', 'COMPLETED', '{}'::jsonb,
+                        '{}'::jsonb, now())
+                """,
+                run_id,
+                uuid4(),
+                uuid4(),
+                "d" * 64,
+            )
+            await writer.execute(
+                """
+                INSERT INTO rag_evaluation_cases
+                (id, run_id, case_id, question_digest, answer_refused,
+                 retrieved_chunk_ids, retrieved_document_ids, retrieved_document_version_ids,
+                 citation_chunk_ids, citation_document_version_ids, snapshot)
+                VALUES ($1, $2, 'legacy-case', $3, false, $4, $5, $6, $7, $8, $9::jsonb)
+                """,
+                case_id,
+                run_id,
+                "e" * 64,
+                [retrieved_chunk_id],
+                [retrieved_document_id],
+                [retrieved_version_id],
+                [cited_chunk_id],
+                [cited_version_id],
+                json.dumps(snapshot),
+            )
+        finally:
+            await writer.close()
+
+        mutator = await asyncpg.connect(_application_dsn())
+        try:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await mutator.execute(
+                    "UPDATE rag_evaluation_cases SET snapshot = '{}'::jsonb WHERE id = $1",
+                    case_id,
+                )
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await mutator.execute("DELETE FROM rag_evaluation_cases WHERE id = $1", case_id)
+            stored = await mutator.fetchrow(
+                """
+                SELECT retrieved_chunk_ids, retrieved_document_ids,
+                       retrieved_document_version_ids, citation_chunk_ids,
+                       citation_document_version_ids, snapshot
+                FROM rag_evaluation_cases WHERE id = $1
+                """,
+                case_id,
+            )
+            assert stored is not None
+            assert list(stored["retrieved_chunk_ids"]) == [retrieved_chunk_id]
+            assert list(stored["retrieved_document_ids"]) == [retrieved_document_id]
+            assert list(stored["retrieved_document_version_ids"]) == [retrieved_version_id]
+            assert list(stored["citation_chunk_ids"]) == [cited_chunk_id]
+            assert list(stored["citation_document_version_ids"]) == [cited_version_id]
+            assert json.loads(stored["snapshot"]) == snapshot
+        finally:
+            await mutator.close()
+    finally:
+        await _delete_evaluation_run(run_id)

@@ -28,6 +28,9 @@ runner sends only each question to the answer service; labels are applied only
 after an answer has been produced.
 
 Staff Assist calls `POST /api/v1/staff/knowledge/search` with a staff session
-and `{ "question": "..." }`. It uses the staff citation projection, is read
-only, and does not create outbox events, workflow state, customer messages, or
+and `{ "question": "..." }`. Before retrieval, the route applies the central
+`knowledge.read` role/action policy and requires the caller's matching resource
+grant. The approved role model permits `ADMIN`, `REVIEWER`, and `MEMBER` callers
+with that grant. It uses the staff citation projection, is read only, and does
+not create audit/outbox events, jobs, evaluation history, customer messages, or
 delivery intents.
