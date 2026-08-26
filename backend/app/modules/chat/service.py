@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -25,26 +26,6 @@ class ChatSessionService:
         self._db_session = db_session
         self._token_service = token_service or ChatTokenService()
         self._rate_limiter = rate_limiter
-
-    async def create_session(
-        self,
-        *,
-        public_key: str,
-        customer_name: str | None,
-        customer_email: str | None,
-        ip_address: str,
-    ) -> tuple[ChatSession, str, datetime] | None:
-        knowledge_base = await self.knowledge_base_for_public_key(public_key)
-        if knowledge_base is None:
-            return None
-        await self._limiter().check_creation(
-            ip_address=ip_address, organization_id=str(knowledge_base.organization_id)
-        )
-        return await self.create_session_for_knowledge_base(
-            knowledge_base=knowledge_base,
-            customer_name=customer_name,
-            customer_email=customer_email,
-        )
 
     async def knowledge_base_for_public_key(self, public_key: str) -> KnowledgeBase | None:
         knowledge_base = await self._db_session.scalar(
@@ -77,7 +58,8 @@ class ChatSessionService:
         knowledge_base: KnowledgeBase,
         customer_name: str | None,
         customer_email: str | None,
-    ) -> tuple[ChatSession, str, datetime]:
+        credential_value_for_session: Callable[[UUID], str],
+    ) -> tuple[ChatSession, ChatSessionCredential, str, datetime]:
         session = ChatSession(
             organization_id=knowledge_base.organization_id,
             knowledge_base_id=knowledge_base.id,
@@ -86,16 +68,18 @@ class ChatSessionService:
         )
         self._db_session.add(session)
         await self._db_session.flush()
-        issued = self._token_service.issue(session_id=session.id)
-        self._db_session.add(
-            ChatSessionCredential(
-                session_id=session.id,
-                token_hash=issued.token_hash,
-                expires_at=issued.expires_at,
-            )
+        issued = self._token_service.issue(
+            session_id=session.id,
+            value=credential_value_for_session(session.id),
         )
+        credential = ChatSessionCredential(
+            session_id=session.id,
+            token_hash=issued.token_hash,
+            expires_at=issued.expires_at,
+        )
+        self._db_session.add(credential)
         await self._db_session.flush()
-        return session, issued.value, issued.expires_at
+        return session, credential, issued.value, issued.expires_at
 
     def _limiter(self) -> SlidingWindowRateLimiter:
         if self._rate_limiter is None:
@@ -121,8 +105,12 @@ class ChatSessionService:
         return session if isinstance(session, ChatSession) else None
 
     async def rotate_credential(
-        self, *, session_id: UUID, credential_value: str
-    ) -> tuple[str, datetime] | None:
+        self,
+        *,
+        session_id: UUID,
+        credential_value: str,
+        replacement_credential_value: str,
+    ) -> tuple[ChatSessionCredential, str, datetime] | None:
         now = datetime.now(UTC)
         credential = await self._db_session.scalar(
             select(ChatSessionCredential)
@@ -144,13 +132,14 @@ class ChatSessionService:
         if session.state is ConversationState.RESOLVED:
             raise ValueError("chat session is resolved")
         credential.revoked_at = now
-        issued = self._token_service.issue(session_id=session.id)
-        self._db_session.add(
-            ChatSessionCredential(
-                session_id=session.id,
-                token_hash=issued.token_hash,
-                expires_at=issued.expires_at,
-            )
+        issued = self._token_service.issue(
+            session_id=session.id, value=replacement_credential_value
         )
+        replacement = ChatSessionCredential(
+            session_id=session.id,
+            token_hash=issued.token_hash,
+            expires_at=issued.expires_at,
+        )
+        self._db_session.add(replacement)
         await self._db_session.flush()
-        return issued.value, issued.expires_at
+        return replacement, issued.value, issued.expires_at

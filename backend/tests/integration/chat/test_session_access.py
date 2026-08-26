@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from secrets import token_urlsafe
 
 import httpx
 import pytest
@@ -9,12 +10,14 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import async_sessionmaker
+from app.core.config import Settings
+from app.core.database import async_sessionmaker, engine
 from app.main import create_app
 from app.modules.chat.models import ChatSession, ChatSessionCredential
 from app.modules.chat.rate_limit import SlidingWindowRateLimiter
 from app.modules.chat.service import ChatSessionService
 from app.modules.chat.tokens import ChatTokenService
+from app.modules.idempotency.models import IdempotencyRecord
 from app.modules.identity.dependencies import get_db_session
 from app.modules.identity.models import Organization
 from app.modules.knowledge.models import KnowledgeBase
@@ -27,7 +30,7 @@ class AlwaysAdmitRedis:
 
 @pytest.fixture
 def app(db_session: AsyncSession) -> FastAPI:
-    application = create_app()
+    application = create_app(Settings(SESSION_SECRET="task-thirteen-test-session-secret"))
 
     async def override_db_session() -> AsyncIterator[AsyncSession]:
         yield db_session
@@ -126,11 +129,75 @@ async def test_public_writes_fail_closed_when_redis_is_not_configured(public_cli
     response = await public_client.post(
         "/api/v1/public/chat/sessions",
         json={"public_key": knowledge_base.public_key},
+        headers={"Idempotency-Key": "no-redis"},
     )
 
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "1"
     assert response.json()["detail"] == "Please wait a moment before trying again."
+
+
+@pytest.mark.asyncio
+async def test_public_writes_require_an_idempotency_key(
+    app: FastAPI, public_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
+    organization = Organization(name="Required idempotency key")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id,
+        public_key=f"public-{organization.id.hex}",
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+
+    response = await public_client.post(
+        "/api/v1/public/chat/sessions", json={"public_key": knowledge_base.public_key}
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_credential_rotation_requires_an_idempotency_key(
+    app: FastAPI, public_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
+    session, token = await _session_with_token(db_session)
+
+    response = await public_client.post(
+        f"/api/v1/public/chat/sessions/{session.id}/credentials/rotate",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_public_writes_reject_when_session_secret_is_not_configured(
+    app: FastAPI, public_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    app.state.settings = Settings()
+    app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
+    organization = Organization(name="Missing chat session secret")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id,
+        public_key=f"public-{organization.id.hex}",
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+
+    response = await public_client.post(
+        "/api/v1/public/chat/sessions",
+        json={"public_key": knowledge_base.public_key},
+        headers={"Idempotency-Key": "missing-secret"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Public chat is unavailable."
 
 
 @pytest.mark.asyncio
@@ -164,6 +231,13 @@ async def test_session_creation_idempotency_replays_original_body_and_rejects_mi
     assert first.status_code == replay.status_code == 201
     assert replay.json() == first.json()
     assert mismatch.status_code == 409
+    record = await db_session.scalar(
+        select(IdempotencyRecord).where(IdempotencyRecord.key == "create-1")
+    )
+    assert record is not None
+    assert first.json()["credential"]["token"] not in str(record.response_body)
+    assert "task-thirteen-test-session-secret" not in str(record.response_body)
+    assert "token" not in (record.response_body or {}).get("credential", {})
 
 
 @pytest.mark.asyncio
@@ -187,6 +261,59 @@ async def test_rotation_idempotency_replays_after_old_credential_is_revoked(
         f"/api/v1/public/chat/sessions/{session.id}",
         headers={"Authorization": f"Bearer {old_token}"},
     )).status_code == 404
+    record = await db_session.scalar(
+        select(IdempotencyRecord).where(IdempotencyRecord.key == "rotate-1")
+    )
+    assert record is not None
+    assert first.json()["token"] not in str(record.response_body)
+    assert "task-thirteen-test-session-secret" not in str(record.response_body)
+    assert "token" not in (record.response_body or {}).get("credential", {})
+
+
+@pytest.mark.asyncio
+async def test_idempotency_replay_is_durable_across_fresh_app_instances() -> None:
+    session_secret = "durable-public-chat-session-secret"
+    async with async_sessionmaker() as setup_session:
+        organization = Organization(name="Durable idempotency")
+        setup_session.add(organization)
+        await setup_session.flush()
+        knowledge_base = KnowledgeBase(
+            organization_id=organization.id,
+            public_key=f"public-{organization.id.hex}",
+        )
+        setup_session.add(knowledge_base)
+        await setup_session.commit()
+
+    first_app = create_app(Settings(SESSION_SECRET=session_secret))
+    first_app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
+    request = {"public_key": knowledge_base.public_key, "customer_name": "Ada"}
+    headers = {"Idempotency-Key": "durable-create"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=first_app), base_url="https://testserver"
+    ) as first_client:
+        first = await first_client.post(
+            "/api/v1/public/chat/sessions", json=request, headers=headers
+        )
+
+    fresh_app = create_app(Settings(SESSION_SECRET=session_secret))
+    fresh_app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=fresh_app), base_url="https://testserver"
+    ) as fresh_client:
+        replay = await fresh_client.post(
+            "/api/v1/public/chat/sessions", json=request, headers=headers
+        )
+
+    assert first.status_code == replay.status_code == 201
+    assert replay.json() == first.json()
+    async with async_sessionmaker() as verification_session:
+        record = await verification_session.scalar(
+            select(IdempotencyRecord).where(IdempotencyRecord.key == "durable-create")
+        )
+    assert record is not None
+    assert first.json()["credential"]["token"] not in str(record.response_body)
+    assert session_secret not in str(record.response_body)
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -220,7 +347,9 @@ async def test_concurrent_old_token_rotations_leave_exactly_one_active_replaceme
     async def rotate_once() -> tuple[str, datetime] | None:
         async with async_sessionmaker() as rotation_session:
             result = await ChatSessionService(rotation_session).rotate_credential(
-                session_id=session.id, credential_value=issued.value
+                session_id=session.id,
+                credential_value=issued.value,
+                replacement_credential_value=token_urlsafe(32),
             )
             await rotation_session.commit()
             return result
