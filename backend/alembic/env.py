@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.modules.authorization import models as authorization_models  # noqa: F401
 from app.modules.audit import models as audit_models  # noqa: F401
+from app.modules.chat import models as chat_models  # noqa: F401
 from app.modules.connectors import models as connector_models  # noqa: F401
 from app.modules.identity import models  # noqa: F401
 from app.modules.idempotency import models as idempotency_models  # noqa: F401

@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
+from secrets import token_urlsafe
 from uuid import UUID, uuid4
 
 from pgvector.sqlalchemy import Vector
@@ -55,6 +56,13 @@ class KnowledgeBase(Base):
     )
     default_language: Mapped[str] = mapped_column(
         String(16), nullable=False, default="en", server_default=sql_text("'en'")
+    )
+    public_key: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        default=lambda: token_urlsafe(24),
+        server_default=sql_text("replace(gen_random_uuid()::text, '-', '')"),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

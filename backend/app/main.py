@@ -5,6 +5,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.core.celery import create_celery
 from app.core.config import Settings
 from app.core.logging import configure_logging
+from app.modules.chat.rate_limit import SlidingWindowRateLimiter
+from app.modules.chat.router import router as chat_router
 from app.modules.connectors.router import router as connectors_router
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.oidc import configure_google_oidc
@@ -24,6 +26,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.google_oidc_client = None
     app.state.connector_service = ConnectorService.from_settings(settings)
     app.state.drive_gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
+    app.state.chat_rate_limiter = None
+    if settings.redis_url is not None:
+        from redis.asyncio import Redis
+
+        app.state.chat_rate_limiter = SlidingWindowRateLimiter(
+            Redis.from_url(settings.redis_url.unicode_string(), decode_responses=True)
+        )
     app.state.grounded_answer_service = (
         GroundedAnswerService.from_settings(settings)
         if (
@@ -58,6 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(connectors_router)
     app.include_router(knowledge_router)
     app.include_router(rag_router)
+    app.include_router(chat_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
