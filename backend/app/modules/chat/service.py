@@ -104,6 +104,25 @@ class ChatSessionService:
         )
         return session if isinstance(session, ChatSession) else None
 
+    async def get_authorized_session_for_rotation(
+        self, *, session_id: UUID, credential_value: str
+    ) -> ChatSession | None:
+        """Authorize and lock the presented credential until rotation/replay completes."""
+
+        now = datetime.now(UTC)
+        session = await self._db_session.scalar(
+            select(ChatSession)
+            .join(ChatSessionCredential, ChatSessionCredential.session_id == ChatSession.id)
+            .where(
+                ChatSession.id == session_id,
+                ChatSessionCredential.token_hash == hash_chat_token(credential_value),
+                ChatSessionCredential.revoked_at.is_(None),
+                ChatSessionCredential.expires_at > now,
+            )
+            .with_for_update()
+        )
+        return session if isinstance(session, ChatSession) else None
+
     async def rotate_credential(
         self,
         *,

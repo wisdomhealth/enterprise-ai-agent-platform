@@ -241,7 +241,7 @@ async def test_session_creation_idempotency_replays_original_body_and_rejects_mi
 
 
 @pytest.mark.asyncio
-async def test_rotation_idempotency_replays_after_old_credential_is_revoked(
+async def test_rotation_replay_rejects_the_revoked_old_credential(
     app: FastAPI, public_client: httpx.AsyncClient, db_session: AsyncSession
 ) -> None:
     app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
@@ -255,12 +255,21 @@ async def test_rotation_idempotency_replays_after_old_credential_is_revoked(
         f"/api/v1/public/chat/sessions/{session.id}/credentials/rotate", headers=headers
     )
 
-    assert first.status_code == replay.status_code == 200
-    assert replay.json() == first.json()
+    assert first.status_code == 200
+    assert replay.status_code == 404
+    assert "token" not in replay.text
     assert (await public_client.get(
         f"/api/v1/public/chat/sessions/{session.id}",
         headers={"Authorization": f"Bearer {old_token}"},
     )).status_code == 404
+    current = await public_client.post(
+        f"/api/v1/public/chat/sessions/{session.id}/credentials/rotate",
+        headers={
+            "Authorization": f"Bearer {first.json()['token']}",
+            "Idempotency-Key": "rotate-current-1",
+        },
+    )
+    assert current.status_code == 200
     record = await db_session.scalar(
         select(IdempotencyRecord).where(IdempotencyRecord.key == "rotate-1")
     )

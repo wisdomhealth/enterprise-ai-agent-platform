@@ -273,7 +273,9 @@ async def rotate_public_credential(
     service: ChatSessionService = Depends(_service),
 ) -> PublicChatCredentialRead:
     session_secret = _chat_credential_secret(request)
-    session = await db_session.get(ChatSession, session_id)
+    session = await service.get_authorized_session_for_rotation(
+        session_id=session_id, credential_value=credential
+    )
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     record = await _begin_idempotency(
