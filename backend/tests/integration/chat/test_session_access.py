@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
@@ -5,14 +6,23 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import async_sessionmaker
 from app.main import create_app
 from app.modules.chat.models import ChatSession, ChatSessionCredential
+from app.modules.chat.rate_limit import SlidingWindowRateLimiter
+from app.modules.chat.service import ChatSessionService
 from app.modules.chat.tokens import ChatTokenService
 from app.modules.identity.dependencies import get_db_session
 from app.modules.identity.models import Organization
 from app.modules.knowledge.models import KnowledgeBase
+
+
+class AlwaysAdmitRedis:
+    async def eval(self, _script: str, _numkeys: int, *_args: object) -> list[int]:
+        return [1, 0]
 
 
 @pytest.fixture
@@ -99,3 +109,140 @@ async def test_expired_token_is_rejected_and_public_read_hides_internal_fields(
     assert valid.status_code == 404
     assert "knowledge_base_id" not in valid.text
     assert "organization_id" not in valid.text
+
+
+@pytest.mark.asyncio
+async def test_public_writes_fail_closed_when_redis_is_not_configured(public_client, db_session):
+    organization = Organization(name="Unavailable limiter")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id,
+        public_key=f"public-{organization.id.hex}",
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+
+    response = await public_client.post(
+        "/api/v1/public/chat/sessions",
+        json={"public_key": knowledge_base.public_key},
+    )
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "1"
+    assert response.json()["detail"] == "Please wait a moment before trying again."
+
+
+@pytest.mark.asyncio
+async def test_session_creation_idempotency_replays_original_body_and_rejects_mismatch(
+    app: FastAPI, public_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
+    organization = Organization(name="Creation idempotency")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id,
+        public_key=f"public-{organization.id.hex}",
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    request = {"public_key": knowledge_base.public_key, "customer_name": "Ada"}
+
+    first = await public_client.post(
+        "/api/v1/public/chat/sessions", json=request, headers={"Idempotency-Key": "create-1"}
+    )
+    replay = await public_client.post(
+        "/api/v1/public/chat/sessions", json=request, headers={"Idempotency-Key": "create-1"}
+    )
+    mismatch = await public_client.post(
+        "/api/v1/public/chat/sessions",
+        json={**request, "customer_name": "Grace"},
+        headers={"Idempotency-Key": "create-1"},
+    )
+
+    assert first.status_code == replay.status_code == 201
+    assert replay.json() == first.json()
+    assert mismatch.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_rotation_idempotency_replays_after_old_credential_is_revoked(
+    app: FastAPI, public_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    app.state.chat_rate_limiter = SlidingWindowRateLimiter(AlwaysAdmitRedis())
+    session, old_token = await _session_with_token(db_session)
+    headers = {"Authorization": f"Bearer {old_token}", "Idempotency-Key": "rotate-1"}
+
+    first = await public_client.post(
+        f"/api/v1/public/chat/sessions/{session.id}/credentials/rotate", headers=headers
+    )
+    replay = await public_client.post(
+        f"/api/v1/public/chat/sessions/{session.id}/credentials/rotate", headers=headers
+    )
+
+    assert first.status_code == replay.status_code == 200
+    assert replay.json() == first.json()
+    assert (await public_client.get(
+        f"/api/v1/public/chat/sessions/{session.id}",
+        headers={"Authorization": f"Bearer {old_token}"},
+    )).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_concurrent_old_token_rotations_leave_exactly_one_active_replacement() -> None:
+    async with async_sessionmaker() as setup_session:
+        organization = Organization(name="Concurrent rotation")
+        setup_session.add(organization)
+        await setup_session.flush()
+        knowledge_base = KnowledgeBase(
+            organization_id=organization.id,
+            public_key=f"public-{organization.id.hex}",
+        )
+        setup_session.add(knowledge_base)
+        await setup_session.flush()
+        session = ChatSession(
+            organization_id=organization.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+        setup_session.add(session)
+        await setup_session.flush()
+        issued = ChatTokenService().issue(session_id=session.id, lifetime_seconds=3_600)
+        setup_session.add(
+            ChatSessionCredential(
+                session_id=session.id,
+                token_hash=issued.token_hash,
+                expires_at=issued.expires_at,
+            )
+        )
+        await setup_session.commit()
+
+    async def rotate_once() -> tuple[str, datetime] | None:
+        async with async_sessionmaker() as rotation_session:
+            result = await ChatSessionService(rotation_session).rotate_credential(
+                session_id=session.id, credential_value=issued.value
+            )
+            await rotation_session.commit()
+            return result
+
+    first, second = await asyncio.gather(rotate_once(), rotate_once())
+    assert sum(result is not None for result in (first, second)) == 1
+
+    async with async_sessionmaker() as verification_session:
+        credentials = list(
+            (
+                await verification_session.scalars(
+                    select(ChatSessionCredential).where(
+                        ChatSessionCredential.session_id == session.id
+                    )
+                )
+            ).all()
+        )
+    assert len(credentials) == 2
+    assert sum(credential.revoked_at is None for credential in credentials) == 1
+
+
+def test_task_thirteen_does_not_publish_the_task_fourteen_message_route() -> None:
+    paths = {route.path for route in create_app().routes}
+
+    assert "/api/v1/public/chat/sessions/{session_id}/messages" not in paths

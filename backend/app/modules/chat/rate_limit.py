@@ -4,17 +4,7 @@ from typing import Any, Protocol
 
 
 class SlidingWindowRedis(Protocol):
-    async def zremrangebyscore(self, key: str, minimum: float, maximum: float) -> Any: ...
-
-    async def zcard(self, key: str) -> int: ...
-
-    async def zadd(self, key: str, mapping: dict[str, float]) -> Any: ...
-
-    async def expire(self, key: str, seconds: int) -> Any: ...
-
-    async def zrange(
-        self, key: str, start: int, end: int, *, withscores: bool = False
-    ) -> list[Any]: ...
+    async def eval(self, script: str, numkeys: int, *args: object) -> list[Any]: ...
 
 
 class RateLimitExceeded(RuntimeError):
@@ -23,8 +13,41 @@ class RateLimitExceeded(RuntimeError):
         self.retry_after = retry_after
 
 
+class RateLimitUnavailable(RuntimeError):
+    """Public writes fail closed if their admission control is unavailable."""
+
+
+_SLIDING_WINDOW_ADMIT = """
+local now = tonumber(ARGV[1])
+local threshold = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local window = tonumber(ARGV[4])
+local member = ARGV[5]
+local retry_after = 0
+
+for index = 1, #KEYS do
+  redis.call('ZREMRANGEBYSCORE', KEYS[index], 0, threshold)
+  if redis.call('ZCARD', KEYS[index]) >= limit then
+    local oldest = redis.call('ZRANGE', KEYS[index], 0, 0, 'WITHSCORES')
+    local retry = window
+    if oldest[2] then
+      retry = math.max(1, math.ceil(tonumber(oldest[2]) + window - now))
+    end
+    if retry > retry_after then retry_after = retry end
+  end
+end
+
+if retry_after > 0 then return {0, retry_after} end
+for index = 1, #KEYS do
+  redis.call('ZADD', KEYS[index], now, member)
+  redis.call('EXPIRE', KEYS[index], window + 1)
+end
+return {1, 0}
+"""
+
+
 class SlidingWindowRateLimiter:
-    """Redis-backed fixed-duration sliding windows for public chat ingress."""
+    """Atomic Redis sliding-window admission for public chat ingress."""
 
     def __init__(
         self,
@@ -51,6 +74,13 @@ class SlidingWindowRateLimiter:
             now=now,
         )
 
+    async def check_creation_ip(
+        self, *, ip_address: str, now: datetime | None = None
+    ) -> None:
+        await self._check_many(
+            (f"chat:rate:create:ip:{ip_address}",), self._creation_limit, now=now
+        )
+
     async def check_message(
         self,
         *,
@@ -75,19 +105,20 @@ class SlidingWindowRateLimiter:
         instant = now or datetime.now(UTC)
         timestamp = instant.timestamp()
         threshold = (instant - timedelta(seconds=self._window_seconds)).timestamp()
-        retries: list[int] = []
-        for key in keys:
-            await self._redis.zremrangebyscore(key, 0, threshold)
-            if await self._redis.zcard(key) >= limit:
-                oldest = await self._redis.zrange(key, 0, 0, withscores=True)
-                if oldest:
-                    raw_score = oldest[0][1]
-                    score = float(raw_score.decode() if isinstance(raw_score, bytes) else raw_score)
-                    retries.append(max(1, int(score + self._window_seconds - timestamp) + 1))
-                else:
-                    retries.append(self._window_seconds)
-        if retries:
-            raise RateLimitExceeded(max(retries))
-        for key in keys:
-            await self._redis.zadd(key, {token_hex(16): timestamp})
-            await self._redis.expire(key, self._window_seconds + 1)
+        try:
+            result = await self._redis.eval(
+                _SLIDING_WINDOW_ADMIT,
+                len(keys),
+                *keys,
+                timestamp,
+                threshold,
+                limit,
+                self._window_seconds,
+                token_hex(16),
+            )
+        except Exception as error:
+            raise RateLimitUnavailable from error
+        admitted = int(result[0]) if result else 0
+        if admitted != 1:
+            retry_after = int(result[1]) if len(result) > 1 else self._window_seconds
+            raise RateLimitExceeded(max(1, retry_after))

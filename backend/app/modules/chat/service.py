@@ -1,13 +1,10 @@
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.chat.models import (
-    ChatActor,
-    ChatMessage,
-    ChatMessageStatus,
     ChatSession,
     ChatSessionCredential,
     ConversationState,
@@ -37,15 +34,50 @@ class ChatSessionService:
         customer_email: str | None,
         ip_address: str,
     ) -> tuple[ChatSession, str, datetime] | None:
+        knowledge_base = await self.knowledge_base_for_public_key(public_key)
+        if knowledge_base is None:
+            return None
+        await self._limiter().check_creation(
+            ip_address=ip_address, organization_id=str(knowledge_base.organization_id)
+        )
+        return await self.create_session_for_knowledge_base(
+            knowledge_base=knowledge_base,
+            customer_name=customer_name,
+            customer_email=customer_email,
+        )
+
+    async def knowledge_base_for_public_key(self, public_key: str) -> KnowledgeBase | None:
         knowledge_base = await self._db_session.scalar(
             select(KnowledgeBase).where(KnowledgeBase.public_key == public_key)
         )
-        if knowledge_base is None:
-            return None
-        if self._rate_limiter is not None:
-            await self._rate_limiter.check_creation(
-                ip_address=ip_address, organization_id=str(knowledge_base.organization_id)
-            )
+        return knowledge_base if isinstance(knowledge_base, KnowledgeBase) else None
+
+    async def check_invalid_creation_attempt(self, *, ip_address: str) -> None:
+        await self._limiter().check_creation_ip(ip_address=ip_address)
+
+    async def check_creation_admission(
+        self, *, ip_address: str, organization_id: UUID
+    ) -> None:
+        await self._limiter().check_creation(
+            ip_address=ip_address, organization_id=str(organization_id)
+        )
+
+    async def check_rotation_admission(
+        self, *, ip_address: str, session_id: UUID, organization_id: UUID
+    ) -> None:
+        await self._limiter().check_message(
+            ip_address=ip_address,
+            session_id=str(session_id),
+            organization_id=str(organization_id),
+        )
+
+    async def create_session_for_knowledge_base(
+        self,
+        *,
+        knowledge_base: KnowledgeBase,
+        customer_name: str | None,
+        customer_email: str | None,
+    ) -> tuple[ChatSession, str, datetime]:
         session = ChatSession(
             organization_id=knowledge_base.organization_id,
             knowledge_base_id=knowledge_base.id,
@@ -65,6 +97,13 @@ class ChatSessionService:
         await self._db_session.flush()
         return session, issued.value, issued.expires_at
 
+    def _limiter(self) -> SlidingWindowRateLimiter:
+        if self._rate_limiter is None:
+            from app.modules.chat.rate_limit import RateLimitUnavailable
+
+            raise RateLimitUnavailable
+        return self._rate_limiter
+
     async def get_authorized_session(
         self, *, session_id: UUID, credential_value: str
     ) -> ChatSession | None:
@@ -82,19 +121,29 @@ class ChatSessionService:
         return session if isinstance(session, ChatSession) else None
 
     async def rotate_credential(
-        self, *, session: ChatSession
+        self, *, session_id: UUID, credential_value: str
     ) -> tuple[str, datetime] | None:
-        if session.state is ConversationState.RESOLVED:
-            return None
         now = datetime.now(UTC)
-        await self._db_session.execute(
-            update(ChatSessionCredential)
+        credential = await self._db_session.scalar(
+            select(ChatSessionCredential)
             .where(
-                ChatSessionCredential.session_id == session.id,
+                ChatSessionCredential.session_id == session_id,
+                ChatSessionCredential.token_hash == hash_chat_token(credential_value),
                 ChatSessionCredential.revoked_at.is_(None),
+                ChatSessionCredential.expires_at > now,
             )
-            .values(revoked_at=now)
+            .with_for_update()
         )
+        if not isinstance(credential, ChatSessionCredential):
+            return None
+        session = await self._db_session.scalar(
+            select(ChatSession).where(ChatSession.id == session_id).with_for_update()
+        )
+        if not isinstance(session, ChatSession):
+            return None
+        if session.state is ConversationState.RESOLVED:
+            raise ValueError("chat session is resolved")
+        credential.revoked_at = now
         issued = self._token_service.issue(session_id=session.id)
         self._db_session.add(
             ChatSessionCredential(
@@ -105,41 +154,3 @@ class ChatSessionService:
         )
         await self._db_session.flush()
         return issued.value, issued.expires_at
-
-    async def add_customer_message(
-        self, *, session: ChatSession, body: str, ip_address: str
-    ) -> ChatMessage:
-        if session.state is ConversationState.RESOLVED:
-            raise ValueError("chat session is resolved")
-        if self._rate_limiter is not None:
-            await self._rate_limiter.check_message(
-                session_id=str(session.id),
-                organization_id=str(session.organization_id),
-                ip_address=ip_address,
-            )
-        next_sequence = await self._db_session.scalar(
-            select(func.coalesce(func.max(ChatMessage.sequence), 0) + 1).where(
-                ChatMessage.session_id == session.id
-            )
-        )
-        message = ChatMessage(
-            session_id=session.id,
-            sequence=next_sequence if isinstance(next_sequence, int) else 1,
-            actor=ChatActor.CUSTOMER,
-            body=body,
-            status=ChatMessageStatus.PERSISTED,
-        )
-        self._db_session.add(message)
-        await self._db_session.flush()
-        return message
-
-    async def messages_for(self, *, session_id: UUID) -> list[ChatMessage]:
-        return list(
-            (
-                await self._db_session.scalars(
-                    select(ChatMessage)
-                    .where(ChatMessage.session_id == session_id)
-                    .order_by(ChatMessage.sequence)
-                )
-            ).all()
-        )
