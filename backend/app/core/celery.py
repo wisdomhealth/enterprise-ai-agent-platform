@@ -8,7 +8,7 @@ def create_celery(settings: Settings | None = None) -> Celery:
     broker_url = str(settings.redis_url) if settings.redis_url is not None else "memory://"
     celery_app = Celery("enterprise_ai_agent_platform", broker=broker_url)
     celery_app.conf.update(
-        imports=("app.modules.knowledge.tasks",),
+        imports=("app.modules.knowledge.tasks", "app.modules.chat.tasks"),
         result_backend=None,
         task_ignore_result=True,
         task_acks_late=True,
@@ -21,6 +21,10 @@ def create_celery(settings: Settings | None = None) -> Celery:
             },
             "knowledge-drive-sync-outbox-dispatch": {
                 "task": "app.modules.knowledge.tasks.dispatch_pending_drive_sync_outbox_events",
+                "schedule": 60,
+            },
+            "chat-answer-intent-dispatch": {
+                "task": "app.modules.chat.tasks.dispatch_pending_chat_answer_jobs",
                 "schedule": 60,
             },
         },

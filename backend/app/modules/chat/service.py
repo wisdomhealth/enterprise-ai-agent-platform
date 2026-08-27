@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.chat.models import (
+    ChatMessage,
     ChatSession,
     ChatSessionCredential,
     ConversationState,
@@ -103,6 +104,17 @@ class ChatSessionService:
             )
         )
         return session if isinstance(session, ChatSession) else None
+
+    async def public_messages(self, session_id: UUID) -> list[ChatMessage]:
+        return list(
+            (
+                await self._db_session.scalars(
+                    select(ChatMessage)
+                    .where(ChatMessage.session_id == session_id)
+                    .order_by(ChatMessage.sequence)
+                )
+            ).all()
+        )
 
     async def get_authorized_session_for_rotation(
         self, *, session_id: UUID, credential_value: str

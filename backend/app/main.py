@@ -27,12 +27,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.connector_service = ConnectorService.from_settings(settings)
     app.state.drive_gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
     app.state.chat_rate_limiter = None
+    app.state.chat_sse_redis = None
     if settings.redis_url is not None:
         from redis.asyncio import Redis
 
-        app.state.chat_rate_limiter = SlidingWindowRateLimiter(
-            Redis.from_url(settings.redis_url.unicode_string(), decode_responses=True)
-        )
+        chat_redis = Redis.from_url(settings.redis_url.unicode_string(), decode_responses=True)
+        app.state.chat_rate_limiter = SlidingWindowRateLimiter(chat_redis)
+        app.state.chat_sse_redis = chat_redis
     app.state.grounded_answer_service = (
         GroundedAnswerService.from_settings(settings)
         if (

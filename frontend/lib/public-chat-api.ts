@@ -44,10 +44,30 @@ export function startPublicChat(input: {
 }): Promise<PublicChatStart> {
   return request<PublicChatStart>("/sessions", {
     method: "POST",
+    headers: { "Idempotency-Key": crypto.randomUUID() },
     body: JSON.stringify({
       public_key: input.publicKey,
       customer_name: input.customerName || null,
       customer_email: input.customerEmail || null,
     }),
   });
+}
+
+export function sendPublicChatMessage(input: {
+  sessionId: string;
+  token: string;
+  body: string;
+  idempotencyKey?: string;
+}): Promise<PublicChatSession["messages"][number]> {
+  return request<PublicChatSession["messages"][number]>(
+    `/sessions/${input.sessionId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${input.token}`,
+        "Idempotency-Key": input.idempotencyKey ?? crypto.randomUUID(),
+      },
+      body: JSON.stringify({ body: input.body }),
+    },
+  );
 }

@@ -39,6 +39,15 @@ class ChatMessageStatus(StrEnum):
     PERSISTED = "PERSISTED"
 
 
+class ChatSSEEventType(StrEnum):
+    """Customer-safe event names derived from durable chat message state."""
+
+    MESSAGE_VALIDATED = "message.validated"
+    MESSAGE_SEGMENT = "message.segment"
+    SESSION_STATE = "session.state"
+    ERROR_SAFE = "error.safe"
+
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
     __table_args__ = (

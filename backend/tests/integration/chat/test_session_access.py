@@ -380,7 +380,7 @@ async def test_concurrent_old_token_rotations_leave_exactly_one_active_replaceme
     assert sum(credential.revoked_at is None for credential in credentials) == 1
 
 
-def test_task_thirteen_does_not_publish_the_task_fourteen_message_route() -> None:
+def test_task_fourteen_publishes_the_authorized_message_route() -> None:
     paths = {route.path for route in create_app().routes}
 
-    assert "/api/v1/public/chat/sessions/{session_id}/messages" not in paths
+    assert "/api/v1/public/chat/sessions/{session_id}/messages" in paths

@@ -1,0 +1,213 @@
+from collections.abc import AsyncIterator
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import Settings
+from app.main import create_app
+from app.modules.chat.models import ChatActor, ChatMessage, ChatMessageStatus, ChatSession
+from app.modules.chat.sse import PostgresSSEService
+from app.modules.chat.tokens import ChatTokenService
+from app.modules.identity.dependencies import get_db_session
+from app.modules.identity.models import Organization
+from app.modules.knowledge.models import KnowledgeBase
+from app.modules.outbox.models import OutboxEvent
+
+
+async def _session(db_session: AsyncSession) -> ChatSession:
+    organization = Organization(name=f"SSE recovery {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id,
+        public_key=f"public-{uuid4().hex}",
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(
+        organization_id=organization.id,
+        knowledge_base_id=knowledge_base.id,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_reconnect_replays_from_postgres_not_redis(db_session: AsyncSession) -> None:
+    session = await _session(db_session)
+    db_session.add_all(
+        [
+            ChatMessage(
+                session_id=session.id,
+                sequence=1,
+                actor=ChatActor.CUSTOMER,
+                body="Question",
+                status=ChatMessageStatus.PERSISTED,
+            ),
+            ChatMessage(
+                session_id=session.id,
+                sequence=2,
+                actor=ChatActor.AI,
+                body="First validated answer.",
+                status=ChatMessageStatus.PERSISTED,
+            ),
+            ChatMessage(
+                session_id=session.id,
+                sequence=3,
+                actor=ChatActor.AI,
+                body="Second validated answer.",
+                status=ChatMessageStatus.PERSISTED,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    events = await PostgresSSEService(db_session).events_after(session.id, after_sequence=1)
+
+    assert [event.sequence for event in events if event.event == "message.validated"] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_sse_uses_persisted_validated_segments(db_session: AsyncSession) -> None:
+    session = await _session(db_session)
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.AI,
+        body="Provider text that must not be re-segmented.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.validated",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": 1,
+                "message_id": str(message.id),
+                "segments": ["Persisted validated sentence."],
+                "citations": [],
+            },
+        )
+    )
+    await db_session.commit()
+
+    event = (await PostgresSSEService(db_session).events_after(session.id, after_sequence=0))[0]
+
+    assert event.data["segments"] == ["Persisted validated sentence."]
+
+
+def test_configured_redis_is_available_for_ephemeral_sse_hints() -> None:
+    application = create_app(
+        Settings(
+            SESSION_SECRET="task-fourteen-session-secret",
+            REDIS_URL="redis://127.0.0.1:6379/15",
+        )
+    )
+
+    assert hasattr(application.state, "chat_sse_redis")
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_replays_postgres_after_sequence(db_session: AsyncSession) -> None:
+    session = await _session(db_session)
+    issued = ChatTokenService().issue(session_id=session.id)
+    from app.modules.chat.models import ChatSessionCredential
+
+    db_session.add(
+        ChatSessionCredential(
+            session_id=session.id,
+            token_hash=issued.token_hash,
+            expires_at=issued.expires_at,
+        )
+    )
+    db_session.add_all(
+        [
+            ChatMessage(
+                session_id=session.id,
+                sequence=1,
+                actor=ChatActor.CUSTOMER,
+                body="Question",
+                status=ChatMessageStatus.PERSISTED,
+            ),
+            ChatMessage(
+                session_id=session.id,
+                sequence=2,
+                actor=ChatActor.AI,
+                body="Validated response.",
+                status=ChatMessageStatus.PERSISTED,
+            ),
+        ]
+    )
+    await db_session.commit()
+    application: FastAPI = create_app(Settings(SESSION_SECRET="task-fourteen-session-secret"))
+
+    async def override_db_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    application.dependency_overrides[get_db_session] = override_db_session
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="https://testserver"
+    ) as client:
+        response = await client.get(
+            f"/api/v1/public/chat/sessions/{session.id}/events?after=1",
+            headers={"Authorization": f"Bearer {issued.value}"},
+        )
+
+    assert response.status_code == 200
+    assert "id: 2" in response.text
+    assert "event: message.validated" in response.text
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_reads_durable_session_state(db_session: AsyncSession) -> None:
+    session = await _session(db_session)
+    await db_session.commit()
+
+    frames = [
+        frame
+        async for frame in PostgresSSEService(db_session).stream(session.id, after_sequence=0)
+    ]
+
+    assert "event: session.state" in frames[0]
+
+
+@pytest.mark.asyncio
+async def test_persisted_refusal_is_exposed_as_a_safe_error(db_session: AsyncSession) -> None:
+    session = await _session(db_session)
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.AI,
+        body="I don't know based on the available information.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.refused",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": 1,
+                "message_id": str(message.id),
+                "segments": [message.body],
+                "citations": [],
+                "refused": True,
+                "handoff_recommended": True,
+            },
+        )
+    )
+    await db_session.commit()
+
+    event = (await PostgresSSEService(db_session).events_after(session.id, after_sequence=0))[0]
+
+    assert event.event == "error.safe"
+    assert event.data["handoff_recommended"] is True

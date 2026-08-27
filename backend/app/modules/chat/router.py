@@ -3,10 +3,12 @@ from hashlib import sha256
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.chat.models import ChatSession
+from app.modules.chat.answering import ChatAnswerService
+from app.modules.chat.models import ChatMessage, ChatSession
 from app.modules.chat.rate_limit import (
     RateLimitExceeded,
     RateLimitUnavailable,
@@ -14,11 +16,15 @@ from app.modules.chat.rate_limit import (
 )
 from app.modules.chat.schemas import (
     PublicChatCredentialRead,
+    PublicChatMessageCreate,
+    PublicChatMessageRead,
     PublicChatSessionCreate,
     PublicChatSessionCreated,
     PublicChatSessionRead,
 )
 from app.modules.chat.service import ChatSessionService
+from app.modules.chat.sse import PostgresSSEService
+from app.modules.chat.tasks import CHAT_ANSWER_TASK_NAME
 from app.modules.chat.tokens import derive_idempotent_chat_token
 from app.modules.idempotency.models import IdempotencyRecord, IdempotencyState
 from app.modules.idempotency.service import (
@@ -26,7 +32,8 @@ from app.modules.idempotency.service import (
     IdempotencyInProgress,
     IdempotencyService,
 )
-from app.modules.identity.dependencies import get_db_session
+from app.modules.identity.dependencies import Principal, get_db_session
+from app.modules.rag.types import AnswerAudience, ValidatedAnswer
 
 router = APIRouter(prefix="/api/v1/public/chat", tags=["public-chat"])
 
@@ -82,7 +89,19 @@ async def _authorized_session(
     return session
 
 
-def _session_read(session: ChatSession) -> PublicChatSessionRead:
+def _message_read(message: ChatMessage) -> PublicChatMessageRead:
+    return PublicChatMessageRead(
+        sequence=message.sequence,
+        actor=message.actor,
+        body=message.body,
+        status=message.status,
+        created_at=message.created_at,
+    )
+
+
+def _session_read(
+    session: ChatSession, messages: list[ChatMessage] | None = None
+) -> PublicChatSessionRead:
     return PublicChatSessionRead(
         id=session.id,
         state=session.state,
@@ -90,7 +109,7 @@ def _session_read(session: ChatSession) -> PublicChatSessionRead:
         customer_name=session.customer_name,
         customer_email=session.customer_email,
         created_at=session.created_at,
-        messages=[],
+        messages=[_message_read(message) for message in messages or []],
     )
 
 
@@ -259,8 +278,107 @@ async def create_public_session(
 @router.get("/sessions/{session_id}", response_model=PublicChatSessionRead)
 async def read_public_session(
     session: ChatSession = Depends(_authorized_session),
+    service: ChatSessionService = Depends(_service),
 ) -> PublicChatSessionRead:
-    return _session_read(session)
+    return _session_read(session, await service.public_messages(session.id))
+
+
+@router.post(
+    "/sessions/{session_id}/messages",
+    response_model=PublicChatMessageRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_public_message(
+    session_id: UUID,
+    payload: PublicChatMessageCreate,
+    request: Request,
+    credential: str = Depends(_credential_value),
+    idempotency_key: str = Depends(_idempotency_key),
+    session: ChatSession = Depends(_authorized_session),
+    db_session: AsyncSession = Depends(get_db_session),
+    service: ChatSessionService = Depends(_service),
+) -> PublicChatMessageRead:
+    record = await _begin_idempotency(
+        db_session,
+        scope_id=session.organization_id,
+        actor_id=uuid5(NAMESPACE_URL, f"public-chat-token:{credential}"),
+        operation="public_chat.message.create",
+        object_id=session.id,
+        key=idempotency_key,
+        request_hash=_request_hash(payload.model_dump(mode="json")),
+    )
+    if record.state is IdempotencyState.COMPLETED:
+        try:
+            return PublicChatMessageRead.model_validate(record.response_body)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT) from error
+    try:
+        await service.check_rotation_admission(
+            ip_address=_ip_address(request),
+            session_id=session.id,
+            organization_id=session.organization_id,
+        )
+    except (RateLimitExceeded, RateLimitUnavailable) as error:
+        _raise_rate_limit(error)
+    message, job = await ChatAnswerService.submit_customer_message(
+        ChatAnswerService(db_session, _NoModelAnswerService()), session.id, payload.body
+    )
+    response = _message_read(message)
+    await IdempotencyService(db_session).complete(
+        record.id,
+        status.HTTP_202_ACCEPTED,
+        response.model_dump(mode="json"),
+        lease_token=record.lease_token,
+        safe_response_keys=(
+            "sequence",
+            "actor",
+            "body",
+            "status",
+            "created_at",
+        ),
+    )
+    await db_session.commit()
+    try:
+        request.app.state.celery.send_task(CHAT_ANSWER_TASK_NAME, args=[str(job.id)])
+    except Exception:
+        # The JobIntent is committed.  The Celery periodic durable-intent sweep
+        # will recover any post-commit broker wake-up loss.
+        pass
+    return response
+
+
+@router.get("/sessions/{session_id}/events")
+async def public_chat_events(
+    session_id: UUID,
+    request: Request,
+    after: int = Query(default=0, ge=0),
+    session: ChatSession = Depends(_authorized_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> StreamingResponse:
+    # The authorization dependency binds the opaque bearer to this exact
+    # session.  Redis is optional because it is only a hint channel.
+    redis_client = getattr(request.app.state, "chat_sse_redis", None)
+    return StreamingResponse(
+        PostgresSSEService(db_session, redis_client=redis_client).stream(
+            session.id, after_sequence=after
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class _NoModelAnswerService:
+    """Submit-time placeholder; the registered worker constructs the provider."""
+
+    async def answer(
+        self,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        query: str,
+        audience: AnswerAudience,
+    ) -> ValidatedAnswer:
+        del principal, knowledge_base_id, query, audience
+        raise RuntimeError("chat answer generation only runs in the Celery worker")
 
 
 @router.post("/sessions/{session_id}/credentials/rotate", response_model=PublicChatCredentialRead)
