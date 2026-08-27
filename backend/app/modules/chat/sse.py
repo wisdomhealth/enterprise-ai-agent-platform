@@ -86,15 +86,25 @@ class PostgresSSEService:
                 )
             ).all()
         )
-        answer_metadata = {
-            str(event.payload.get("message_id")): event.payload for event in published
-        }
+        provenance_by_message_id: dict[str, list[OutboxEvent]] = {}
+        for event in published:
+            message_id = event.payload.get("message_id")
+            if isinstance(message_id, str):
+                provenance_by_message_id.setdefault(message_id, []).append(event)
         all_events: list[ChatSSEEvent] = []
         for message in messages:
-            metadata = answer_metadata.get(str(message.id))
+            metadata = _approved_customer_metadata(
+                message, provenance_by_message_id.get(str(message.id), [])
+            )
+            if metadata is None:
+                # A chat_messages row by itself proves neither grounded
+                # validation nor an approved safe error.  Never use a body as
+                # a fallback provenance record.
+                continue
             validated = self._validated_event(message, metadata)
             all_events.append(validated)
-            all_events.extend(_segment_events(message, metadata))
+            if validated.event == ChatSSEEventType.MESSAGE_VALIDATED.value:
+                all_events.extend(_segment_events(message, metadata))
         return [
             event
             for event in all_events
@@ -187,12 +197,9 @@ class PostgresSSEService:
 
 
 def _segment_events(message: ChatMessage, metadata: dict[str, object] | None) -> list[ChatSSEEvent]:
-    raw_segments = (metadata or {}).get("segments", [message.body])
-    segments = (
-        [str(segment) for segment in raw_segments]
-        if isinstance(raw_segments, list) and raw_segments
-        else [message.body]
-    )
+    assert metadata is not None
+    segments = _approved_segments(metadata)
+    assert segments is not None
     return [
         ChatSSEEvent(
             cursor=f"{message.sequence}:s:{index}",
@@ -202,6 +209,55 @@ def _segment_events(message: ChatMessage, metadata: dict[str, object] | None) ->
         )
         for index, segment in enumerate(segments)
     ]
+
+
+def _approved_customer_metadata(
+    message: ChatMessage, candidates: list[OutboxEvent]
+) -> dict[str, object] | None:
+    """Return one durable record that authorizes this exact visible message."""
+    approved = [
+        event
+        for event in candidates
+        if _is_approved_provenance(message, event)
+    ]
+    if len(approved) != 1:
+        return None
+    return approved[0].payload
+
+
+def _is_approved_provenance(message: ChatMessage, event: OutboxEvent) -> bool:
+    payload = event.payload
+    if (
+        payload.get("message_id") != str(message.id)
+        or payload.get("sequence") != message.sequence
+    ):
+        return False
+    if message.actor is ChatActor.SYSTEM:
+        return (
+            event.event_type == "chat.answer.safe_error"
+            and isinstance(payload.get("code"), str)
+            and isinstance(payload.get("handoff_recommended"), bool)
+        )
+    if message.actor is not ChatActor.AI:
+        return False
+    if event.event_type == "chat.answer.validated":
+        if payload.get("refused", False) is not False:
+            return False
+    elif event.event_type == "chat.answer.refused":
+        if payload.get("refused") is not True:
+            return False
+    else:
+        return False
+    return isinstance(payload.get("citations"), list) and _approved_segments(payload) is not None
+
+
+def _approved_segments(payload: dict[str, object]) -> list[str] | None:
+    raw_segments = payload.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        return None
+    if not all(isinstance(segment, str) and segment.strip() for segment in raw_segments):
+        return None
+    return list(raw_segments)
 
 
 def _cursor_sort_key(cursor: str) -> tuple[int, int, int]:

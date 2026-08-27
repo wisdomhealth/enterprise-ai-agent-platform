@@ -39,28 +39,52 @@ async def _session(db_session: AsyncSession) -> ChatSession:
 @pytest.mark.asyncio
 async def test_reconnect_replays_from_postgres_not_redis(db_session: AsyncSession) -> None:
     session = await _session(db_session)
+    customer = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.CUSTOMER,
+        body="Question",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    first = ChatMessage(
+        session_id=session.id,
+        sequence=2,
+        actor=ChatActor.AI,
+        body="First validated answer.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    second = ChatMessage(
+        session_id=session.id,
+        sequence=3,
+        actor=ChatActor.AI,
+        body="Second validated answer.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add_all([customer, first, second])
+    await db_session.flush()
     db_session.add_all(
         [
-            ChatMessage(
-                session_id=session.id,
-                sequence=1,
-                actor=ChatActor.CUSTOMER,
-                body="Question",
-                status=ChatMessageStatus.PERSISTED,
+            OutboxEvent(
+                event_type="chat.answer.validated",
+                aggregate_type="chat_session",
+                aggregate_id=session.id,
+                payload={
+                    "sequence": first.sequence,
+                    "message_id": str(first.id),
+                    "segments": [first.body],
+                    "citations": [],
+                },
             ),
-            ChatMessage(
-                session_id=session.id,
-                sequence=2,
-                actor=ChatActor.AI,
-                body="First validated answer.",
-                status=ChatMessageStatus.PERSISTED,
-            ),
-            ChatMessage(
-                session_id=session.id,
-                sequence=3,
-                actor=ChatActor.AI,
-                body="Second validated answer.",
-                status=ChatMessageStatus.PERSISTED,
+            OutboxEvent(
+                event_type="chat.answer.validated",
+                aggregate_type="chat_session",
+                aggregate_id=session.id,
+                payload={
+                    "sequence": second.sequence,
+                    "message_id": str(second.id),
+                    "segments": [second.body],
+                    "citations": [],
+                },
             ),
         ]
     )
@@ -69,6 +93,37 @@ async def test_reconnect_replays_from_postgres_not_redis(db_session: AsyncSessio
     events = await PostgresSSEService(db_session).events_after(session.id, after_sequence=1)
 
     assert [event.sequence for event in events if event.event == "message.validated"] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_sse_hides_ai_and_system_messages_without_safe_durable_provenance(
+    db_session: AsyncSession,
+) -> None:
+    """A bare persisted body is never a groundedness or safe-error proof."""
+    session = await _session(db_session)
+    db_session.add_all(
+        [
+            ChatMessage(
+                session_id=session.id,
+                sequence=1,
+                actor=ChatActor.AI,
+                body="Ungrounded model output must stay hidden.",
+                status=ChatMessageStatus.PERSISTED,
+            ),
+            ChatMessage(
+                session_id=session.id,
+                sequence=2,
+                actor=ChatActor.SYSTEM,
+                body="An unproven safe error must stay hidden too.",
+                status=ChatMessageStatus.PERSISTED,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    events = await PostgresSSEService(db_session).events_after(session.id, after_cursor="0")
+
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -172,23 +227,34 @@ async def test_sse_endpoint_replays_postgres_after_sequence(db_session: AsyncSes
             expires_at=issued.expires_at,
         )
     )
-    db_session.add_all(
-        [
-            ChatMessage(
-                session_id=session.id,
-                sequence=1,
-                actor=ChatActor.CUSTOMER,
-                body="Question",
-                status=ChatMessageStatus.PERSISTED,
-            ),
-            ChatMessage(
-                session_id=session.id,
-                sequence=2,
-                actor=ChatActor.AI,
-                body="Validated response.",
-                status=ChatMessageStatus.PERSISTED,
-            ),
-        ]
+    customer = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.CUSTOMER,
+        body="Question",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    answer = ChatMessage(
+        session_id=session.id,
+        sequence=2,
+        actor=ChatActor.AI,
+        body="Validated response.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add_all([customer, answer])
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.validated",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": answer.sequence,
+                "message_id": str(answer.id),
+                "segments": [answer.body],
+                "citations": [],
+            },
+        )
     )
     await db_session.commit()
     application: FastAPI = create_app(Settings(SESSION_SECRET="task-fourteen-session-secret"))
