@@ -1,4 +1,10 @@
-"""Recoverable PostgreSQL-first SSE for public chat."""
+"""Recoverable PostgreSQL-first SSE for public chat.
+
+An SSE cursor names one durable event, rather than merely a chat-message
+sequence.  That matters for a reconnect in the middle of a sentence-segment
+stream: ``2:s:0`` resumes at ``2:s:1`` without either replaying the first
+segment or dropping the remainder of message 2.
+"""
 
 import asyncio
 import json
@@ -15,6 +21,7 @@ from app.modules.outbox.models import OutboxEvent
 
 @dataclass(frozen=True, slots=True)
 class ChatSSEEvent:
+    cursor: str
     sequence: int
     event: str
     data: dict[str, object]
@@ -36,14 +43,26 @@ class PostgresSSEService:
         self._db_session = db_session
         self._redis_client = redis_client
 
-    async def events_after(self, session_id: UUID, *, after_sequence: int) -> list[ChatSSEEvent]:
+    async def events_after(
+        self,
+        session_id: UUID,
+        *,
+        after_cursor: str | int = "0",
+        after_sequence: int | None = None,
+    ) -> list[ChatSSEEvent]:
+        """Read every customer-visible answer event from durable PostgreSQL.
+
+        Outbox payloads hold the validated sentence segments and citations; no
+        provider token stream or Redis state contributes customer-visible text.
+        """
+        if after_sequence is not None:
+            after_cursor = after_sequence
         messages = list(
             (
                 await self._db_session.scalars(
                     select(ChatMessage)
                     .where(
                         ChatMessage.session_id == session_id,
-                        ChatMessage.sequence > after_sequence,
                         ChatMessage.actor.in_([ChatActor.AI, ChatActor.SYSTEM]),
                     )
                     .order_by(ChatMessage.sequence)
@@ -57,7 +76,11 @@ class PostgresSSEService:
                         OutboxEvent.aggregate_type == "chat_session",
                         OutboxEvent.aggregate_id == session_id,
                         OutboxEvent.event_type.in_(
-                            ["chat.answer.validated", "chat.answer.refused"]
+                            [
+                                "chat.answer.validated",
+                                "chat.answer.refused",
+                                "chat.answer.safe_error",
+                            ]
                         ),
                     )
                 )
@@ -66,27 +89,45 @@ class PostgresSSEService:
         answer_metadata = {
             str(event.payload.get("message_id")): event.payload for event in published
         }
+        all_events: list[ChatSSEEvent] = []
+        for message in messages:
+            metadata = answer_metadata.get(str(message.id))
+            validated = self._validated_event(message, metadata)
+            all_events.append(validated)
+            all_events.extend(_segment_events(message, metadata))
         return [
-            self._validated_event(message, answer_metadata.get(str(message.id)))
-            for message in messages
+            event
+            for event in all_events
+            if _cursor_sort_key(event.cursor) > _cursor_sort_key(str(after_cursor))
         ]
 
-    async def stream(self, session_id: UUID, *, after_sequence: int) -> AsyncIterator[str]:
-        highest = after_sequence
+    async def stream(
+        self,
+        session_id: UUID,
+        *,
+        after_cursor: str | int = "0",
+        after_sequence: int | None = None,
+    ) -> AsyncIterator[str]:
+        if after_sequence is not None:
+            after_cursor = after_sequence
+        highest = str(after_cursor)
         session = await self._db_session.get(ChatSession, session_id)
         if isinstance(session, ChatSession):
             yield _encode(
                 ChatSSEEvent(
-                    sequence=highest,
+                    cursor=f"0:t:{session.version}",
+                    sequence=0,
                     event=ChatSSEEventType.SESSION_STATE.value,
-                    data={"state": session.state.value, "version": session.version},
+                    data={
+                        "sequence": 0,
+                        "state": session.state.value,
+                        "version": session.version,
+                    },
                 )
             )
-        for event in await self.events_after(session_id, after_sequence=highest):
-            highest = max(highest, event.sequence)
+        for event in await self.events_after(session_id, after_cursor=highest):
+            highest = event.cursor
             yield _encode(event)
-            for segment in _segments(event):
-                yield _encode(segment)
         if self._redis_client is None:
             return
         pubsub_factory = getattr(self._redis_client, "pubsub", None)
@@ -100,11 +141,9 @@ class PostgresSSEService:
                 if hint is None:
                     yield ": keepalive\n\n"
                     continue
-                for event in await self.events_after(session_id, after_sequence=highest):
-                    highest = max(highest, event.sequence)
+                for event in await self.events_after(session_id, after_cursor=highest):
+                    highest = event.cursor
                     yield _encode(event)
-                    for segment in _segments(event):
-                        yield _encode(segment)
         except asyncio.CancelledError:
             raise
         finally:
@@ -117,6 +156,7 @@ class PostgresSSEService:
     ) -> ChatSSEEvent:
         if message.actor is ChatActor.SYSTEM or (metadata or {}).get("refused") is True:
             return ChatSSEEvent(
+                cursor=f"{message.sequence}:e:0",
                 sequence=message.sequence,
                 event=ChatSSEEventType.ERROR_SAFE.value,
                 data={
@@ -131,35 +171,52 @@ class PostgresSSEService:
         raw_segments = (metadata or {}).get("segments", [message.body])
         citations = list(raw_citations) if isinstance(raw_citations, list) else []
         segments = list(raw_segments) if isinstance(raw_segments, list) else [message.body]
+        # The complete answer body intentionally is not released in this
+        # event.  Customer-visible text travels only in durable, individually
+        # resumable segments below.
         return ChatSSEEvent(
+            cursor=f"{message.sequence}:v:0",
             sequence=message.sequence,
             event=ChatSSEEventType.MESSAGE_VALIDATED.value,
             data={
                 "sequence": message.sequence,
-                "body": message.body,
                 "citations": citations,
-                "segments": segments,
+                "segment_count": len(segments),
             },
         )
 
 
-def _segments(event: ChatSSEEvent) -> list[ChatSSEEvent]:
-    if event.event != ChatSSEEventType.MESSAGE_VALIDATED.value:
-        return []
-    raw_segments = event.data.get("segments")
+def _segment_events(message: ChatMessage, metadata: dict[str, object] | None) -> list[ChatSSEEvent]:
+    raw_segments = (metadata or {}).get("segments", [message.body])
     segments = (
         [str(segment) for segment in raw_segments]
         if isinstance(raw_segments, list) and raw_segments
-        else [str(event.data["body"])]
+        else [message.body]
     )
     return [
         ChatSSEEvent(
-            sequence=event.sequence,
+            cursor=f"{message.sequence}:s:{index}",
+            sequence=message.sequence,
             event=ChatSSEEventType.MESSAGE_SEGMENT.value,
-            data={"sequence": event.sequence, "index": index, "text": segment},
+            data={"sequence": message.sequence, "index": index, "text": segment},
         )
         for index, segment in enumerate(segments)
     ]
+
+
+def _cursor_sort_key(cursor: str) -> tuple[int, int, int]:
+    """Accept legacy integer cursors while keeping durable segment ordering."""
+    if cursor.isdecimal():
+        # Older clients use message sequence.  Treat it as the end of that
+        # message, preserving their original after={sequence} contract.
+        return int(cursor), 9, 0
+    parts = cursor.split(":")
+    if len(parts) != 3 or not parts[0].isdecimal() or not parts[2].isdecimal():
+        return 0, 9, 0
+    category = {"v": 0, "s": 1, "e": 2, "t": -1}.get(parts[1])
+    if category is None:
+        return 0, 9, 0
+    return int(parts[0]), category, int(parts[2])
 
 
 def _channel(session_id: UUID) -> str:
@@ -168,7 +225,7 @@ def _channel(session_id: UUID) -> str:
 
 def _encode(event: ChatSSEEvent) -> str:
     return (
-        f"id: {event.sequence}\n"
+        f"id: {event.cursor}\n"
         f"event: {event.event}\n"
         f"data: {json.dumps(event.data, separators=(',', ':'))}\n\n"
     )

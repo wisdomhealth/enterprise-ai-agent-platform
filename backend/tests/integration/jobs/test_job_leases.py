@@ -180,6 +180,34 @@ async def test_live_lease_owner_is_required_to_complete(
 
 
 @pytest.mark.asyncio
+async def test_completion_rejects_a_stale_generation_for_a_reused_owner(
+    job_service, lease_service, db_session
+):
+    """An owner name alone cannot authorize an old delivery after takeover."""
+    job = await job_service.enqueue(
+        db_session, "chat.answer", "chat:reused-owner", {"session_id": "1"}
+    )
+    await db_session.flush()
+    first = await lease_service.claim(job.id, "celery-chat-answer", 60)
+    assert first is not None
+    first_version = first.version
+    await db_session.execute(
+        update(JobIntent)
+        .where(JobIntent.id == job.id)
+        .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    second = await lease_service.claim(job.id, "celery-chat-answer", 60)
+    assert second is not None
+
+    with pytest.raises(JobLeaseLost):
+        await lease_service.complete(
+            job.id, "celery-chat-answer", expected_version=first_version
+        )
+
+    assert second.version > first_version
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error_class", "expected_state"),
     [

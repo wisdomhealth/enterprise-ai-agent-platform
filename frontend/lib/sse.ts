@@ -1,4 +1,5 @@
 export type ChatSSEEvent = {
+  cursor: string;
   sequence: number;
   event: "message.validated" | "message.segment" | "session.state" | "error.safe";
   data: Record<string, unknown>;
@@ -7,14 +8,14 @@ export type ChatSSEEvent = {
 export async function connectChatEvents(options: {
   sessionId: string;
   token: string;
-  after?: number;
+  after?: string;
   onEvent: (event: ChatSSEEvent) => void;
   signal?: AbortSignal;
 }): Promise<void> {
-  let after = options.after ?? 0;
+  let after = options.after ?? "0";
   while (!options.signal?.aborted) {
     const response = await fetch(
-      `/api/v1/public/chat/sessions/${options.sessionId}/events?after=${after}`,
+      `/api/v1/public/chat/sessions/${options.sessionId}/events?after=${encodeURIComponent(after)}`,
       {
         headers: { Accept: "text/event-stream", Authorization: `Bearer ${options.token}` },
         signal: options.signal,
@@ -36,7 +37,7 @@ export async function connectChatEvents(options: {
         for (const frame of frames) {
           const event = parseEvent(frame);
           if (event === null) continue;
-          after = Math.max(after, event.sequence);
+          after = event.cursor;
           options.onEvent(event);
         }
       }
@@ -48,7 +49,7 @@ export async function connectChatEvents(options: {
 }
 
 function parseEvent(frame: string): ChatSSEEvent | null {
-  const id = frame.match(/^id: (\d+)$/m)?.[1];
+  const id = frame.match(/^id: ([\w:.-]+)$/m)?.[1];
   const event = frame.match(/^event: ([\w.]+)$/m)?.[1];
   const data = frame.match(/^data: (.+)$/m)?.[1];
   if (id === undefined || event === undefined || data === undefined) return null;
@@ -58,5 +59,13 @@ function parseEvent(frame: string): ChatSSEEvent | null {
     "session.state",
     "error.safe",
   ].includes(event)) return null;
-  return { sequence: Number(id), event: event as ChatSSEEvent["event"], data: JSON.parse(data) };
+  const parsed = JSON.parse(data) as Record<string, unknown>;
+  const sequence = parsed.sequence;
+  if (typeof sequence !== "number") return null;
+  return {
+    cursor: id,
+    sequence,
+    event: event as ChatSSEEvent["event"],
+    data: parsed,
+  };
 }

@@ -1,14 +1,17 @@
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import httpx
 import pytest
+import pytest_asyncio
 from fastapi import FastAPI
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.celery import create_celery
 from app.core.config import Settings
+from app.core.database import async_sessionmaker, engine
 from app.main import create_app
 from app.modules.chat.answering import ChatAnswerService
 from app.modules.chat.models import ChatActor, ChatMessage, ChatSession, ChatSessionCredential
@@ -17,6 +20,7 @@ from app.modules.chat.tokens import ChatTokenService
 from app.modules.identity.dependencies import get_db_session
 from app.modules.identity.models import Organization
 from app.modules.jobs.models import JobIntent, JobState
+from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.knowledge.models import KnowledgeBase
 from app.modules.rag.types import ValidatedAnswer
 
@@ -41,6 +45,34 @@ class ValidAnswerService:
 class AlwaysAdmitRedis:
     async def eval(self, _script: str, _numkeys: int, *_args: object) -> list[int]:
         return [1, 0]
+
+
+@pytest_asyncio.fixture
+async def independent_sessions() -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        await engine.dispose()
+
+
+class TakeoverDuringAnswerService:
+    def __init__(self, job_id) -> None:  # type: ignore[no-untyped-def]
+        self._job_id = job_id
+
+    async def answer(self, *_args: object, **_kwargs: object) -> ValidatedAnswer:
+        async with async_sessionmaker() as takeover_session:
+            await takeover_session.execute(
+                update(JobIntent)
+                .where(JobIntent.id == self._job_id)
+                .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            await takeover_session.commit()
+            takeover = await JobLeaseService(takeover_session).claim(
+                self._job_id, "celery-chat-answer", lease_seconds=60
+            )
+            assert takeover is not None
+            await takeover_session.commit()
+        return await ValidAnswerService().answer()
 
 
 async def _session(db_session: AsyncSession) -> ChatSession:
@@ -131,7 +163,12 @@ async def test_public_message_write_persists_one_customer_message_and_job(
     assert first.status_code == replay.status_code == 202
     assert first.json() == replay.json()
     assert await db_session.scalar(
-        select(func.count()).select_from(JobIntent).where(JobIntent.kind == "chat.answer")
+        select(func.count())
+        .select_from(JobIntent)
+        .where(
+            JobIntent.kind == "chat.answer",
+            JobIntent.payload["session_id"].astext == str(session.id),
+        )
     ) == 1
 
 
@@ -191,7 +228,57 @@ async def test_pending_dispatcher_requeues_expired_running_chat_job(
 
     await _dispatch_pending_chat_answer_jobs()
 
-    assert submitted == [str(job.id)]
+    assert str(job.id) in submitted
+
+
+@pytest.mark.asyncio
+async def test_stale_chat_worker_cannot_publish_after_expired_lease_takeover(
+    independent_sessions,
+) -> None:
+    """The old worker must not publish after a same-kind Celery takeover."""
+    async with async_sessionmaker() as setup_session:
+        session = await _session(setup_session)
+        customer_message = ChatMessage(
+            session_id=session.id,
+            sequence=1,
+            actor=ChatActor.CUSTOMER,
+            body="Can you help?",
+        )
+        setup_session.add(customer_message)
+        await setup_session.flush()
+        job = await JobService().enqueue(
+            setup_session,
+            "chat.answer",
+            f"stale-chat-worker-{uuid4()}",
+            {"session_id": str(session.id), "message_id": str(customer_message.id)},
+        )
+        job_id = job.id
+        session_id = session.id
+        await setup_session.commit()
+
+    async with async_sessionmaker() as worker_session:
+        service = ChatAnswerService(
+            worker_session, TakeoverDuringAnswerService(job_id)
+        )
+        with pytest.raises(JobLeaseLost):
+            await service.process(job_id)
+
+    async with async_sessionmaker() as verification_session:
+        job = await verification_session.get(JobIntent, job_id)
+        ai_messages = list(
+            (
+                await verification_session.scalars(
+                    select(ChatMessage).where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.actor == ChatActor.AI,
+                    )
+                )
+            ).all()
+        )
+    assert job is not None
+    assert job.state is JobState.RUNNING
+    assert job.lease_owner == "celery-chat-answer"
+    assert ai_messages == []
 
 
 class _SharedSessionFactory:

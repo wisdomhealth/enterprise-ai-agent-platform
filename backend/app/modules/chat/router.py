@@ -351,7 +351,9 @@ async def create_public_message(
 async def public_chat_events(
     session_id: UUID,
     request: Request,
-    after: int = Query(default=0, ge=0),
+    # A cursor may name a persisted segment (for example ``2:s:0``), while
+    # legacy integer message sequences remain accepted for existing clients.
+    after: str = Query(default="0", max_length=64),
     session: ChatSession = Depends(_authorized_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> StreamingResponse:
@@ -360,7 +362,7 @@ async def public_chat_events(
     redis_client = getattr(request.app.state, "chat_sse_redis", None)
     return StreamingResponse(
         PostgresSSEService(db_session, redis_client=redis_client).stream(
-            session.id, after_sequence=after
+            session.id, after_cursor=after
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

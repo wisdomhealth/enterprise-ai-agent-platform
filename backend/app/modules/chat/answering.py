@@ -7,7 +7,7 @@ ephemeral Redis hint that causes connected SSE clients to reread PostgreSQL.
 
 from dataclasses import dataclass
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -98,7 +98,11 @@ class ChatAnswerService:
     async def process(self, job_id: UUID) -> ChatMessage | None:
         """Claim one intent, persist its safe outcome, commit, then notify SSE."""
         lease_service = JobLeaseService(self._db_session)
-        job = await lease_service.claim(job_id, self._worker_id, CHAT_ANSWER_LEASE_SECONDS)
+        # A Celery hostname identifies a process, not a delivery.  The lease
+        # owner has to fence this one execution so an expired delivery cannot
+        # impersonate a later retry from the same consumer process.
+        execution_owner = f"{self._worker_id}:{uuid4()}"
+        job = await lease_service.claim(job_id, execution_owner, CHAT_ANSWER_LEASE_SECONDS)
         if job is None:
             return None
         # A durable claim must precede model I/O.  A crash after this point is
@@ -116,10 +120,12 @@ class ChatAnswerService:
                 or message.actor is not ChatActor.CUSTOMER
             ):
                 return await self._persist_safe_failure(
-                    job, lease_service, session, "CHAT_JOB_INVALID"
+                    job, lease_service, execution_owner, session, "CHAT_JOB_INVALID"
                 )
             if session.state is not ConversationState.AI_ACTIVE:
-                await lease_service.complete(job.id, self._worker_id)
+                await lease_service.complete(
+                    job.id, execution_owner, expected_version=job.version
+                )
                 await self._db_session.commit()
                 await self._notify(session.id, message.sequence)
                 return None
@@ -132,7 +138,11 @@ class ChatAnswerService:
             )
             if not isinstance(answer, ValidatedAnswer):
                 return await self._persist_safe_failure(
-                    job, lease_service, session, "CHAT_ANSWER_UNVALIDATED"
+                    job,
+                    lease_service,
+                    execution_owner,
+                    session,
+                    "CHAT_ANSWER_UNVALIDATED",
                 )
             # A handoff can start while generation is running.  Re-lock and
             # re-read durable state before publication so an old AI response
@@ -144,12 +154,20 @@ class ChatAnswerService:
                 not isinstance(current_session, ChatSession)
                 or current_session.state is not ConversationState.AI_ACTIVE
             ):
-                await lease_service.complete(job.id, self._worker_id)
+                await lease_service.complete(
+                    job.id, execution_owner, expected_version=job.version
+                )
                 await self._db_session.commit()
                 await self._notify(session.id, message.sequence)
                 return None
             persisted = await self._persist_validated_answer(session, answer)
-            await lease_service.complete(job.id, self._worker_id)
+            # The message/outbox inserts and this generation-fenced compare
+            # and set share one transaction.  PostgreSQL predicate
+            # re-evaluation on the conditional UPDATE makes an expired or
+            # taken-over lease roll the complete publication back.
+            await lease_service.complete(
+                job.id, execution_owner, expected_version=job.version
+            )
             await self._db_session.commit()
             await self._notify(session.id, persisted.sequence)
             return persisted
@@ -161,7 +179,11 @@ class ChatAnswerService:
             # customer message or event.  The safe state recommends handoff.
             session = await self._session_for_job(job)
             return await self._persist_safe_failure(
-                job, lease_service, session, "CHAT_ANSWER_UNAVAILABLE"
+                job,
+                lease_service,
+                execution_owner,
+                session,
+                "CHAT_ANSWER_UNAVAILABLE",
             )
 
     async def _persist_validated_answer(
@@ -204,6 +226,7 @@ class ChatAnswerService:
         self,
         job: JobIntent,
         lease_service: JobLeaseService,
+        execution_owner: str,
         session: ChatSession | None,
         error_code: str,
     ) -> ChatMessage | None:
@@ -233,7 +256,7 @@ class ChatAnswerService:
             )
         await lease_service.retry(
             job.id,
-            self._worker_id,
+            execution_owner,
             error_code=error_code,
             error_class=ErrorClass.NON_RETRYABLE,
             expected_version=job.version,

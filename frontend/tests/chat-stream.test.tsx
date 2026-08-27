@@ -20,16 +20,26 @@ vi.mock("../lib/public-chat-api", () => ({
 
 vi.mock("../lib/sse", () => ({
   connectChatEvents: vi.fn(async (_options: object) => {
-    const options = _options as { onEvent: (event: { sequence: number; event: string; data: object }) => void };
+    const options = _options as {
+      onEvent: (event: { cursor: string; sequence: number; event: string; data: object }) => void;
+    };
     options.onEvent({
       sequence: 2,
+      cursor: "2:v:0",
       event: "message.validated",
-      data: { sequence: 2, body: "Validated answer.", citations: [] },
+      data: { sequence: 2, citations: [], segment_count: 1 },
     });
     options.onEvent({
       sequence: 2,
+      cursor: "2:s:0",
       event: "message.segment",
-      data: { sequence: 2, index: 0, text: "Validated answer." },
+      data: { sequence: 2, index: 0, text: "Validated " },
+    });
+    options.onEvent({
+      sequence: 2,
+      cursor: "2:s:1",
+      event: "message.segment",
+      data: { sequence: 2, index: 1, text: "answer." },
     });
   }),
 }));

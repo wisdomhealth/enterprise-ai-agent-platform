@@ -125,16 +125,25 @@ class JobLeaseService:
             .returning(JobIntent)
         )
 
-    async def complete(self, job_id: UUID, worker_id: str) -> JobIntent:
-        database_now = func.current_timestamp()
+    async def complete(
+        self, job_id: UUID, worker_id: str, *, expected_version: int | None = None
+    ) -> JobIntent:
+        # ``clock_timestamp()`` is PostgreSQL wall-clock time rather than the
+        # transaction-start timestamp.  A worker that spent its lease doing
+        # external work must therefore be fenced at publication/completion.
+        database_now = func.clock_timestamp()
+        lease_fence = [
+            JobIntent.id == job_id,
+            JobIntent.state == JobState.RUNNING,
+            JobIntent.lease_owner == worker_id,
+            JobIntent.lease_expires_at.is_not(None),
+            JobIntent.lease_expires_at > database_now,
+        ]
+        if expected_version is not None:
+            lease_fence.append(JobIntent.version == expected_version)
         completed = await self._db_session.scalar(
             update(JobIntent)
-            .where(
-                JobIntent.id == job_id,
-                JobIntent.state == JobState.RUNNING,
-                JobIntent.lease_owner == worker_id,
-                JobIntent.lease_expires_at > database_now,
-            )
+            .where(*lease_fence)
             .values(
                 state=JobState.SUCCEEDED,
                 lease_owner=None,
@@ -148,7 +157,15 @@ class JobLeaseService:
         if completed is not None:
             return completed
         existing = await self._db_session.get(JobIntent, job_id)
-        if existing is not None and existing.state is JobState.SUCCEEDED:
+        # A caller carrying a claim generation must never treat another
+        # generation's completed work as permission to commit its own pending
+        # side effects.  The no-generation form retains the public idempotent
+        # completion contract used by older, non-publication call sites.
+        if (
+            expected_version is None
+            and existing is not None
+            and existing.state is JobState.SUCCEEDED
+        ):
             return existing
         raise JobLeaseLost(job_id)
 

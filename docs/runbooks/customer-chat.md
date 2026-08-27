@@ -12,9 +12,13 @@ key is bound to one session/message pair.
 
 The worker commits a fully validated customer-safe response before publishing
 an optional Redis `chat:sse:<session-id>` hint. Redis contains no authoritative
-chat response state. A customer reconnects with `after=<message-sequence>`;
-the server reads durable PostgreSQL messages first and then uses Redis only to
-decide when to read PostgreSQL again.
+chat response state. A customer reconnects with the durable SSE event cursor
+(`after=<message-sequence>:s:<segment-index>` after a partial answer; legacy
+integer message sequences remain accepted). The server reads durable
+PostgreSQL events first and then uses Redis only to decide when to read
+PostgreSQL again. `message.validated` carries only safe metadata; each
+customer-visible sentence is a separately persisted/replayable
+`message.segment` event.
 
 ## Safe failure behaviour
 

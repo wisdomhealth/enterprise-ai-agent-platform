@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 import {
   PublicChatSession,
@@ -21,6 +21,8 @@ export function ChatShell({ publicKey }: ChatShellProps) {
   const [starting, setStarting] = useState(false);
   const [messageBody, setMessageBody] = useState("");
   const [messages, setMessages] = useState<PublicChatSession["messages"]>([]);
+  const eventCursor = useRef("0");
+  const deliveredCursors = useRef(new Set<string>());
 
   async function startChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -47,14 +49,28 @@ export function ChatShell({ publicKey }: ChatShellProps) {
     void connectChatEvents({
       sessionId: chat.session.id,
       token: chat.credential.token,
-      after: messages.at(-1)?.sequence ?? 0,
+      after: eventCursor.current,
       signal: controller.signal,
       onEvent: (event) => {
-        if (event.event !== "message.validated" && event.event !== "error.safe") return;
-        const body = String(event.data.body ?? "");
+        // Session-state is a snapshot, not an answer-progress cursor.  It
+        // must never move a reconnect backwards from a persisted segment.
+        if (event.event === "session.state") return;
+        if (deliveredCursors.current.has(event.cursor)) return;
+        deliveredCursors.current.add(event.cursor);
+        eventCursor.current = event.cursor;
+        if (event.event === "message.validated") return;
+        const body = String(event.data.body ?? event.data.text ?? "");
         const actor = event.event === "error.safe" ? "SYSTEM" : "AI";
         setMessages((current) => {
-          if (current.some((message) => message.sequence === event.sequence)) return current;
+          const existing = current.find((message) => message.sequence === event.sequence);
+          if (existing !== undefined && event.event === "message.segment") {
+            return current.map((message) =>
+              message.sequence === event.sequence
+                ? { ...message, body: `${message.body}${body}` }
+                : message,
+            );
+          }
+          if (existing !== undefined) return current;
           return [
             ...current,
             {

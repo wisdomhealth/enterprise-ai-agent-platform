@@ -98,9 +98,54 @@ async def test_sse_uses_persisted_validated_segments(db_session: AsyncSession) -
     )
     await db_session.commit()
 
-    event = (await PostgresSSEService(db_session).events_after(session.id, after_sequence=0))[0]
+    events = await PostgresSSEService(db_session).events_after(session.id, after_sequence=0)
 
-    assert event.data["segments"] == ["Persisted validated sentence."]
+    assert events[0].event == "message.validated"
+    assert "body" not in events[0].data
+    assert events[0].data["segment_count"] == 1
+    assert events[1].event == "message.segment"
+    assert events[1].data["text"] == "Persisted validated sentence."
+
+
+@pytest.mark.asyncio
+async def test_sse_reconnect_replays_only_missing_persisted_segments(
+    db_session: AsyncSession,
+) -> None:
+    """A segment cursor must resume within one validated answer, not skip it."""
+    session = await _session(db_session)
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=2,
+        actor=ChatActor.AI,
+        body="First validated sentence. Second validated sentence.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.validated",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": 2,
+                "message_id": str(message.id),
+                "segments": ["First validated sentence.", "Second validated sentence."],
+                "citations": [],
+            },
+        )
+    )
+    await db_session.commit()
+
+    events = await PostgresSSEService(db_session).events_after(
+        session.id, after_cursor="2:s:0"
+    )
+
+    assert [(event.event, event.data.get("index")) for event in events] == [
+        ("message.segment", 1)
+    ]
+    assert events[0].cursor == "2:s:1"
+    assert events[0].data["text"] == "Second validated sentence."
 
 
 def test_configured_redis_is_available_for_ephemeral_sse_hints() -> None:
