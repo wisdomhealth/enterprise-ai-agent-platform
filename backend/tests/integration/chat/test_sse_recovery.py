@@ -313,6 +313,7 @@ async def test_persisted_refusal_is_exposed_as_a_safe_error(db_session: AsyncSes
                 "citations": [],
                 "refused": True,
                 "handoff_recommended": True,
+                "safe_body": message.body,
             },
         )
     )
@@ -321,4 +322,154 @@ async def test_persisted_refusal_is_exposed_as_a_safe_error(db_session: AsyncSes
     event = (await PostgresSSEService(db_session).events_after(session.id, after_sequence=0))[0]
 
     assert event.event == "error.safe"
+    assert event.data["body"] == message.body
     assert event.data["handoff_recommended"] is True
+
+
+@pytest.mark.asyncio
+async def test_sse_hides_refusal_when_outbox_safe_body_does_not_bind_message(
+    db_session: AsyncSession,
+) -> None:
+    session = await _session(db_session)
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.AI,
+        body="The persisted refusal body.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.refused",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": message.sequence,
+                "message_id": str(message.id),
+                "segments": [message.body],
+                "citations": [],
+                "refused": True,
+                "handoff_recommended": True,
+                "safe_body": "A different safe body must not be exposed.",
+            },
+        )
+    )
+    await db_session.commit()
+
+    events = await PostgresSSEService(db_session).events_after(session.id, after_cursor="0")
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_sse_hides_safe_error_when_outbox_safe_body_does_not_bind_message(
+    db_session: AsyncSession,
+) -> None:
+    session = await _session(db_session)
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.SYSTEM,
+        body="The persisted safe error body.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.safe_error",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": message.sequence,
+                "message_id": str(message.id),
+                "code": "CHAT_ANSWER_UNAVAILABLE",
+                "handoff_recommended": True,
+                "safe_body": "A different safe body must not be exposed.",
+            },
+        )
+    )
+    await db_session.commit()
+
+    events = await PostgresSSEService(db_session).events_after(session.id, after_cursor="0")
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_sse_hides_validated_answer_with_internal_citation_metadata(
+    db_session: AsyncSession,
+) -> None:
+    session = await _session(db_session)
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.AI,
+        body="A validated answer with an unsafe citation payload.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.validated",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": message.sequence,
+                "message_id": str(message.id),
+                "segments": [message.body],
+                "citations": [
+                    {
+                        "title": "Customer-safe title",
+                        "section": "Overview",
+                        "page_number": 1,
+                        "internal_drive_link": "https://drive.example.internal/private",
+                    }
+                ],
+            },
+        )
+    )
+    await db_session.commit()
+
+    events = await PostgresSSEService(db_session).events_after(session.id, after_cursor="0")
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_sse_emits_safe_error_from_bound_outbox_safe_body(
+    db_session: AsyncSession,
+) -> None:
+    session = await _session(db_session)
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.SYSTEM,
+        body="The approved customer-safe error.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.safe_error",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": message.sequence,
+                "message_id": str(message.id),
+                "code": "CHAT_ANSWER_UNAVAILABLE",
+                "handoff_recommended": True,
+                "safe_body": message.body,
+            },
+        )
+    )
+    await db_session.commit()
+
+    event = (await PostgresSSEService(db_session).events_after(session.id, after_cursor="0"))[0]
+
+    assert event.event == "error.safe"
+    assert event.data["body"] == "The approved customer-safe error."

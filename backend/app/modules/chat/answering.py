@@ -24,7 +24,7 @@ from app.modules.identity.models import UserRole
 from app.modules.jobs.models import ErrorClass, JobIntent
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.outbox.service import OutboxService
-from app.modules.rag.types import AnswerAudience, ValidatedAnswer
+from app.modules.rag.types import AnswerAudience, CustomerCitation, ValidatedAnswer
 
 CHAT_ANSWER_KIND = "chat.answer"
 CHAT_ANSWER_WORKER_ID = "celery-chat-answer"
@@ -209,9 +209,25 @@ class ChatAnswerService:
                 "sequence": sequence,
                 "message_id": str(message.id),
                 "segments": list(answer.segments),
-                "citations": [citation.model_dump(mode="json") for citation in answer.citations],
+                # The outbox is the customer-visible evidence source for SSE.
+                # Project here even if a caller accidentally supplies a staff
+                # citation, so internal chunk IDs and Drive URLs never enter
+                # the durable customer payload.
+                "citations": [
+                    CustomerCitation(
+                        title=citation.title,
+                        section=citation.section,
+                        page_number=citation.page_number,
+                    ).model_dump(mode="json")
+                    for citation in answer.citations
+                ],
                 "refused": answer.refused,
                 "handoff_recommended": answer.refused,
+                # Refusal text is visible as a single safe-error event, not
+                # as a segment stream.  Persist its exact customer display
+                # value in the same provenance record rather than deriving
+                # it later from the mutable chat-message row.
+                **({"safe_body": answer.text} if answer.refused else {}),
                 "model": answer.model,
                 "prompt_version": answer.prompt_version,
                 "latency_ms": answer.latency_ms,
@@ -252,6 +268,9 @@ class ChatAnswerService:
                     "message_id": str(message.id),
                     "code": error_code,
                     "handoff_recommended": True,
+                    # See the matching SSE provenance check: the customer
+                    # display string must originate in this approved event.
+                    "safe_body": _SAFE_ERROR,
                 },
             )
         await lease_service.retry(

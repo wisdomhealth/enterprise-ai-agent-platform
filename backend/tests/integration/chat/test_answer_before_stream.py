@@ -10,7 +10,7 @@ from app.modules.identity.models import Organization
 from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.models import KnowledgeBase
 from app.modules.outbox.models import OutboxEvent
-from app.modules.rag.types import ValidatedAnswer
+from app.modules.rag.types import SourceCitation, ValidatedAnswer
 
 
 class UnvalidatedAnswerService:
@@ -41,6 +41,32 @@ class HandoffDuringAnswerService:
             citations=[],
             segments=["This answer must not be published after handoff."],
             refused=False,
+            model="fake",
+            prompt_version="test",
+            latency_ms=1,
+            input_tokens=1,
+            output_tokens=1,
+            estimated_cost=0.0,
+        )
+
+
+class RefusalWithStaffCitationService:
+    async def answer(self, *_args: object, **_kwargs: object) -> ValidatedAnswer:
+        return ValidatedAnswer(
+            text="I don't know based on the available information.",
+            claims=[],
+            citations=[
+                SourceCitation(
+                    chunk_id=uuid4(),
+                    document_version_id=uuid4(),
+                    title="Customer-safe title",
+                    section="Overview",
+                    page_number=4,
+                    internal_drive_link="https://drive.example.internal/private",
+                )
+            ],
+            segments=["I don't know based on the available information."],
+            refused=True,
             model="fake",
             prompt_version="test",
             latency_ms=1,
@@ -95,6 +121,38 @@ async def test_no_sse_segment_exists_before_answer_validation(db_session: AsyncS
     assert "chat.message.segment" not in event_types
     assert [message.actor for message in messages] == [ChatActor.CUSTOMER, ChatActor.SYSTEM]
     assert "team member" in messages[-1].body
+    safe_error = await db_session.scalar(
+        select(OutboxEvent).where(
+            OutboxEvent.aggregate_id == session.id,
+            OutboxEvent.event_type == "chat.answer.safe_error",
+        )
+    )
+    assert isinstance(safe_error, OutboxEvent)
+    assert safe_error.payload["safe_body"] == messages[-1].body
+
+
+@pytest.mark.asyncio
+async def test_refusal_outbox_persists_exact_safe_body_and_customer_citation_projection(
+    db_session: AsyncSession,
+) -> None:
+    session = await _session(db_session)
+    service = ChatAnswerService(db_session, RefusalWithStaffCitationService())
+    _, job = await service.submit_customer_message(session.id, "Can you answer this?")
+    await db_session.commit()
+
+    await service.process(job.id)
+
+    event = await db_session.scalar(
+        select(OutboxEvent).where(
+            OutboxEvent.aggregate_id == session.id,
+            OutboxEvent.event_type == "chat.answer.refused",
+        )
+    )
+    assert isinstance(event, OutboxEvent)
+    assert event.payload["safe_body"] == "I don't know based on the available information."
+    assert event.payload["citations"] == [
+        {"title": "Customer-safe title", "section": "Overview", "page_number": 4}
+    ]
 
 
 @pytest.mark.asyncio

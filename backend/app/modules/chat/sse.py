@@ -12,11 +12,13 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.chat.models import ChatActor, ChatMessage, ChatSession, ChatSSEEventType
 from app.modules.outbox.models import OutboxEvent
+from app.modules.rag.types import CustomerCitation
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,25 +164,25 @@ class PostgresSSEService:
 
     @staticmethod
     def _validated_event(
-        message: ChatMessage, metadata: dict[str, object] | None = None
+        message: ChatMessage, metadata: dict[str, object]
     ) -> ChatSSEEvent:
-        if message.actor is ChatActor.SYSTEM or (metadata or {}).get("refused") is True:
+        if message.actor is ChatActor.SYSTEM or metadata.get("refused") is True:
+            safe_body = _approved_safe_body(metadata)
+            assert safe_body is not None
             return ChatSSEEvent(
                 cursor=f"{message.sequence}:e:0",
                 sequence=message.sequence,
                 event=ChatSSEEventType.ERROR_SAFE.value,
                 data={
                     "sequence": message.sequence,
-                    "body": message.body,
-                    "handoff_recommended": bool(
-                        (metadata or {}).get("handoff_recommended", True)
-                    ),
+                    "body": safe_body,
+                    "handoff_recommended": bool(metadata["handoff_recommended"]),
                 },
             )
-        raw_citations = (metadata or {}).get("citations", [])
-        raw_segments = (metadata or {}).get("segments", [message.body])
-        citations = list(raw_citations) if isinstance(raw_citations, list) else []
-        segments = list(raw_segments) if isinstance(raw_segments, list) else [message.body]
+        citations = _approved_customer_citations(metadata)
+        segments = _approved_segments(metadata)
+        assert citations is not None
+        assert segments is not None
         # The complete answer body intentionally is not released in this
         # event.  Customer-visible text travels only in durable, individually
         # resumable segments below.
@@ -237,6 +239,7 @@ def _is_approved_provenance(message: ChatMessage, event: OutboxEvent) -> bool:
             event.event_type == "chat.answer.safe_error"
             and isinstance(payload.get("code"), str)
             and isinstance(payload.get("handoff_recommended"), bool)
+            and _approved_safe_body(payload) == message.body
         )
     if message.actor is not ChatActor.AI:
         return False
@@ -246,9 +249,40 @@ def _is_approved_provenance(message: ChatMessage, event: OutboxEvent) -> bool:
     elif event.event_type == "chat.answer.refused":
         if payload.get("refused") is not True:
             return False
+        if _approved_safe_body(payload) != message.body:
+            return False
     else:
         return False
-    return isinstance(payload.get("citations"), list) and _approved_segments(payload) is not None
+    return (
+        _approved_customer_citations(payload) is not None
+        and _approved_segments(payload) is not None
+    )
+
+
+def _approved_safe_body(payload: dict[str, object]) -> str | None:
+    safe_body = payload.get("safe_body")
+    return safe_body if isinstance(safe_body, str) and safe_body.strip() else None
+
+
+def _approved_customer_citations(payload: dict[str, object]) -> list[dict[str, object]] | None:
+    """Accept only the strictly customer-safe persisted citation shape.
+
+    `CustomerCitation` forbids extra fields, so a malformed list or a staff
+    projection containing chunk IDs/internal URLs makes the complete answer
+    ineligible for SSE rather than silently leaking or partially rendering it.
+    """
+    raw_citations = payload.get("citations")
+    if not isinstance(raw_citations, list):
+        return None
+    try:
+        if not all(isinstance(citation, dict) for citation in raw_citations):
+            return None
+        return [
+            dict(CustomerCitation.model_validate(citation).model_dump(mode="json"))
+            for citation in raw_citations
+        ]
+    except ValidationError:
+        return None
 
 
 def _approved_segments(payload: dict[str, object]) -> list[str] | None:
