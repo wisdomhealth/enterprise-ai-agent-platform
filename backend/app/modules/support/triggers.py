@@ -38,7 +38,9 @@ class SensitiveTopicClassification(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    sensitive_topic: SensitiveTopic | None = None
+    # Explicit JSON null means no sensitive topic.  A missing field is a
+    # malformed provider response and must never silently become that result.
+    sensitive_topic: SensitiveTopic | None
 
 
 class StructuredSafetyClassifierResponseError(RuntimeError):

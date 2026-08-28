@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -13,7 +14,10 @@ from app.modules.outbox.models import OutboxEvent
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.types import ClaimSupport, ValidatedAnswer
 from app.modules.support.models import Handoff, HandoffTrigger, SensitiveTopic
-from app.modules.support.triggers import SensitiveTopicClassification
+from app.modules.support.triggers import (
+    AnthropicStructuredSafetyClassifier,
+    SensitiveTopicClassification,
+)
 
 
 class RefusalAnswer:
@@ -58,6 +62,15 @@ class SafetyTopicClassifier:
 class NoTopicClassifier:
     async def classify(self, _text: str) -> SensitiveTopicClassification:
         return SensitiveTopicClassification(sensitive_topic=None)
+
+
+class _MalformedClassifierMessages:
+    async def create(self, **_kwargs: object) -> object:
+        return SimpleNamespace(content=[SimpleNamespace(text="{}")])
+
+
+class _MalformedClassifierClient:
+    messages = _MalformedClassifierMessages()
 
 
 class _SharedSessionFactory:
@@ -399,6 +412,53 @@ async def test_registered_worker_uses_structured_classifier_for_sensitive_handof
     assert isinstance(handoff, Handoff)
     assert handoff.trigger is HandoffTrigger.SENSITIVE_TOPIC
     assert handoff.sensitive_topic is SensitiveTopic.ACCOUNT_SECURITY
+
+
+@pytest.mark.asyncio
+async def test_registered_worker_fails_closed_for_missing_structured_classification(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real classifier's malformed JSON cannot silently reach the answer path."""
+    from app.modules.chat import tasks
+
+    organization = Organization(name=f"Worker malformed safety {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id, public_key=f"public-{uuid4().hex}"
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(organization_id=organization.id, knowledge_base_id=knowledge_base.id)
+    db_session.add(session)
+    await db_session.flush()
+    _, job = await ChatAnswerService(db_session, ValidAnswer()).submit_customer_message(
+        session.id, "ordinary customer text"
+    )
+    await db_session.commit()
+
+    monkeypatch.setattr(tasks, "async_sessionmaker", _SharedSessionFactory(db_session))
+    monkeypatch.setattr(
+        tasks,
+        "_build_safety_classifier",
+        lambda _settings: AnthropicStructuredSafetyClassifier(
+            "not-a-real-key", client=_MalformedClassifierClient()
+        ),
+    )
+
+    await tasks._consume_chat_answer(job.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.session_id == session.id))
+    assert isinstance(handoff, Handoff)
+    assert handoff.trigger is HandoffTrigger.SYSTEM_ERROR
+    messages = list(
+        (
+            await db_session.scalars(
+                select(ChatMessage).where(ChatMessage.session_id == session.id)
+            )
+        ).all()
+    )
+    assert [message.actor for message in messages] == [ChatActor.CUSTOMER, ChatActor.SYSTEM]
 
 
 @pytest.mark.asyncio

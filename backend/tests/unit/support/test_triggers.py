@@ -59,6 +59,7 @@ async def test_anthropic_structured_classifier_accepts_only_defined_sensitive_to
 @pytest.mark.parametrize(
     "payload",
     [
+        "{}",
         '{"sensitive_topic":"UNKNOWN_TOPIC"}',
         '{"sensitive_topic":"SAFETY","provider_detail":"must not be trusted"}',
         '{"topic":"SAFETY"}',
