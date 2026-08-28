@@ -25,6 +25,9 @@ from app.modules.jobs.models import ErrorClass, JobIntent
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.types import AnswerAudience, CustomerCitation, ValidatedAnswer
+from app.modules.support.models import HandoffTrigger
+from app.modules.support.service import SupportService
+from app.modules.support.triggers import choose_handoff_trigger, detect_sensitive_topic
 
 CHAT_ANSWER_KIND = "chat.answer"
 CHAT_ANSWER_WORKER_ID = "celery-chat-answer"
@@ -123,9 +126,19 @@ class ChatAnswerService:
                     job, lease_service, execution_owner, session, "CHAT_JOB_INVALID"
                 )
             if session.state is not ConversationState.AI_ACTIVE:
-                await lease_service.complete(
-                    job.id, execution_owner, expected_version=job.version
+                await lease_service.complete(job.id, execution_owner, expected_version=job.version)
+                await self._db_session.commit()
+                await self._notify(session.id, message.sequence)
+                return None
+
+            sensitive_topic = detect_sensitive_topic(message.body)
+            if sensitive_topic is not None:
+                await SupportService(self._db_session).request_handoff(
+                    session.id,
+                    trigger=HandoffTrigger.SENSITIVE_TOPIC,
+                    sensitive_topic=sensitive_topic,
                 )
+                await lease_service.complete(job.id, execution_owner, expected_version=job.version)
                 await self._db_session.commit()
                 await self._notify(session.id, message.sequence)
                 return None
@@ -154,20 +167,19 @@ class ChatAnswerService:
                 not isinstance(current_session, ChatSession)
                 or current_session.state is not ConversationState.AI_ACTIVE
             ):
-                await lease_service.complete(
-                    job.id, execution_owner, expected_version=job.version
-                )
+                await lease_service.complete(job.id, execution_owner, expected_version=job.version)
                 await self._db_session.commit()
                 await self._notify(session.id, message.sequence)
                 return None
             persisted = await self._persist_validated_answer(session, answer)
+            trigger = await self._answer_handoff_trigger(session.id, answer)
+            if trigger is not None:
+                await SupportService(self._db_session).request_handoff(session.id, trigger=trigger)
             # The message/outbox inserts and this generation-fenced compare
             # and set share one transaction.  PostgreSQL predicate
             # re-evaluation on the conditional UPDATE makes an expired or
             # taken-over lease roll the complete publication back.
-            await lease_service.complete(
-                job.id, execution_owner, expected_version=job.version
-            )
+            await lease_service.complete(job.id, execution_owner, expected_version=job.version)
             await self._db_session.commit()
             await self._notify(session.id, persisted.sequence)
             return persisted
@@ -280,6 +292,13 @@ class ChatAnswerService:
             error_class=ErrorClass.NON_RETRYABLE,
             expected_version=job.version,
         )
+        # The safe error has already been persisted in the same transaction.
+        # Queue the handoff before committing so a restart observes a complete,
+        # explainable failure-to-human boundary rather than a transient hint.
+        if isinstance(session, ChatSession):
+            await SupportService(self._db_session).request_handoff(
+                session.id, trigger=HandoffTrigger.SYSTEM_ERROR
+            )
         await self._db_session.commit()
         if message is not None:
             await self._notify(message.session_id, message.sequence)
@@ -300,6 +319,37 @@ class ChatAnswerService:
             )
         )
         return int(current or 0) + 1
+
+    async def _answer_handoff_trigger(
+        self, session_id: UUID, answer: ValidatedAnswer
+    ) -> HandoffTrigger | None:
+        prior_failures = list(
+            (
+                await self._db_session.scalars(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.actor.in_([ChatActor.AI, ChatActor.SYSTEM]),
+                    )
+                    .order_by(ChatMessage.sequence.desc())
+                    .limit(2)
+                )
+            ).all()
+        )
+        # The current answer is always represented from its validated object;
+        # historical error/refusal messages are marked by their corresponding
+        # durable customer event, so conservative text-free failures are only
+        # used to decide whether to escalate, never for customer output.
+        history = [
+            {
+                "refused": answer.refused if index == 0 else message.actor is ChatActor.SYSTEM,
+                "supported_material_claims": (
+                    sum(1 for claim in answer.claims if claim.material) if index == 0 else 1
+                ),
+            }
+            for index, message in enumerate(prior_failures)
+        ]
+        return choose_handoff_trigger(history)
 
     async def _notify(self, session_id: UUID, sequence: int) -> None:
         if self._event_publisher is None:

@@ -15,6 +15,8 @@ from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.router import router as knowledge_router
 from app.modules.rag.answer_service import GroundedAnswerService
 from app.modules.rag.router import router as rag_router
+from app.modules.support.router import public_router as support_public_router
+from app.modules.support.router import staff_router as support_staff_router
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -69,6 +71,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(knowledge_router)
     app.include_router(rag_router)
     app.include_router(chat_router)
+    app.include_router(support_public_router)
+    app.include_router(support_staff_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
