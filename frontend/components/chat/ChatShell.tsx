@@ -5,6 +5,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   PublicChatSession,
   PublicChatStart,
+  requestPublicHandoff,
   sendPublicChatMessage,
   startPublicChat,
 } from "../../lib/public-chat-api";
@@ -21,6 +22,7 @@ export function ChatShell({ publicKey }: ChatShellProps) {
   const [starting, setStarting] = useState(false);
   const [messageBody, setMessageBody] = useState("");
   const [messages, setMessages] = useState<PublicChatSession["messages"]>([]);
+  const [conversationState, setConversationState] = useState<PublicChatSession["state"] | null>(null);
   const eventCursor = useRef("0");
   const deliveredCursors = useRef(new Set<string>());
 
@@ -54,7 +56,11 @@ export function ChatShell({ publicKey }: ChatShellProps) {
       onEvent: (event) => {
         // Session-state is a snapshot, not an answer-progress cursor.  It
         // must never move a reconnect backwards from a persisted segment.
-        if (event.event === "session.state") return;
+        if (event.event === "session.state") {
+          const state = event.data.state;
+          if (typeof state === "string") setConversationState(state as PublicChatSession["state"]);
+          return;
+        }
         if (deliveredCursors.current.has(event.cursor)) return;
         deliveredCursors.current.add(event.cursor);
         eventCursor.current = event.cursor;
@@ -108,11 +114,36 @@ export function ChatShell({ publicKey }: ChatShellProps) {
     }
   }
 
+  async function requestPerson() {
+    if (chat === null) return;
+    setError(null);
+    try {
+      const handoff = await requestPublicHandoff({
+        sessionId: chat.session.id,
+        token: chat.credential.token,
+        contactName: customerName,
+        contactEmail: customerEmail,
+      });
+      setConversationState(handoff.state);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to request support.");
+    }
+  }
+
   if (chat !== null) {
+    const state = conversationState ?? chat.session.state;
+    const offline = state === "QUEUED" || state === "HUMAN_ACTIVE";
     return (
       <section aria-label="Customer support chat">
         <h1>How can we help?</h1>
-        <p role="status">Chat started. An AI assistant is ready to help.</p>
+        <p role="status">
+          {state === "QUEUED"
+            ? "Your request is queued for a support person."
+            : state === "HUMAN_ACTIVE"
+              ? "A support person is handling your conversation."
+              : "Chat started. An AI assistant is ready to help."}
+        </p>
+        {offline ? <p>We are not promising a live response. Follow up may arrive by email.</p> : null}
         <MessageList messages={messages} />
         <form onSubmit={sendMessage}>
           <label htmlFor="chat-message">Message</label>
@@ -124,6 +155,11 @@ export function ChatShell({ publicKey }: ChatShellProps) {
           />
           <button type="submit">Send</button>
         </form>
+        {state === "AI_ACTIVE" ? (
+          <button type="button" onClick={() => void requestPerson()}>
+            Request a person
+          </button>
+        ) : null}
         {error === null ? null : <p role="alert">{error}</p>}
       </section>
     );

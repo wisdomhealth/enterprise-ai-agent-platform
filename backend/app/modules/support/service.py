@@ -284,6 +284,35 @@ class SupportService:
             visible.append(handoff)
         return visible
 
+    async def conversation(
+        self, handoff_id: UUID, principal: Principal
+    ) -> tuple[Handoff, ChatSession, list[ChatMessage]]:
+        """Return only the durable context for a staff-authorized handoff."""
+
+        self._require_staff(principal)
+        handoff = await self._db_session.scalar(
+            select(Handoff).where(
+                Handoff.id == handoff_id,
+                Handoff.organization_id == principal.organization_id,
+            )
+        )
+        if not isinstance(handoff, Handoff):
+            raise LookupError("handoff not found")
+        await self._require_session_access(principal, handoff.id)
+        session = await self._db_session.get(ChatSession, handoff.session_id)
+        if not isinstance(session, ChatSession):
+            raise LookupError("chat session not found")
+        messages = list(
+            (
+                await self._db_session.scalars(
+                    select(ChatMessage)
+                    .where(ChatMessage.session_id == session.id)
+                    .order_by(ChatMessage.sequence)
+                )
+            ).all()
+        )
+        return handoff, session, messages
+
     async def _owned_handoff(
         self, handoff_id: UUID, principal: Principal, expected_version: int
     ) -> Handoff:

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.chat.models import ChatSession, ConversationState
+from app.modules.chat.models import ChatMessage, ChatSession, ConversationState
 from app.modules.chat.router import _begin_idempotency, _credential_value, _request_hash
 from app.modules.chat.service import ChatSessionService
 from app.modules.idempotency.models import IdempotencyState
@@ -49,6 +49,40 @@ def _handoff_read(handoff: Handoff) -> dict[str, object]:
         "version": handoff.version,
         "last_customer_sequence": handoff.last_customer_sequence,
     }
+
+
+def _conversation_read(
+    handoff: Handoff, session: ChatSession, messages: list[ChatMessage]
+) -> dict[str, object]:
+    """Project only staff-authorized durable context; never a transient worker view."""
+
+    payload = _handoff_read(handoff)
+    snapshot = handoff.snapshot
+    customer = snapshot.get("customer")
+    payload.update(
+        {
+            "customer": customer
+            if isinstance(customer, dict)
+            else {"name": session.customer_name, "email": session.customer_email},
+            "summary": snapshot.get("summary", ""),
+            "tool_results": snapshot.get("tool_results", []),
+            "messages": [
+                {
+                    "sequence": message.sequence,
+                    "actor": message.actor.value,
+                    "body": message.body,
+                    "status": message.status.value,
+                    "created_at": message.created_at.isoformat(),
+                    # Task 10 customer-answer events deliberately project only
+                    # customer citations. Rich internal sources are supplied by
+                    # the separately authorized Staff Assist query.
+                    "citations": [],
+                }
+                for message in messages
+            ],
+        }
+    )
+    return payload
 
 
 async def _public_session(
@@ -128,6 +162,23 @@ async def list_queue(
         return [_handoff_read(item) for item in await SupportService(db_session).queue(principal)]
     except SupportAuthorizationError:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from None
+
+
+@staff_router.get("/{handoff_id}")
+async def read_conversation(
+    handoff_id: UUID,
+    principal: Principal = Depends(require_staff_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    try:
+        handoff, session, messages = await SupportService(db_session).conversation(
+            handoff_id, principal
+        )
+        return _conversation_read(handoff, session, messages)
+    except SupportAuthorizationError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from None
+    except LookupError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from None
 
 
 async def _perform(

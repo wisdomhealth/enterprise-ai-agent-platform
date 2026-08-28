@@ -71,3 +71,22 @@ export function sendPublicChatMessage(input: {
     },
   );
 }
+
+export function requestPublicHandoff(input: {
+  sessionId: string;
+  token: string;
+  contactName?: string;
+  contactEmail?: string;
+}): Promise<{ state: "QUEUED" | "HUMAN_ACTIVE" }> {
+  return request(`/sessions/${input.sessionId}/handoff`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${input.token}`,
+      "Idempotency-Key": crypto.randomUUID(),
+    },
+    body: JSON.stringify({
+      contact_name: input.contactName || null,
+      contact_email: input.contactEmail || null,
+    }),
+  });
+}
