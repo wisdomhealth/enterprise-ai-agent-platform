@@ -58,9 +58,21 @@ class SupportService:
         if not isinstance(session, ChatSession):
             raise LookupError("chat session not found")
         existing = await self._db_session.scalar(
-            select(Handoff).where(Handoff.session_id == session.id).with_for_update()
+            select(Handoff)
+            .where(
+                Handoff.session_id == session.id,
+                Handoff.state.in_(
+                    [
+                        ConversationState.HANDOFF_REQUESTED,
+                        ConversationState.QUEUED,
+                        ConversationState.HUMAN_ACTIVE,
+                    ]
+                ),
+            )
+            .order_by(Handoff.created_at.desc())
+            .with_for_update()
         )
-        if isinstance(existing, Handoff) and existing.state is not ConversationState.RESOLVED:
+        if isinstance(existing, Handoff):
             return existing
         if session.state is not ConversationState.AI_ACTIVE:
             raise InvalidTransition(f"cannot request handoff from {session.state}")
@@ -69,26 +81,16 @@ class SupportService:
         snapshot, boundary = await self._snapshot(session)
         queued_state = transition(requested_state, SupportAction.QUEUE)
         assert queued_state is ConversationState.QUEUED
-        if isinstance(existing, Handoff):
-            existing.trigger = trigger
-            existing.sensitive_topic = sensitive_topic
-            existing.snapshot = snapshot
-            existing.last_customer_sequence = boundary
-            existing.assigned_user_id = None
-            existing.state = queued_state
-            existing.version += 1
-            handoff = existing
-        else:
-            handoff = Handoff(
-                session_id=session.id,
-                organization_id=session.organization_id,
-                state=queued_state,
-                trigger=trigger,
-                sensitive_topic=sensitive_topic,
-                snapshot=snapshot,
-                last_customer_sequence=boundary,
-            )
-            self._db_session.add(handoff)
+        handoff = Handoff(
+            session_id=session.id,
+            organization_id=session.organization_id,
+            state=queued_state,
+            trigger=trigger,
+            sensitive_topic=sensitive_topic,
+            snapshot=snapshot,
+            last_customer_sequence=boundary,
+        )
+        self._db_session.add(handoff)
         session.state = queued_state
         session.version += 1
         await self._db_session.flush()

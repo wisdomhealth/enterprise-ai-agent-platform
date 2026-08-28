@@ -80,3 +80,61 @@ async def test_resume_ai_clears_pending_old_answer_and_waits_for_later_customer_
         )
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_customer_can_create_fresh_handoff_after_explicit_resume(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"Support rehandoff {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id, public_key=f"public-{uuid4().hex}"
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(organization_id=organization.id, knowledge_base_id=knowledge_base.id)
+    db_session.add(session)
+    await db_session.flush()
+    reviewer = StaffUser(
+        organization_id=organization.id,
+        oidc_subject=f"support-{uuid4()}",
+        email=f"reviewer-{uuid4()}@example.test",
+        role=UserRole.REVIEWER,
+        status=UserStatus.ACTIVE,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    db_session.add(
+        ResourceGrant(
+            organization_id=organization.id,
+            subject_id=reviewer.id,
+            resource_type="knowledge",
+            resource_id=knowledge_base.id,
+            actions=["knowledge.review"],
+        )
+    )
+    await db_session.flush()
+    principal = Principal(
+        reviewer.id, organization.id, reviewer.email, UserRole.REVIEWER, uuid4(), ""
+    )
+    service = SupportService(db_session)
+    first = await service.request_handoff(session.id, trigger=HandoffTrigger.CUSTOMER_REQUEST)
+    claimed = await service.claim(first.id, principal, first.version)
+    await service.resume_ai(first.id, principal, claimed.version)
+    db_session.add(
+        ChatMessage(
+            session_id=session.id,
+            sequence=1,
+            actor=ChatActor.CUSTOMER,
+            body="Need help again",
+        )
+    )
+    await db_session.flush()
+
+    second = await service.request_handoff(session.id, trigger=HandoffTrigger.CUSTOMER_REQUEST)
+
+    assert second.id != first.id
+    assert second.state is ConversationState.QUEUED
+    assert second.snapshot["last_customer_sequence"] == 1

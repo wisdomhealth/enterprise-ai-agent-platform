@@ -1,4 +1,5 @@
 from collections.abc import Mapping, Sequence
+from typing import Protocol
 
 from app.modules.support.models import HandoffTrigger, SensitiveTopic
 
@@ -24,16 +25,14 @@ def choose_handoff_trigger(
     return None
 
 
-def detect_sensitive_topic(text: str) -> SensitiveTopic | None:
-    normalized = text.casefold()
-    phrases = {
-        SensitiveTopic.ACCOUNT_SECURITY: ("password", "account hacked", "security code"),
-        SensitiveTopic.PAYMENT_DATA: ("card number", "cvv", "payment data"),
-        SensitiveTopic.LEGAL_THREAT: ("lawsuit", "legal action", "sue"),
-        SensitiveTopic.SAFETY: ("self harm", "suicide", "immediate danger"),
-        SensitiveTopic.PRIVACY_REQUEST: ("delete my data", "privacy request", "gdpr"),
-    }
-    return next(
-        (topic for topic, values in phrases.items() if any(item in normalized for item in values)),
-        None,
-    )
+class StructuredSafetyClassifier(Protocol):
+    """A typed safety boundary; unstructured keyword matching is forbidden."""
+
+    async def classify(self, text: str) -> SensitiveTopic | None: ...
+
+
+class NoSensitiveTopicClassifier:
+    """Explicit default used until a configured structured classifier is supplied."""
+
+    async def classify(self, _text: str) -> SensitiveTopic | None:
+        return None

@@ -23,11 +23,16 @@ from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
 from app.modules.jobs.models import ErrorClass, JobIntent
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
+from app.modules.outbox.models import OutboxEvent
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.types import AnswerAudience, CustomerCitation, ValidatedAnswer
 from app.modules.support.models import HandoffTrigger
 from app.modules.support.service import SupportService
-from app.modules.support.triggers import choose_handoff_trigger, detect_sensitive_topic
+from app.modules.support.triggers import (
+    NoSensitiveTopicClassifier,
+    StructuredSafetyClassifier,
+    choose_handoff_trigger,
+)
 
 CHAT_ANSWER_KIND = "chat.answer"
 CHAT_ANSWER_WORKER_ID = "celery-chat-answer"
@@ -65,11 +70,13 @@ class ChatAnswerService:
         *,
         event_publisher: ChatEventPublisher | None = None,
         worker_id: str = CHAT_ANSWER_WORKER_ID,
+        safety_classifier: StructuredSafetyClassifier | None = None,
     ) -> None:
         self._db_session = db_session
         self._answer_service = answer_service
         self._event_publisher = event_publisher
         self._worker_id = worker_id
+        self._safety_classifier = safety_classifier or NoSensitiveTopicClassifier()
 
     async def submit_customer_message(
         self, session_id: UUID, body: str
@@ -131,7 +138,16 @@ class ChatAnswerService:
                 await self._notify(session.id, message.sequence)
                 return None
 
-            sensitive_topic = detect_sensitive_topic(message.body)
+            try:
+                sensitive_topic = await self._safety_classifier.classify(message.body)
+            except Exception:
+                return await self._persist_safe_failure(
+                    job,
+                    lease_service,
+                    execution_owner,
+                    session,
+                    "CHAT_SAFETY_CLASSIFIER_UNAVAILABLE",
+                )
             if sensitive_topic is not None:
                 await SupportService(self._db_session).request_handoff(
                     session.id,
@@ -161,7 +177,10 @@ class ChatAnswerService:
             # re-read durable state before publication so an old AI response
             # cannot appear after control leaves AI.
             current_session = await self._db_session.scalar(
-                select(ChatSession).where(ChatSession.id == session.id).with_for_update()
+                select(ChatSession)
+                .where(ChatSession.id == session.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if (
                 not isinstance(current_session, ChatSession)
@@ -172,7 +191,7 @@ class ChatAnswerService:
                 await self._notify(session.id, message.sequence)
                 return None
             persisted = await self._persist_validated_answer(session, answer)
-            trigger = await self._answer_handoff_trigger(session.id, answer)
+            trigger = await self._answer_handoff_trigger(session.id, persisted.id, answer)
             if trigger is not None:
                 await SupportService(self._db_session).request_handoff(session.id, trigger=trigger)
             # The message/outbox inserts and this generation-fenced compare
@@ -260,6 +279,24 @@ class ChatAnswerService:
     ) -> ChatMessage | None:
         message: ChatMessage | None = None
         if isinstance(session, ChatSession):
+            current_session = await self._db_session.scalar(
+                select(ChatSession)
+                .where(ChatSession.id == session.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                not isinstance(current_session, ChatSession)
+                or current_session.state is not ConversationState.AI_ACTIVE
+            ):
+                await lease_service.complete(
+                    job.id,
+                    execution_owner,
+                    expected_version=job.version,
+                )
+                await self._db_session.commit()
+                return None
+            session = current_session
             sequence = await self._next_sequence(session.id)
             message = ChatMessage(
                 session_id=session.id,
@@ -321,7 +358,7 @@ class ChatAnswerService:
         return int(current or 0) + 1
 
     async def _answer_handoff_trigger(
-        self, session_id: UUID, answer: ValidatedAnswer
+        self, session_id: UUID, message_id: UUID, answer: ValidatedAnswer
     ) -> HandoffTrigger | None:
         prior_failures = list(
             (
@@ -336,18 +373,39 @@ class ChatAnswerService:
                 )
             ).all()
         )
-        # The current answer is always represented from its validated object;
-        # historical error/refusal messages are marked by their corresponding
-        # durable customer event, so conservative text-free failures are only
-        # used to decide whether to escalate, never for customer output.
+        events = list(
+            (
+                await self._db_session.scalars(
+                    select(OutboxEvent).where(
+                        OutboxEvent.aggregate_type == "chat_session",
+                        OutboxEvent.aggregate_id == session_id,
+                        OutboxEvent.event_type.in_(
+                            ["chat.answer.refused", "chat.answer.safe_error"]
+                        ),
+                    )
+                )
+            ).all()
+        )
+        refused_message_ids = {
+            str(event.payload.get("message_id"))
+            for event in events
+            if event.event_type == "chat.answer.refused" and event.payload.get("refused") is True
+        }
         history = [
             {
-                "refused": answer.refused if index == 0 else message.actor is ChatActor.SYSTEM,
+                "refused": (
+                    answer.refused
+                    if message.id == message_id
+                    else str(message.id) in refused_message_ids
+                    or message.actor is ChatActor.SYSTEM
+                ),
                 "supported_material_claims": (
-                    sum(1 for claim in answer.claims if claim.material) if index == 0 else 1
+                    sum(1 for claim in answer.claims if claim.material)
+                    if message.id == message_id
+                    else 1
                 ),
             }
-            for index, message in enumerate(prior_failures)
+            for message in prior_failures
         ]
         return choose_handoff_trigger(history)
 

@@ -8,7 +8,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    UniqueConstraint,
     func,
     text,
 )
@@ -49,7 +48,7 @@ class SensitiveTopic(StrEnum):
 class Handoff(Base):
     __tablename__ = "support_handoffs"
     __table_args__ = (
-        UniqueConstraint("session_id", name="uq_support_handoffs_session"),
+        Index("ix_support_handoffs_session", "session_id", "created_at"),
         Index("ix_support_handoffs_queue", "organization_id", "state", "created_at"),
         Index("ix_support_handoffs_assignee", "assigned_user_id", "state"),
     )
