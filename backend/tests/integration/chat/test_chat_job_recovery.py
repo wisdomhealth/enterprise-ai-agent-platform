@@ -23,6 +23,7 @@ from app.modules.jobs.models import JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.knowledge.models import KnowledgeBase
 from app.modules.rag.types import ValidatedAnswer
+from app.modules.support.triggers import NoSensitiveTopicClassifier
 
 
 class ValidAnswerService:
@@ -187,6 +188,13 @@ async def test_registered_celery_consumer_processes_durable_chat_intent(
     celery.loader.import_default_modules()
     monkeypatch.setattr(
         "app.modules.chat.tasks.async_sessionmaker", _SharedSessionFactory(db_session)
+    )
+    # This worker-wiring regression exercises normal answer delivery, not the
+    # configured provider.  Supply a deterministic structured no-topic result
+    # rather than weakening the production fail-closed classifier boundary.
+    monkeypatch.setattr(
+        "app.modules.chat.tasks._build_safety_classifier",
+        lambda _settings: NoSensitiveTopicClassifier(),
     )
     await _consume_chat_answer(job.id)
 

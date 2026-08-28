@@ -13,6 +13,12 @@ from app.modules.chat.sse import RedisChatEventPublisher
 from app.modules.jobs.models import JobIntent, JobState
 from app.modules.rag.answer_service import GroundedAnswerService
 from app.modules.rag.types import ValidatedAnswer
+from app.modules.support.triggers import (
+    AnthropicStructuredSafetyClassifier,
+    StructuredSafetyClassifier,
+    StructuredSafetyClassifierUnavailable,
+    UnavailableStructuredSafetyClassifier,
+)
 
 CHAT_ANSWER_TASK_NAME = "app.modules.chat.tasks.chat_answer"
 
@@ -42,8 +48,25 @@ async def _consume_chat_answer(job_id: UUID) -> None:
                 Redis.from_url(settings.redis_url.unicode_string(), decode_responses=True)
             )
         await ChatAnswerService(
-            db_session, answer_service, event_publisher=publisher
+            db_session,
+            answer_service,
+            event_publisher=publisher,
+            safety_classifier=_build_safety_classifier(settings),
         ).process(job_id)
+
+
+def _build_safety_classifier(settings: Settings) -> StructuredSafetyClassifier:
+    """Build the only production classifier from explicit provider configuration.
+
+    ``ANTHROPIC_API_KEY`` is the existing secret boundary; an optional
+    ``SAFETY_CLASSIFIER_MODEL`` selects a dedicated model.  Incomplete
+    configuration deliberately fails closed during processing instead of
+    falling back to keyword detection or an unstructured default.
+    """
+    try:
+        return AnthropicStructuredSafetyClassifier.from_settings(settings)
+    except StructuredSafetyClassifierUnavailable:
+        return UnavailableStructuredSafetyClassifier()
 
 
 class _UnavailableAnswerService:

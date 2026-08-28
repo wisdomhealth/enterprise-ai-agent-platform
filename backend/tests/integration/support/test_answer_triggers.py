@@ -13,6 +13,7 @@ from app.modules.outbox.models import OutboxEvent
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.types import ClaimSupport, ValidatedAnswer
 from app.modules.support.models import Handoff, HandoffTrigger, SensitiveTopic
+from app.modules.support.triggers import SensitiveTopicClassification
 
 
 class RefusalAnswer:
@@ -50,13 +51,72 @@ class ValidAnswer:
 
 
 class SafetyTopicClassifier:
-    async def classify(self, _text: str) -> SensitiveTopic | None:
-        return SensitiveTopic.ACCOUNT_SECURITY
+    async def classify(self, _text: str) -> SensitiveTopicClassification:
+        return SensitiveTopicClassification(sensitive_topic=SensitiveTopic.ACCOUNT_SECURITY)
 
 
 class NoTopicClassifier:
-    async def classify(self, _text: str) -> SensitiveTopic | None:
+    async def classify(self, _text: str) -> SensitiveTopicClassification:
+        return SensitiveTopicClassification(sensitive_topic=None)
+
+
+class _SharedSessionFactory:
+    """Exercise the registered Celery consumer on the fixture transaction."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    def __call__(self) -> "_SharedSessionFactory":
+        return self
+
+    async def __aenter__(self) -> AsyncSession:
+        return self._session
+
+    async def __aexit__(self, *_args: object) -> None:
         return None
+
+
+async def _persist_answer_provenance(
+    db_session: AsyncSession,
+    *,
+    session: ChatSession,
+    sequence: int,
+    actor: ChatActor,
+    event_type: str | None,
+    refused: bool = False,
+) -> ChatMessage:
+    """Create only the durable provenance combinations accepted in production."""
+    message = ChatMessage(
+        session_id=session.id,
+        sequence=sequence,
+        actor=actor,
+        body=f"historical-{sequence}",
+    )
+    db_session.add(message)
+    await db_session.flush()
+    if event_type is not None:
+        payload: dict[str, object] = {
+            "message_id": str(message.id),
+            "sequence": sequence,
+        }
+        if event_type == "chat.answer.refused":
+            payload["refused"] = refused
+        elif event_type == "chat.answer.safe_error":
+            payload.update(
+                {
+                    "code": "CHAT_ANSWER_UNAVAILABLE",
+                    "handoff_recommended": True,
+                    "safe_body": message.body,
+                }
+            )
+        await OutboxService().add(
+            db_session,
+            event_type,
+            "chat_session",
+            session.id,
+            payload,
+        )
+    return message
 
 
 class HumanTakeoverThenFailure:
@@ -144,6 +204,139 @@ async def test_two_persisted_refused_ai_answers_trigger_repeated_failure(
 
 
 @pytest.mark.asyncio
+async def test_current_success_after_prior_refusal_does_not_queue_handoff(
+    db_session: AsyncSession,
+) -> None:
+    """The most recent durable answer, not descending query order, controls reset."""
+    organization = Organization(name=f"Successful reset {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id, public_key=f"public-{uuid4().hex}"
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(organization_id=organization.id, knowledge_base_id=knowledge_base.id)
+    db_session.add(session)
+    await db_session.flush()
+    await _persist_answer_provenance(
+        db_session,
+        session=session,
+        sequence=1,
+        actor=ChatActor.AI,
+        event_type="chat.answer.refused",
+        refused=True,
+    )
+    service = ChatAnswerService(db_session, ValidAnswer())
+    _, job = await service.submit_customer_message(session.id, "Try again")
+    await db_session.commit()
+
+    await service.process(job.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.session_id == session.id))
+    assert handoff is None
+
+
+@pytest.mark.asyncio
+async def test_current_refusal_after_prior_success_is_not_repeated_failure(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"Prior success {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id, public_key=f"public-{uuid4().hex}"
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(organization_id=organization.id, knowledge_base_id=knowledge_base.id)
+    db_session.add(session)
+    await db_session.flush()
+    await _persist_answer_provenance(
+        db_session,
+        session=session,
+        sequence=1,
+        actor=ChatActor.AI,
+        event_type="chat.answer.validated",
+    )
+    service = ChatAnswerService(db_session, RefusalAnswer())
+    _, job = await service.submit_customer_message(session.id, "Try again")
+    await db_session.commit()
+
+    await service.process(job.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.session_id == session.id))
+    assert isinstance(handoff, Handoff)
+    assert handoff.trigger is HandoffTrigger.LOW_CONFIDENCE
+
+
+@pytest.mark.asyncio
+async def test_bare_system_message_does_not_count_as_prior_failure(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"Bare system {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id, public_key=f"public-{uuid4().hex}"
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(organization_id=organization.id, knowledge_base_id=knowledge_base.id)
+    db_session.add(session)
+    await db_session.flush()
+    await _persist_answer_provenance(
+        db_session,
+        session=session,
+        sequence=1,
+        actor=ChatActor.SYSTEM,
+        event_type=None,
+    )
+    service = ChatAnswerService(db_session, RefusalAnswer())
+    _, job = await service.submit_customer_message(session.id, "Try again")
+    await db_session.commit()
+
+    await service.process(job.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.session_id == session.id))
+    assert isinstance(handoff, Handoff)
+    assert handoff.trigger is HandoffTrigger.LOW_CONFIDENCE
+
+
+@pytest.mark.asyncio
+async def test_persisted_safe_error_counts_as_prior_failure(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"Persisted safe error {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id, public_key=f"public-{uuid4().hex}"
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(organization_id=organization.id, knowledge_base_id=knowledge_base.id)
+    db_session.add(session)
+    await db_session.flush()
+    await _persist_answer_provenance(
+        db_session,
+        session=session,
+        sequence=1,
+        actor=ChatActor.SYSTEM,
+        event_type="chat.answer.safe_error",
+    )
+    service = ChatAnswerService(db_session, RefusalAnswer())
+    _, job = await service.submit_customer_message(session.id, "Try again")
+    await db_session.commit()
+
+    await service.process(job.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.session_id == session.id))
+    assert isinstance(handoff, Handoff)
+    assert handoff.trigger is HandoffTrigger.REPEATED_FAILURE
+
+
+@pytest.mark.asyncio
 async def test_structured_classifier_controls_sensitive_topic_handoff(
     db_session: AsyncSession,
 ) -> None:
@@ -165,6 +358,42 @@ async def test_structured_classifier_controls_sensitive_topic_handoff(
     await db_session.commit()
 
     await service.process(job.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.session_id == session.id))
+    assert isinstance(handoff, Handoff)
+    assert handoff.trigger is HandoffTrigger.SENSITIVE_TOPIC
+    assert handoff.sensitive_topic is SensitiveTopic.ACCOUNT_SECURITY
+
+
+@pytest.mark.asyncio
+async def test_registered_worker_uses_structured_classifier_for_sensitive_handoff(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Celery assembly must pass the production classifier into the worker service."""
+    from app.modules.chat import tasks
+
+    organization = Organization(name=f"Worker structured safety {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base = KnowledgeBase(
+        organization_id=organization.id, public_key=f"public-{uuid4().hex}"
+    )
+    db_session.add(knowledge_base)
+    await db_session.flush()
+    session = ChatSession(organization_id=organization.id, knowledge_base_id=knowledge_base.id)
+    db_session.add(session)
+    await db_session.flush()
+    _, job = await ChatAnswerService(db_session, ValidAnswer()).submit_customer_message(
+        session.id, "ordinary text that requires a structured safety decision"
+    )
+    await db_session.commit()
+
+    monkeypatch.setattr(tasks, "async_sessionmaker", _SharedSessionFactory(db_session))
+    monkeypatch.setattr(
+        tasks, "_build_safety_classifier", lambda _settings: SafetyTopicClassifier()
+    )
+
+    await tasks._consume_chat_answer(job.id)
 
     handoff = await db_session.scalar(select(Handoff).where(Handoff.session_id == session.id))
     assert isinstance(handoff, Handoff)

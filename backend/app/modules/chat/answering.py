@@ -139,7 +139,8 @@ class ChatAnswerService:
                 return None
 
             try:
-                sensitive_topic = await self._safety_classifier.classify(message.body)
+                classification = await self._safety_classifier.classify(message.body)
+                sensitive_topic = classification.sensitive_topic
             except Exception:
                 return await self._persist_safe_failure(
                     job,
@@ -191,7 +192,7 @@ class ChatAnswerService:
                 await self._notify(session.id, message.sequence)
                 return None
             persisted = await self._persist_validated_answer(session, answer)
-            trigger = await self._answer_handoff_trigger(session.id, persisted.id, answer)
+            trigger = await self._answer_handoff_trigger(session.id, persisted.id)
             if trigger is not None:
                 await SupportService(self._db_session).request_handoff(session.id, trigger=trigger)
             # The message/outbox inserts and this generation-fenced compare
@@ -253,6 +254,9 @@ class ChatAnswerService:
                     for citation in answer.citations
                 ],
                 "refused": answer.refused,
+                "supported_material_claims": sum(
+                    1 for claim in answer.claims if claim.material
+                ),
                 "handoff_recommended": answer.refused,
                 # Refusal text is visible as a single safe-error event, not
                 # as a segment stream.  Persist its exact customer display
@@ -358,18 +362,34 @@ class ChatAnswerService:
         return int(current or 0) + 1
 
     async def _answer_handoff_trigger(
-        self, session_id: UUID, message_id: UUID, answer: ValidatedAnswer
+        self, session_id: UUID, message_id: UUID
     ) -> HandoffTrigger | None:
-        prior_failures = list(
+        """Evaluate only chronological, message-bound durable answer provenance.
+
+        Chat messages are not proof of an answer outcome: a worker can be
+        interrupted after writing one, or a stale worker can leave a row behind.
+        The matching Outbox event is the durable publication record.  We ignore
+        every unbound, duplicate or malformed candidate so it cannot create a
+        false repeated-failure escalation.
+        """
+        current_sequence = await self._db_session.scalar(
+            select(ChatMessage.sequence).where(
+                ChatMessage.id == message_id,
+                ChatMessage.session_id == session_id,
+            )
+        )
+        if not isinstance(current_sequence, int):
+            return None
+        messages = list(
             (
                 await self._db_session.scalars(
                     select(ChatMessage)
                     .where(
                         ChatMessage.session_id == session_id,
+                        ChatMessage.sequence <= current_sequence,
                         ChatMessage.actor.in_([ChatActor.AI, ChatActor.SYSTEM]),
                     )
-                    .order_by(ChatMessage.sequence.desc())
-                    .limit(2)
+                    .order_by(ChatMessage.sequence)
                 )
             ).all()
         )
@@ -380,32 +400,30 @@ class ChatAnswerService:
                         OutboxEvent.aggregate_type == "chat_session",
                         OutboxEvent.aggregate_id == session_id,
                         OutboxEvent.event_type.in_(
-                            ["chat.answer.refused", "chat.answer.safe_error"]
+                            [
+                                "chat.answer.validated",
+                                "chat.answer.refused",
+                                "chat.answer.safe_error",
+                            ]
                         ),
                     )
                 )
             ).all()
         )
-        refused_message_ids = {
-            str(event.payload.get("message_id"))
-            for event in events
-            if event.event_type == "chat.answer.refused" and event.payload.get("refused") is True
-        }
+        events_by_message_id: dict[str, list[OutboxEvent]] = {}
+        for event in events:
+            raw_message_id = event.payload.get("message_id")
+            if isinstance(raw_message_id, str):
+                events_by_message_id.setdefault(raw_message_id, []).append(event)
         history = [
-            {
-                "refused": (
-                    answer.refused
-                    if message.id == message_id
-                    else str(message.id) in refused_message_ids
-                    or message.actor is ChatActor.SYSTEM
-                ),
-                "supported_material_claims": (
-                    sum(1 for claim in answer.claims if claim.material)
-                    if message.id == message_id
-                    else 1
-                ),
-            }
-            for message in prior_failures
+            turn
+            for message in messages
+            if (
+                turn := _durable_answer_turn(
+                    message, events_by_message_id.get(str(message.id), [])
+                )
+            )
+            is not None
         ]
         return choose_handoff_trigger(history)
 
@@ -434,3 +452,36 @@ def _public_session_principal(session: ChatSession) -> Principal:
         session_id=session.id,
         csrf_hash="",
     )
+
+
+def _durable_answer_turn(
+    message: ChatMessage, candidates: list[OutboxEvent]
+) -> dict[str, object] | None:
+    """Project exactly one valid durable result into trigger history."""
+    matches = [
+        event
+        for event in candidates
+        if event.payload.get("message_id") == str(message.id)
+        and event.payload.get("sequence") == message.sequence
+    ]
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    payload = event.payload
+    if message.actor is ChatActor.AI:
+        if event.event_type == "chat.answer.refused" and payload.get("refused") is True:
+            return {"refused": True, "supported_material_claims": 0}
+        if event.event_type == "chat.answer.validated" and payload.get("refused") is False:
+            supported_claims = payload.get("supported_material_claims", 1)
+            if isinstance(supported_claims, int) and supported_claims >= 0:
+                return {"refused": False, "supported_material_claims": supported_claims}
+        return None
+    if message.actor is ChatActor.SYSTEM:
+        if (
+            event.event_type == "chat.answer.safe_error"
+            and isinstance(payload.get("code"), str)
+            and payload.get("handoff_recommended") is True
+            and payload.get("safe_body") == message.body
+        ):
+            return {"refused": True, "supported_material_claims": 0}
+    return None

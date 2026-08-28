@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     anthropic_model: str = Field(
         default="claude-3-5-sonnet-latest", validation_alias="ANTHROPIC_MODEL"
     )
+    safety_classifier_model: str | None = Field(
+        default=None,
+        validation_alias="SAFETY_CLASSIFIER_MODEL",
+    )
     grounded_refusal_message: str = Field(
         default=(
             "I don't know based on the available information. "
