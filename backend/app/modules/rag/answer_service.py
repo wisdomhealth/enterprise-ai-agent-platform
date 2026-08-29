@@ -1,13 +1,13 @@
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID
 
 from app.core.config import Settings
 from app.core.telemetry import record_grounded_answer
 from app.modules.identity.dependencies import Principal
-from app.modules.rag.citations import project_citations
+from app.modules.rag.citations import citation_from_chunk, project_citations
 from app.modules.rag.groundedness import CitationValidator, GroundednessError
 from app.modules.rag.llm import (
     GeneratedAnswer,
@@ -16,7 +16,13 @@ from app.modules.rag.llm import (
     ProviderTransientError,
 )
 from app.modules.rag.prompts import PROMPT_VERSION, build_grounded_prompt
-from app.modules.rag.types import AnswerAudience, RetrievedChunk, Retriever, ValidatedAnswer
+from app.modules.rag.types import (
+    AnswerAudience,
+    RetrievedChunk,
+    Retriever,
+    SourceCitation,
+    ValidatedAnswer,
+)
 
 _SENTENCES = re.compile(r"(?<=[.!?])\s+")
 _DEFAULT_REFUSAL = (
@@ -30,6 +36,7 @@ class AnswerExecution:
     retrieved_chunks: list[RetrievedChunk]
     retrieval_latency_ms: int
     model_latency_ms: int
+    source_citations: list[SourceCitation] = field(default_factory=list)
 
 
 class GroundedAnswerService:
@@ -182,7 +189,13 @@ class GroundedAnswerService:
             estimated_cost=estimated_cost,
         )
         self._record(audience, generation.model, "validated", answer, len(chunks))
-        return AnswerExecution(answer, chunks, retrieval_latency_ms, model_latency_ms)
+        return AnswerExecution(
+            answer,
+            chunks,
+            retrieval_latency_ms,
+            model_latency_ms,
+            source_citations=[citation_from_chunk(chunk) for chunk in citations],
+        )
 
     def _refusal(
         self,

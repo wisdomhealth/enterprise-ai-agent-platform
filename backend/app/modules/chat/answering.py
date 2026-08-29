@@ -6,7 +6,7 @@ ephemeral Redis hint that causes connected SSE clients to reread PostgreSQL.
 """
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
@@ -25,7 +25,8 @@ from app.modules.jobs.models import ErrorClass, JobIntent
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.outbox.models import OutboxEvent
 from app.modules.outbox.service import OutboxService
-from app.modules.rag.types import AnswerAudience, CustomerCitation, ValidatedAnswer
+from app.modules.rag.answer_service import AnswerExecution
+from app.modules.rag.types import AnswerAudience, CustomerCitation, SourceCitation, ValidatedAnswer
 from app.modules.support.models import HandoffTrigger
 from app.modules.support.service import SupportService
 from app.modules.support.triggers import (
@@ -48,6 +49,16 @@ class CustomerAnswerService(Protocol):
         query: str,
         audience: AnswerAudience,
     ) -> ValidatedAnswer: ...
+
+
+class CustomerAnswerEvidenceService(Protocol):
+    async def answer_with_evidence(
+        self,
+        principal: Principal,
+        knowledge_base_id: UUID,
+        query: str,
+        audience: AnswerAudience,
+    ) -> AnswerExecution: ...
 
 
 class ChatEventPublisher(Protocol):
@@ -160,12 +171,7 @@ class ChatAnswerService:
                 await self._notify(session.id, message.sequence)
                 return None
 
-            answer = await self._answer_service.answer(
-                _public_session_principal(session),
-                session.knowledge_base_id,
-                message.body,
-                AnswerAudience.CUSTOMER,
-            )
+            answer, staff_citations = await self._answer_with_staff_evidence(session, message)
             if not isinstance(answer, ValidatedAnswer):
                 return await self._persist_safe_failure(
                     job,
@@ -191,7 +197,7 @@ class ChatAnswerService:
                 await self._db_session.commit()
                 await self._notify(session.id, message.sequence)
                 return None
-            persisted = await self._persist_validated_answer(session, answer)
+            persisted = await self._persist_validated_answer(session, answer, staff_citations)
             trigger = await self._answer_handoff_trigger(session.id, persisted.id)
             if trigger is not None:
                 await SupportService(self._db_session).request_handoff(session.id, trigger=trigger)
@@ -219,7 +225,10 @@ class ChatAnswerService:
             )
 
     async def _persist_validated_answer(
-        self, session: ChatSession, answer: ValidatedAnswer
+        self,
+        session: ChatSession,
+        answer: ValidatedAnswer,
+        staff_citations: list[SourceCitation],
     ) -> ChatMessage:
         sequence = await self._next_sequence(session.id)
         message = ChatMessage(
@@ -253,6 +262,10 @@ class ChatAnswerService:
                     ).model_dump(mode="json")
                     for citation in answer.citations
                 ],
+                "staff_citations": [
+                    citation.model_dump(mode="json")
+                    for citation in staff_citations
+                ],
                 "refused": answer.refused,
                 "supported_material_claims": sum(
                     1 for claim in answer.claims if claim.material
@@ -272,6 +285,33 @@ class ChatAnswerService:
             },
         )
         return message
+
+    async def _answer_with_staff_evidence(
+        self, session: ChatSession, message: ChatMessage
+    ) -> tuple[object, list[SourceCitation]]:
+        principal = _public_session_principal(session)
+        if callable(getattr(self._answer_service, "answer_with_evidence", None)):
+            evidence_service = cast(CustomerAnswerEvidenceService, self._answer_service)
+            execution = await evidence_service.answer_with_evidence(
+                principal,
+                session.knowledge_base_id,
+                message.body,
+                AnswerAudience.CUSTOMER,
+            )
+            if not isinstance(execution, AnswerExecution):
+                return execution, []
+            return execution.answer, list(execution.source_citations)
+        answer = await self._answer_service.answer(
+            principal,
+            session.knowledge_base_id,
+            message.body,
+            AnswerAudience.CUSTOMER,
+        )
+        return answer, (
+            [citation for citation in answer.citations if isinstance(citation, SourceCitation)]
+            if isinstance(answer, ValidatedAnswer)
+            else []
+        )
 
     async def _persist_safe_failure(
         self,

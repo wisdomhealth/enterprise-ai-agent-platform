@@ -27,12 +27,12 @@ export type SupportConversation = SupportHandoff & {
 };
 
 export type InternalCitation = {
-  document_title: string;
+  title: string;
   section: string | null;
-  page: number | null;
+  page_number: number | null;
   chunk_id: string;
-  version_id: string;
-  drive_url: string | null;
+  document_version_id: string;
+  internal_drive_link: string | null;
 };
 
 export type StaffKnowledgeAnswer = { text: string; citations: InternalCitation[] };

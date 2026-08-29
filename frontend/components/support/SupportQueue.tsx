@@ -39,7 +39,12 @@ export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff
         "handoff" in error &&
         error.handoff !== undefined
       ) {
-        const current = { ...handoff, ...(error.handoff as Partial<SupportHandoff>) };
+        const authoritative = error.handoff as Partial<SupportHandoff>;
+        const current = {
+          ...handoff,
+          state: authoritative.state ?? handoff.state,
+          version: authoritative.version ?? handoff.version,
+        };
         setHandoffs((items) => items.map((item) => (item.id === handoff.id ? current : item)));
         onSelect?.(current);
         setNotice("Already claimed");

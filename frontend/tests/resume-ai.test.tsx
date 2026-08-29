@@ -57,3 +57,36 @@ it("does not show Resume AI for an unclaimed or non-human conversation", () => {
 
   expect(screen.queryByRole("button", { name: "Resume AI" })).not.toBeInTheDocument();
 });
+
+it("renders the authorized transcript citation using the durable source schema", () => {
+  render(
+    <ConversationPanel
+      conversation={{
+        ...humanActiveConversation,
+        messages: [
+          {
+            ...humanActiveConversation.messages[0],
+            actor: "AI",
+            citations: [
+              {
+                chunk_id: "chunk-1",
+                document_version_id: "version-1",
+                title: "Support policy",
+                section: "Response times",
+                page_number: 2,
+                internal_drive_link: "https://drive.google.com/internal-policy",
+              },
+            ],
+          },
+        ],
+      }}
+    />,
+  );
+
+  fireEvent.click(screen.getByText("Internal source: Support policy"));
+  expect(screen.getByText("Version version-1")).toBeVisible();
+  expect(screen.getByRole("link", { name: "Open internal source" })).toHaveAttribute(
+    "href",
+    "https://drive.google.com/internal-policy",
+  );
+});

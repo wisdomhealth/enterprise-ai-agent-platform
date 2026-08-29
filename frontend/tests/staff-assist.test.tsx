@@ -11,12 +11,12 @@ it("shows internal source details as read-only staff reference", async () => {
     text: "The SLA is one business day.",
     citations: [
       {
-        document_title: "Support policy",
+        title: "Support policy",
         section: "Response times",
-        page: 2,
+        page_number: 2,
         chunk_id: "chunk-1",
-        version_id: "version-1",
-        drive_url: "https://drive.example/internal",
+        document_version_id: "version-1",
+        internal_drive_link: "https://drive.example/internal",
       },
     ],
   });

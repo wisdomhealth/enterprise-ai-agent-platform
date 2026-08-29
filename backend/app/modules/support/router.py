@@ -1,10 +1,11 @@
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.chat.models import ChatMessage, ChatSession, ConversationState
+from app.modules.chat.models import ChatActor, ChatMessage, ChatSession, ConversationState
 from app.modules.chat.router import _begin_idempotency, _credential_value, _request_hash
 from app.modules.chat.service import ChatSessionService
 from app.modules.idempotency.models import IdempotencyState
@@ -15,6 +16,8 @@ from app.modules.identity.dependencies import (
     require_staff_csrf,
     require_staff_session,
 )
+from app.modules.outbox.models import OutboxEvent
+from app.modules.rag.types import SourceCitation
 from app.modules.support.models import Handoff, HandoffTrigger
 from app.modules.support.service import SupportAuthorizationError, SupportService, VersionConflict
 
@@ -52,7 +55,7 @@ def _handoff_read(handoff: Handoff) -> dict[str, object]:
 
 
 def _conversation_read(
-    handoff: Handoff, session: ChatSession, messages: list[ChatMessage]
+    handoff: Handoff, session: ChatSession, messages: list[ChatMessage], events: list[OutboxEvent]
 ) -> dict[str, object]:
     """Project only staff-authorized durable context; never a transient worker view."""
 
@@ -73,16 +76,47 @@ def _conversation_read(
                     "body": message.body,
                     "status": message.status.value,
                     "created_at": message.created_at.isoformat(),
-                    # Task 10 customer-answer events deliberately project only
-                    # customer citations. Rich internal sources are supplied by
-                    # the separately authorized Staff Assist query.
-                    "citations": [],
+                    "citations": _approved_staff_citations(message, events),
                 }
                 for message in messages
             ],
         }
     )
     return payload
+
+
+def _approved_staff_citations(
+    message: ChatMessage, events: list[OutboxEvent]
+) -> list[dict[str, object]]:
+    """Project one exact durable chat-answer source list after staff authorization."""
+
+    if message.actor is not ChatActor.AI:
+        return []
+    approved = [
+        event
+        for event in events
+        if event.event_type in {"chat.answer.validated", "chat.answer.refused"}
+        and event.payload.get("message_id") == str(message.id)
+        and event.payload.get("sequence") == message.sequence
+        and (
+            (event.event_type == "chat.answer.validated" and event.payload.get("refused") is False)
+            or (event.event_type == "chat.answer.refused" and event.payload.get("refused") is True)
+        )
+    ]
+    if len(approved) != 1:
+        return []
+    raw_citations = approved[0].payload.get("staff_citations")
+    if not isinstance(raw_citations, list) or not all(
+        isinstance(citation, dict) for citation in raw_citations
+    ):
+        return []
+    try:
+        return [
+            dict(SourceCitation.model_validate(citation).model_dump(mode="json"))
+            for citation in raw_citations
+        ]
+    except ValidationError:
+        return []
 
 
 async def _public_session(
@@ -174,7 +208,20 @@ async def read_conversation(
         handoff, session, messages = await SupportService(db_session).conversation(
             handoff_id, principal
         )
-        return _conversation_read(handoff, session, messages)
+        events = list(
+            (
+                await db_session.scalars(
+                    select(OutboxEvent).where(
+                        OutboxEvent.aggregate_type == "chat_session",
+                        OutboxEvent.aggregate_id == session.id,
+                        OutboxEvent.event_type.in_(
+                            ["chat.answer.validated", "chat.answer.refused"]
+                        ),
+                    )
+                )
+            ).all()
+        )
+        return _conversation_read(handoff, session, messages, events)
     except SupportAuthorizationError:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from None
     except LookupError:

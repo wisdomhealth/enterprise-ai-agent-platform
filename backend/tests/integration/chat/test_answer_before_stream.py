@@ -10,7 +10,8 @@ from app.modules.identity.models import Organization
 from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.models import KnowledgeBase
 from app.modules.outbox.models import OutboxEvent
-from app.modules.rag.types import SourceCitation, ValidatedAnswer
+from app.modules.rag.answer_service import AnswerExecution
+from app.modules.rag.types import CustomerCitation, SourceCitation, ValidatedAnswer
 
 
 class UnvalidatedAnswerService:
@@ -73,6 +74,50 @@ class RefusalWithStaffCitationService:
             input_tokens=1,
             output_tokens=1,
             estimated_cost=0.0,
+        )
+
+
+class ValidatedEvidenceAnswerService:
+    def __init__(self) -> None:
+        self.source = SourceCitation(
+            chunk_id=uuid4(),
+            document_version_id=uuid4(),
+            title="Customer-safe title",
+            section="Overview",
+            page_number=4,
+            internal_drive_link="https://drive.example.internal/private",
+        )
+
+    async def answer(self, *_args: object, **_kwargs: object) -> ValidatedAnswer:
+        raise AssertionError("chat generation must use the evidence-preserving boundary")
+
+    async def answer_with_evidence(
+        self, *_args: object, **_kwargs: object
+    ) -> AnswerExecution:
+        return AnswerExecution(
+            answer=ValidatedAnswer(
+                text="The validated answer.",
+                claims=[],
+                citations=[
+                    CustomerCitation(
+                        title=self.source.title,
+                        section=self.source.section,
+                        page_number=self.source.page_number,
+                    )
+                ],
+                segments=["The validated answer."],
+                refused=False,
+                model="fake",
+                prompt_version="test",
+                latency_ms=1,
+                input_tokens=1,
+                output_tokens=1,
+                estimated_cost=0.0,
+            ),
+            retrieved_chunks=[],
+            retrieval_latency_ms=0,
+            model_latency_ms=0,
+            source_citations=[self.source],
         )
 
 
@@ -153,6 +198,31 @@ async def test_refusal_outbox_persists_exact_safe_body_and_customer_citation_pro
     assert event.payload["citations"] == [
         {"title": "Customer-safe title", "section": "Overview", "page_number": 4}
     ]
+
+
+@pytest.mark.asyncio
+async def test_chat_outbox_persists_staff_sources_separately_from_customer_citations(
+    db_session: AsyncSession,
+) -> None:
+    session = await _session(db_session)
+    answer_service = ValidatedEvidenceAnswerService()
+    service = ChatAnswerService(db_session, answer_service)
+    _, job = await service.submit_customer_message(session.id, "Can you answer this?")
+    await db_session.commit()
+
+    await service.process(job.id)
+
+    event = await db_session.scalar(
+        select(OutboxEvent).where(
+            OutboxEvent.aggregate_id == session.id,
+            OutboxEvent.event_type == "chat.answer.validated",
+        )
+    )
+    assert isinstance(event, OutboxEvent)
+    assert event.payload["citations"] == [
+        {"title": "Customer-safe title", "section": "Overview", "page_number": 4}
+    ]
+    assert event.payload["staff_citations"] == [answer_service.source.model_dump(mode="json")]
 
 
 @pytest.mark.asyncio

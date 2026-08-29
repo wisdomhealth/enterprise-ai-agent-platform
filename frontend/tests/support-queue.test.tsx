@@ -30,7 +30,7 @@ it("refreshes current state after a claim conflict", async () => {
   });
 
   render(<SupportQueue />);
-  fireEvent.click(await screen.findByRole("button", { name: "Claim" }));
+  fireEvent.click((await screen.findAllByRole("button", { name: "Claim" }))[0]);
 
   expect(await screen.findByText("Already claimed")).toBeVisible();
   expect(screen.getByText("Version 4")).toBeVisible();
@@ -51,4 +51,24 @@ it("preserves the claim control focus after a successful claim", async () => {
 
   expect(await screen.findByText("Human active")).toBeVisible();
   expect(screen.getByRole("button", { name: "Conversation session-1" })).toHaveFocus();
+});
+
+it("keeps the conflicted handoff identity when another queue item exists", async () => {
+  const other = { ...queuedHandoff, id: "handoff-2", session_id: "session-2", version: 7 };
+  vi.mocked(listSupportQueue).mockResolvedValue([queuedHandoff, other]);
+  vi.mocked(claimHandoff).mockRejectedValue({
+    status: 409,
+    handoff: { id: "", session_id: "", state: "HUMAN_ACTIVE", version: 4 },
+  });
+  const selected = vi.fn();
+  render(<SupportQueue onSelect={selected} />);
+  fireEvent.click((await screen.findAllByRole("button", { name: "Claim" }))[0]);
+
+  expect(await screen.findByText("Already claimed")).toBeVisible();
+  expect(selected).toHaveBeenCalledWith(
+    expect.objectContaining({ id: "handoff-1", session_id: "session-1", version: 4 }),
+  );
+  expect(screen.getByRole("button", { name: "Conversation session-1" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Conversation session-2" })).toBeVisible();
+  expect(screen.getByText("Version 7")).toBeVisible();
 });

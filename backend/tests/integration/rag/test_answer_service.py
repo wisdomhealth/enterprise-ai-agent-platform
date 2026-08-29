@@ -166,6 +166,43 @@ async def test_customer_answer_projects_citations_only_after_validation() -> Non
 
 
 @pytest.mark.asyncio
+async def test_customer_answer_execution_retains_separate_staff_source_projection() -> None:
+    principal = _principal()
+    chunk = _chunk(principal)
+    fake_llm = FakeLLM(
+        GeneratedAnswer(
+            text="Refunds take five business days.",
+            claims=[
+                ClaimSupport(text="Refunds take five business days.", citation_ids=[chunk.chunk_id])
+            ],
+            model="claude-test",
+            input_tokens=10,
+            output_tokens=8,
+        )
+    )
+
+    execution = await _service(chunk, fake_llm).answer_with_evidence(
+        principal, chunk.knowledge_base_id, "How long do refunds take?", AnswerAudience.CUSTOMER
+    )
+
+    assert execution.answer.citations[0].model_dump(mode="json") == {
+        "title": "Refund policy",
+        "section": "Eligibility",
+        "page_number": 2,
+    }
+    assert [citation.model_dump(mode="json") for citation in execution.source_citations] == [
+        {
+            "chunk_id": str(chunk.chunk_id),
+            "document_version_id": str(chunk.document_version_id),
+            "title": "Refund policy",
+            "section": "Eligibility",
+            "page_number": 2,
+            "internal_drive_link": "https://drive.google.com/private",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_retrieval_result_is_refused_before_citation_projection() -> None:
     principal = _principal()
     chunk = _chunk(principal)

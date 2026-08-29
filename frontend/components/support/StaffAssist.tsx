@@ -42,12 +42,14 @@ export function StaffAssist() {
           <ul aria-label="Internal source details">
             {answer.citations.map((citation) => (
               <li key={citation.chunk_id}>
-                <strong>{citation.document_title}</strong>
+                <strong>{citation.title}</strong>
                 {citation.section ? <span> — {citation.section}</span> : null}
-                {citation.page ? <span> (page {citation.page})</span> : null}
+                {citation.page_number ? <span> (page {citation.page_number})</span> : null}
                 <p>Chunk {citation.chunk_id}</p>
-                <p>Version {citation.version_id}</p>
-                {citation.drive_url ? <a href={citation.drive_url}>Open internal source</a> : null}
+                <p>Version {citation.document_version_id}</p>
+                {citation.internal_drive_link ? (
+                  <a href={citation.internal_drive_link}>Open internal source</a>
+                ) : null}
               </li>
             ))}
           </ul>

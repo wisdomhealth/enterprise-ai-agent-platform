@@ -77,12 +77,14 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
             <p>{message.body}</p>
             {message.citations.map((citation) => (
               <details key={citation.chunk_id}>
-                <summary>Internal source: {citation.document_title}</summary>
+                <summary>Internal source: {citation.title}</summary>
                 <p>Chunk {citation.chunk_id}</p>
-                <p>Version {citation.version_id}</p>
+                <p>Version {citation.document_version_id}</p>
                 {citation.section ? <p>Section {citation.section}</p> : null}
-                {citation.page ? <p>Page {citation.page}</p> : null}
-                {citation.drive_url ? <a href={citation.drive_url}>Open internal source</a> : null}
+                {citation.page_number ? <p>Page {citation.page_number}</p> : null}
+                {citation.internal_drive_link ? (
+                  <a href={citation.internal_drive_link}>Open internal source</a>
+                ) : null}
               </details>
             ))}
           </li>
