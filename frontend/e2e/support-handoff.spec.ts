@@ -1,134 +1,75 @@
 import { expect, test } from "@playwright/test";
 
-test("claim, reply, and explicit Resume AI suppress a pending stale answer", async ({ browser }) => {
+type Fixture = { staff_session_id: string; csrf_token: string; handoff_id: string };
+
+test("live PostgreSQL claim, reply, and explicit Resume AI fence stale output", async ({
+  browser,
+  request,
+}) => {
+  const fixtureResponse = await request.get("http://127.0.0.1:3100/__e2e__/fixture");
+  expect(fixtureResponse.ok()).toBeTruthy();
+  const fixture = (await fixtureResponse.json()) as Fixture;
   const context = await browser.newContext();
   await context.addCookies([
-    { name: "staff_session", value: "staff-session", domain: "127.0.0.1", path: "/" },
-    { name: "staff_csrf", value: "csrf-token", domain: "127.0.0.1", path: "/" },
-  ]);
-  const customer = await context.newPage();
-  const staff = await context.newPage();
-  let state = "AI_ACTIVE";
-  let version = 1;
-  let assignedUserId: string | null = null;
-  let resumeRequests = 0;
-  let releaseSse!: () => void;
-  const resumed = new Promise<void>((resolve) => {
-    releaseSse = resolve;
-  });
-  const messages = [
     {
-      sequence: 1,
-      actor: "CUSTOMER",
-      body: "I need a person",
-      status: "PERSISTED",
-      created_at: "2026-08-29T00:00:00Z",
-      citations: [],
+      name: "staff_session",
+      value: fixture.staff_session_id,
+      domain: "127.0.0.1",
+      path: "/",
     },
-  ];
-  const handoff = () => ({
-    id: "handoff-1",
-    session_id: "session-1",
-    state,
-    trigger: "CUSTOMER_REQUEST",
-    assigned_user_id: assignedUserId,
-    version,
-    last_customer_sequence: 1,
-  });
-
-  await context.route("**/api/v1/public/chat/sessions", async (route) => {
-    await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify({
-        session: {
-          id: "session-1",
-          state: "AI_ACTIVE",
-          version: 1,
-          customer_name: "Ada",
-          customer_email: "ada@example.test",
-          created_at: "2026-08-29T00:00:00Z",
-          messages: [],
-        },
-        credential: { token: "opaque-token", expires_at: "2026-08-30T00:00:00Z" },
-      }),
-    });
-  });
-  await context.route("**/api/v1/public/chat/sessions/session-1/handoff", async (route) => {
-    state = "QUEUED";
-    version += 1;
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(handoff()) });
-  });
-  await context.route("**/api/v1/public/chat/sessions/session-1/events?after=0", async (route) => {
-    await resumed;
-    await route.fulfill({
-      contentType: "text/event-stream",
-      body: `id: 0:t:${version}\nevent: session.state\ndata: {"sequence":0,"state":"AI_ACTIVE","version":${version}}\n\n`,
-    });
-  });
-  await context.route("**/api/v1/staff/support/queue", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify([handoff()]) });
-  });
-  await context.route("**/api/v1/staff/support/handoff-1", async (route) => {
-    await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify({
-        ...handoff(),
-        customer: { name: "Ada", email: "ada@example.test" },
-        summary: "",
-        tool_results: [],
-        messages,
-      }),
-    });
-  });
-  await context.route("**/api/v1/staff/support/handoff-1/claim", async (route) => {
-    state = "HUMAN_ACTIVE";
-    assignedUserId = "staff-1";
-    version += 1;
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(handoff()) });
-  });
-  await context.route("**/api/v1/staff/support/handoff-1/reply", async (route) => {
-    const body = (await route.request().postDataJSON()) as { body: string };
-    version += 1;
-    const message = {
-      sequence: 2,
-      actor: "STAFF",
-      body: body.body,
-      status: "PERSISTED",
-      created_at: "2026-08-29T00:01:00Z",
-      citations: [],
-    };
-    messages.push(message);
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(message) });
-  });
-  await context.route("**/api/v1/staff/support/handoff-1/resume-ai", async (route) => {
-    resumeRequests += 1;
-    state = "AI_ACTIVE";
-    version += 1;
-    releaseSse();
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(handoff()) });
-  });
-
-  await customer.goto("/chat/public-acme");
-  await customer.getByLabel("Name (optional)").fill("Ada");
-  await customer.getByLabel("Email").fill("ada@example.test");
-  await customer.getByRole("button", { name: "Start chat" }).click();
-  await customer.getByRole("button", { name: "Request a person" }).click();
-  await expect(customer.getByText("Your request is queued for a support person.")).toBeVisible();
+    { name: "staff_csrf", value: fixture.csrf_token, domain: "127.0.0.1", path: "/" },
+  ]);
+  const staff = await context.newPage();
 
   await staff.goto("/staff/support");
+  await expect(staff.getByText("Queued")).toBeVisible();
+  const initialVersion = Number((await staff.getByText(/Version /).textContent())?.split(" ")[2]);
   await staff.getByRole("button", { name: "Claim" }).click();
   await expect(staff.getByText("Human active")).toBeVisible();
+
+  const staleClaimStatus = await staff.evaluate(
+    async ({ handoffId, version }) =>
+      (
+        await fetch(`/api/v1/staff/support/${handoffId}/claim`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": "task16-browser-csrf" },
+          body: JSON.stringify({ version }),
+        })
+      ).status,
+    { handoffId: fixture.handoff_id, version: initialVersion },
+  );
+  expect(staleClaimStatus).toBe(409);
+
   await staff.getByLabel("Reply to customer").fill("A human reply");
   await staff.getByRole("button", { name: "Send reply" }).click();
   await expect(staff.getByText("Reply sent.")).toBeVisible();
+  await expect(staff.getByText("A human reply")).toBeVisible();
+
   await staff.getByRole("button", { name: "Resume AI" }).click();
   await expect(staff.getByRole("dialog", { name: "Resume AI confirmation" })).toBeVisible();
-  expect(resumeRequests).toBe(0);
+  const headers = {
+    Cookie: `staff_session=${fixture.staff_session_id}; staff_csrf=${fixture.csrf_token}`,
+    "X-CSRF-Token": fixture.csrf_token,
+  };
+  const beforeResume = await request.get("http://127.0.0.1:3100/__e2e__/state", { headers });
+  expect((await beforeResume.json()).job_state).toBe("PENDING");
+
   await staff.getByRole("button", { name: "Confirm resume AI" }).click();
   await expect(staff.getByText("AI will wait for the next customer message.")).toBeVisible();
-  expect(resumeRequests).toBe(1);
 
-  await expect(customer.getByText("Chat started. An AI assistant is ready to help.")).toBeVisible();
-  await expect(customer.getByText("stale AI answer", { exact: false })).toHaveCount(0);
+  const staleAttempt = await request.post(
+    "http://127.0.0.1:3100/__e2e__/attempt-stale-answer",
+    { headers },
+  );
+  expect(await staleAttempt.json()).toEqual({ published: false, model_calls: 0 });
+  const afterResume = await request.get("http://127.0.0.1:3100/__e2e__/state", { headers });
+  expect(await afterResume.json()).toMatchObject({
+    handoff_state: "AI_ACTIVE",
+    job_state: "FAILED",
+    job_error: "HANDOFF_RESUME_STALE",
+    output_count: 0,
+    answer_event_count: 0,
+  });
+
   await context.close();
 });

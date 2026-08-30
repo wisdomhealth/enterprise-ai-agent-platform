@@ -15,7 +15,7 @@ const stateLabel: Record<SupportHandoff["state"], string> = {
 export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff) => void }) {
   const [handoffs, setHandoffs] = useState<SupportHandoff[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
-  const selectionButton = useRef<HTMLButtonElement>(null);
+  const selectionButtons = useRef(new Map<string, HTMLButtonElement>());
 
   useEffect(() => {
     void listSupportQueue()
@@ -52,7 +52,7 @@ export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff
         setNotice("Unable to claim the conversation.");
       }
     } finally {
-      selectionButton.current?.focus();
+      selectionButtons.current.get(handoff.id)?.focus();
     }
   }
 
@@ -63,7 +63,14 @@ export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff
       <ul aria-label="Queued customer conversations">
         {handoffs.map((handoff) => (
           <li key={handoff.id}>
-            <button ref={selectionButton} type="button" onClick={() => onSelect?.(handoff)}>
+            <button
+              ref={(button) => {
+                if (button === null) selectionButtons.current.delete(handoff.id);
+                else selectionButtons.current.set(handoff.id, button);
+              }}
+              type="button"
+              onClick={() => onSelect?.(handoff)}
+            >
               Conversation {handoff.session_id}
             </button>
             <span> {stateLabel[handoff.state]}</span>

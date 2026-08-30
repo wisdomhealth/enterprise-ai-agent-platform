@@ -76,3 +76,43 @@
   and TypeScript checks passed.
 - The protected Task 7 formatting-only diffs and the pre-existing Task 15
   report remain unstaged and unchanged by this fix round.
+
+## Fix round 2/5
+
+- `ConversationPanel` now synchronizes its local resource state whenever the
+  selected conversation changes, clearing the prior reply draft, notice, and
+  confirmation state. A claim conflict on conversation B therefore renders B's
+  fetched transcript instead of retaining conversation A's local state. A
+  same-conversation version refresh still preserves the just-completed action's
+  accessible result notice.
+- Queue selection controls are tracked by handoff ID. Both successful and
+  conflicting claims restore focus to the control for the operated item rather
+  than whichever item rendered last.
+- Replaced the request-intercepted Playwright state machine with a test-only
+  FastAPI harness backed by the disposable PostgreSQL database. The browser now
+  uses the real staff session/CSRF checks and production support router/service
+  for queue, claim, conflict, detail, reply, and Resume AI. A seeded pending
+  answer job is processed after explicit resume through the real
+  `ChatAnswerService` fence; the test asserts no model call, no AI/SYSTEM
+  message, no answer Outbox event, and durable `HANDOFF_RESUME_STALE` failure.
+- The harness lives only under `backend/tests`, explicitly warns against
+  production use, exposes only local test fixture routes, and contains no real
+  credentials or external-service mutation.
+
+### Fix-round 2 TDD and verification evidence
+
+- RED: multi-item component regressions reproduced the stale A transcript after
+  selecting/conflicting on B and focus landing on the last rendered item before
+  the prop synchronization and per-ID focus fixes.
+- Full frontend Vitest passed `8 files / 17 tests`; ESLint, TypeScript, and the
+  optimized Next.js build passed under the bundled Node 24 runtime.
+- The live Playwright lifecycle passed `1` browser test against local FastAPI and
+  PostgreSQL, including a real `200` claim followed by stale-version `409`, a
+  persisted reply, explicit Resume AI confirmation, and stale-output fencing.
+- Independent PostgreSQL files passed: staff detail `6`, answer publication `5`,
+  Resume AI `2`, atomic claim `2`, SSE recovery/provenance `12`, job leases `18`,
+  RAG answer service `8`, and the new live route/service lifecycle `1`.
+- Scoped Ruff passed; `mypy app` passed for `79` source files; strict mypy passed
+  for both new test harness files; `git diff --check` passed.
+- Protected Task 7 files and the pre-existing Task 15 report remain unstaged and
+  excluded from this round.

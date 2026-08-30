@@ -1,12 +1,22 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 
+import StaffSupportPage from "../app/staff/support/page";
 import { SupportQueue } from "../components/support/SupportQueue";
-import { claimHandoff, listSupportQueue } from "../lib/staff-api";
+import {
+  claimHandoff,
+  getSupportConversation,
+  listSupportQueue,
+  type SupportHandoff,
+} from "../lib/staff-api";
 
 vi.mock("../lib/staff-api", () => ({
   claimHandoff: vi.fn(),
+  getSupportConversation: vi.fn(),
   listSupportQueue: vi.fn(),
+  replyToHandoff: vi.fn(),
+  resumeAi: vi.fn(),
+  searchStaffKnowledge: vi.fn(),
 }));
 
 const queuedHandoff = {
@@ -20,6 +30,7 @@ const queuedHandoff = {
 };
 
 beforeEach(() => {
+  vi.clearAllMocks();
   vi.mocked(listSupportQueue).mockResolvedValue([queuedHandoff]);
 });
 
@@ -71,4 +82,73 @@ it("keeps the conflicted handoff identity when another queue item exists", async
   expect(screen.getByRole("button", { name: "Conversation session-1" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Conversation session-2" })).toBeVisible();
   expect(screen.getByText("Version 7")).toBeVisible();
+});
+
+it.each([
+  {
+    outcome: "success",
+    result: {
+      ...queuedHandoff,
+      state: "HUMAN_ACTIVE" as const,
+      assigned_user_id: "staff-1",
+      version: 4,
+    },
+  },
+  {
+    outcome: "conflict",
+    result: {
+      status: 409,
+      handoff: { state: "HUMAN_ACTIVE" as const, version: 4 },
+    },
+  },
+])("restores focus to the operated queue item after a claim $outcome", async ({ outcome, result }) => {
+  const other = { ...queuedHandoff, id: "handoff-2", session_id: "session-2", version: 7 };
+  vi.mocked(listSupportQueue).mockResolvedValue([queuedHandoff, other]);
+  if (outcome === "success") {
+    vi.mocked(claimHandoff).mockResolvedValue(result as unknown as SupportHandoff);
+  } else {
+    vi.mocked(claimHandoff).mockRejectedValue(result);
+  }
+  render(<SupportQueue />);
+  const claims = await screen.findAllByRole("button", { name: "Claim" });
+  claims[0].focus();
+  fireEvent.click(claims[0]);
+
+  await screen.findByText(outcome === "success" ? "Conversation claimed." : "Already claimed");
+  expect(screen.getByRole("button", { name: "Conversation session-1" })).toHaveFocus();
+  expect(screen.getByRole("button", { name: "Conversation session-2" })).not.toHaveFocus();
+});
+
+it("switches the transcript from A to B after B's claim conflict", async () => {
+  const other = { ...queuedHandoff, id: "handoff-2", session_id: "session-2", version: 7 };
+  vi.mocked(listSupportQueue).mockResolvedValue([queuedHandoff, other]);
+  vi.mocked(claimHandoff).mockRejectedValue({
+    status: 409,
+    handoff: { state: "HUMAN_ACTIVE", version: 8 },
+  });
+  vi.mocked(getSupportConversation).mockImplementation(async (handoffId) => ({
+    ...(handoffId === "handoff-1" ? queuedHandoff : other),
+    customer: { name: handoffId === "handoff-1" ? "Customer A" : "Customer B", email: null },
+    summary: "",
+    tool_results: [],
+    messages: [
+      {
+        sequence: 1,
+        actor: "CUSTOMER",
+        body: handoffId === "handoff-1" ? "Transcript A only" : "Transcript B only",
+        status: "PERSISTED",
+        created_at: "2026-08-29T00:00:00Z",
+        citations: [],
+      },
+    ],
+  }));
+
+  render(<StaffSupportPage />);
+  fireEvent.click(await screen.findByRole("button", { name: "Conversation session-1" }));
+  expect(await screen.findByText("Transcript A only")).toBeVisible();
+  fireEvent.click((await screen.findAllByRole("button", { name: "Claim" }))[1]);
+
+  expect(await screen.findByText("Transcript B only")).toBeVisible();
+  expect(screen.queryByText("Transcript A only")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Conversation session-2" })).toHaveFocus();
 });

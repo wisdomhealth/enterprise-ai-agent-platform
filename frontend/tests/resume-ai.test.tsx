@@ -48,6 +48,19 @@ it("requires explicit confirmation before resuming AI", async () => {
   expect(screen.queryByRole("button", { name: "Resume AI" })).not.toBeInTheDocument();
 });
 
+it("keeps the resume result when the parent refreshes the same conversation", async () => {
+  const resumed = { ...humanActiveConversation, state: "AI_ACTIVE" as const, version: 5 };
+  vi.mocked(resumeAi).mockResolvedValue(resumed);
+  const view = render(<ConversationPanel conversation={humanActiveConversation} />);
+  fireEvent.click(screen.getByRole("button", { name: "Resume AI" }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm resume AI" }));
+  expect(await screen.findByText("AI will wait for the next customer message.")).toBeVisible();
+
+  view.rerender(<ConversationPanel conversation={resumed} />);
+
+  expect(screen.getByText("AI will wait for the next customer message.")).toBeVisible();
+});
+
 it("does not show Resume AI for an unclaimed or non-human conversation", () => {
   render(
     <ConversationPanel

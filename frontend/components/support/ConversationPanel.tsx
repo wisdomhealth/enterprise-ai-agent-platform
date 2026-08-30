@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 import {
   replyToHandoff,
@@ -20,6 +20,16 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
   const [confirmResume, setConfirmResume] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const replyBox = useRef<HTMLTextAreaElement>(null);
+  const selectedConversationId = useRef(conversation.id);
+
+  useEffect(() => {
+    setCurrent(conversation);
+    if (selectedConversationId.current === conversation.id) return;
+    selectedConversationId.current = conversation.id;
+    setReply("");
+    setConfirmResume(false);
+    setNotice(null);
+  }, [conversation]);
 
   const humanOwned = current.state === "HUMAN_ACTIVE" && current.assigned_user_id !== null;
 
