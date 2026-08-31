@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 
 import StaffSupportPage from "../app/staff/support/page";
@@ -7,6 +7,7 @@ import {
   claimHandoff,
   getSupportConversation,
   listSupportQueue,
+  type SupportConversation,
   type SupportHandoff,
 } from "../lib/staff-api";
 
@@ -28,6 +29,33 @@ const queuedHandoff = {
   version: 3,
   last_customer_sequence: 2,
 };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
+function conversation(handoff: SupportHandoff, body: string): SupportConversation {
+  return {
+    ...handoff,
+    customer: { name: body, email: null },
+    summary: "",
+    tool_results: [],
+    messages: [
+      {
+        sequence: 1,
+        actor: "CUSTOMER",
+        body,
+        status: "PERSISTED",
+        created_at: "2026-08-29T00:00:00Z",
+        citations: [],
+      },
+    ],
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -151,4 +179,30 @@ it("switches the transcript from A to B after B's claim conflict", async () => {
   expect(await screen.findByText("Transcript B only")).toBeVisible();
   expect(screen.queryByText("Transcript A only")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Conversation session-2" })).toHaveFocus();
+});
+
+it("keeps B selected when delayed A detail resolves after B's claim conflict", async () => {
+  const other = { ...queuedHandoff, id: "handoff-2", session_id: "session-2", version: 7 };
+  const a = deferred<SupportConversation>();
+  const b = deferred<SupportConversation>();
+  vi.mocked(listSupportQueue).mockResolvedValue([queuedHandoff, other]);
+  vi.mocked(claimHandoff).mockRejectedValue({
+    status: 409,
+    handoff: { state: "HUMAN_ACTIVE", version: 8 },
+  });
+  vi.mocked(getSupportConversation).mockImplementation((handoffId) =>
+    handoffId === "handoff-1" ? a.promise : b.promise,
+  );
+
+  render(<StaffSupportPage />);
+  fireEvent.click(await screen.findByRole("button", { name: "Conversation session-1" }));
+  fireEvent.click((await screen.findAllByRole("button", { name: "Claim" }))[1]);
+  expect(await screen.findByText("Already claimed")).toBeVisible();
+  await act(async () => b.resolve(conversation(other, "Transcript B wins")));
+  expect(await screen.findByText("Transcript B wins")).toBeVisible();
+
+  await act(async () => a.resolve(conversation(queuedHandoff, "Delayed transcript A")));
+
+  expect(screen.getByText("Transcript B wins")).toBeVisible();
+  expect(screen.queryByText("Delayed transcript A")).not.toBeInTheDocument();
 });

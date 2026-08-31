@@ -116,3 +116,44 @@
   for both new test harness files; `git diff --check` passed.
 - Protected Task 7 files and the pre-existing Task 15 report remain unstaged and
   excluded from this round.
+
+## Fix round 3/5
+
+- Staff conversation selection now fences asynchronous detail reads with a
+  latest-selection token. A delayed detail response for conversation A cannot
+  replace conversation B after B is selected through a claim conflict.
+- Same-handoff detail synchronization is version-monotonic in both the page and
+  `ConversationPanel`. Older detail cannot roll back state or remove a locally
+  completed reply/Resume AI result; equal versions merge durable transcript
+  messages by sequence.
+- The browser harness now executes a fail-closed environment guard before any
+  database, FastAPI, or production-app import. It requires the explicit
+  `TASK16_E2E=1` sentinel, exact `APP_ENV=test`, a loopback
+  `postgresql+asyncpg` URL naming the approved disposable database, and no
+  configured provider, Google, Redis, KMS, or connector-file secrets. The
+  Playwright server explicitly clears those variables.
+- Because the guard prevents the test ASGI module from importing outside the
+  approved mode, its `/__e2e__` fixture routes cannot be mounted through this
+  harness in development, staging, or production configuration.
+
+### Fix-round 3 TDD and verification evidence
+
+- RED mutation checks: removing the latest-selection token reproduced delayed
+  A replacing B; replacing the monotonic panel merge with direct prop assignment
+  removed the completed reply and restored Resume AI from the older version.
+  Restoring each minimal fix returned the focused frontend tests to green.
+- Guard RED rejected the incomplete non-test behavior with expected failures;
+  GREEN passed `14` unit/subprocess cases, including proof that unsafe
+  sentinel, environment, and provider-secret failures happen before database or
+  application initialization.
+- Full frontend Vitest passed `8 files / 19 tests`; ESLint, TypeScript, and the
+  optimized Next.js build passed under bundled Node `24.19.0`.
+- Live PostgreSQL verification passed the route/service lifecycle `1`, staff
+  detail/security `6`, answer publication `5`, Resume AI `2`, and atomic claim
+  `2` against the approved disposable `platform_task15_fix` database.
+- Live Playwright passed `1` complete browser lifecycle with real PostgreSQL,
+  real staff session/CSRF enforcement, stale-version `409`, reply persistence,
+  explicit Resume AI, and `HANDOFF_RESUME_STALE` output fencing.
+- Scoped Ruff and strict mypy for the harness/guard/tests passed; `git diff
+  --check` passed. Protected Task 7 files and the pre-existing Task 15 report
+  remain unstaged and excluded from this round.

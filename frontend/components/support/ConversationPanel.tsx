@@ -23,7 +23,17 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
   const selectedConversationId = useRef(conversation.id);
 
   useEffect(() => {
-    setCurrent(conversation);
+    setCurrent((value) => {
+      if (value.id !== conversation.id || conversation.version > value.version) return conversation;
+      if (conversation.version < value.version) return value;
+      const messages = new Map(value.messages.map((message) => [message.sequence, message]));
+      conversation.messages.forEach((message) => messages.set(message.sequence, message));
+      return {
+        ...value,
+        ...conversation,
+        messages: [...messages.values()].sort((left, right) => left.sequence - right.sequence),
+      };
+    });
     if (selectedConversationId.current === conversation.id) return;
     selectedConversationId.current = conversation.id;
     setReply("");

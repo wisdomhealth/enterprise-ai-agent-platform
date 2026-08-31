@@ -2,9 +2,9 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 
 import { ConversationPanel } from "../components/support/ConversationPanel";
-import { resumeAi } from "../lib/staff-api";
+import { replyToHandoff, resumeAi } from "../lib/staff-api";
 
-vi.mock("../lib/staff-api", () => ({ resumeAi: vi.fn() }));
+vi.mock("../lib/staff-api", () => ({ replyToHandoff: vi.fn(), resumeAi: vi.fn() }));
 
 const humanActiveConversation = {
   id: "handoff-1",
@@ -48,7 +48,7 @@ it("requires explicit confirmation before resuming AI", async () => {
   expect(screen.queryByRole("button", { name: "Resume AI" })).not.toBeInTheDocument();
 });
 
-it("keeps the resume result when the parent refreshes the same conversation", async () => {
+it("ignores a delayed older version of the same conversation after Resume AI", async () => {
   const resumed = { ...humanActiveConversation, state: "AI_ACTIVE" as const, version: 5 };
   vi.mocked(resumeAi).mockResolvedValue(resumed);
   const view = render(<ConversationPanel conversation={humanActiveConversation} />);
@@ -56,9 +56,29 @@ it("keeps the resume result when the parent refreshes the same conversation", as
   fireEvent.click(screen.getByRole("button", { name: "Confirm resume AI" }));
   expect(await screen.findByText("AI will wait for the next customer message.")).toBeVisible();
 
-  view.rerender(<ConversationPanel conversation={resumed} />);
+  view.rerender(<ConversationPanel conversation={{ ...humanActiveConversation }} />);
 
   expect(screen.getByText("AI will wait for the next customer message.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Resume AI" })).not.toBeInTheDocument();
+});
+
+it("keeps a reply when an older version of the same conversation arrives", async () => {
+  vi.mocked(replyToHandoff).mockResolvedValue({
+    sequence: 2,
+    actor: "STAFF",
+    body: "Durable staff reply",
+  });
+  const view = render(<ConversationPanel conversation={humanActiveConversation} />);
+  fireEvent.change(screen.getByLabelText("Reply to customer"), {
+    target: { value: "Durable staff reply" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send reply" }));
+  expect(await screen.findByText("Durable staff reply")).toBeVisible();
+
+  view.rerender(<ConversationPanel conversation={{ ...humanActiveConversation }} />);
+
+  expect(screen.getByText("Durable staff reply")).toBeVisible();
+  expect(screen.getByText("Reply sent.")).toBeVisible();
 });
 
 it("does not show Resume AI for an unclaimed or non-human conversation", () => {

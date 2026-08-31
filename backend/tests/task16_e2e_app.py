@@ -4,9 +4,17 @@ It exposes fixture credentials under ``/__e2e__`` while exercising the real
 support router, service, and PostgreSQL lifecycle.
 """
 
+# The fail-closed guard must run before imports that initialize the database or app.
+# ruff: noqa: E402
+
+import os
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID, uuid4
+
+from tests.task16_e2e_guard import validate_task16_e2e_environment
+
+validate_task16_e2e_environment(os.environ)
 
 from fastapi import Depends
 from sqlalchemy import func, select
