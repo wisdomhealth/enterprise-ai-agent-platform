@@ -8,7 +8,11 @@ def create_celery(settings: Settings | None = None) -> Celery:
     broker_url = str(settings.redis_url) if settings.redis_url is not None else "memory://"
     celery_app = Celery("enterprise_ai_agent_platform", broker=broker_url)
     celery_app.conf.update(
-        imports=("app.modules.knowledge.tasks", "app.modules.chat.tasks"),
+        imports=(
+            "app.modules.knowledge.tasks",
+            "app.modules.chat.tasks",
+            "app.modules.email.tasks",
+        ),
         result_backend=None,
         task_ignore_result=True,
         task_acks_late=True,
@@ -25,6 +29,14 @@ def create_celery(settings: Settings | None = None) -> Celery:
             },
             "chat-answer-intent-dispatch": {
                 "task": "app.modules.chat.tasks.dispatch_pending_chat_answer_jobs",
+                "schedule": 60,
+            },
+            "gmail-history-poll": {
+                "task": "app.modules.email.tasks.gmail_history_poll",
+                "schedule": 60,
+            },
+            "email-intent-dispatch": {
+                "task": "app.modules.email.tasks.dispatch_pending_email_jobs",
                 "schedule": 60,
             },
         },

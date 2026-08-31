@@ -8,12 +8,13 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 from app.core.config import Settings
 from app.db.base import Base
-from app.modules.authorization import models as authorization_models  # noqa: F401
 from app.modules.audit import models as audit_models  # noqa: F401
+from app.modules.authorization import models as authorization_models  # noqa: F401
 from app.modules.chat import models as chat_models  # noqa: F401
 from app.modules.connectors import models as connector_models  # noqa: F401
-from app.modules.identity import models  # noqa: F401
+from app.modules.email import models as email_models  # noqa: F401
 from app.modules.idempotency import models as idempotency_models  # noqa: F401
+from app.modules.identity import models  # noqa: F401
 from app.modules.jobs import models as job_models  # noqa: F401
 from app.modules.knowledge import models as knowledge_models  # noqa: F401
 from app.modules.outbox import models as outbox_models  # noqa: F401

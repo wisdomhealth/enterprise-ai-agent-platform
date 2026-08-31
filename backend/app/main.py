@@ -9,6 +9,7 @@ from app.modules.chat.rate_limit import SlidingWindowRateLimiter
 from app.modules.chat.router import router as chat_router
 from app.modules.connectors.router import router as connectors_router
 from app.modules.connectors.service import ConnectorService
+from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
 from app.modules.identity.oidc import configure_google_oidc
 from app.modules.identity.router import router as identity_router
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
@@ -28,6 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.google_oidc_client = None
     app.state.connector_service = ConnectorService.from_settings(settings)
     app.state.drive_gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
+    app.state.gmail_gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
     app.state.chat_rate_limiter = None
     app.state.chat_sse_redis = None
     if settings.redis_url is not None:

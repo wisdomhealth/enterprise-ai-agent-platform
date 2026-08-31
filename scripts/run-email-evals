@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Run fixed email-classification fixtures without external credentials."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+
+PERSIST_DATABASE_URL = os.environ.get("DATABASE_URL")
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+BACKEND_ROOT = SCRIPT_ROOT / "backend"
+PROJECT_PYTHON = BACKEND_ROOT / ".venv" / "bin" / "python"
+if (
+    PROJECT_PYTHON.is_file()
+    and Path(sys.prefix).resolve() != (BACKEND_ROOT / ".venv").resolve()
+):
+    os.execv(
+        str(PROJECT_PYTHON),
+        [str(PROJECT_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://postgres@localhost:5432/platform_test"
+)
+
+from app.modules.email.classification import (
+    EMAIL_CLASSIFICATION_PROMPT_VERSION,
+    ClassificationExecution,
+)
+from app.modules.email.evaluation import (
+    EmailEvaluationRepository,
+    EmailEvaluationRunner,
+    load_email_evaluation_dataset,
+)
+from app.modules.email.models import EmailCategory, EmailPriority
+from app.modules.email.schemas import EmailClassification
+
+
+class DeterministicFakeEmailClassifier:
+    async def classify(self, subject: str, body: str) -> ClassificationExecution:
+        text = f"{subject} {body}".lower()
+        if "lottery" in text or "seo offer" in text:
+            category, priority = EmailCategory.SPAM, EmailPriority.LOW
+        elif "newsletter" in text:
+            category, priority = EmailCategory.INFORMATIONAL, EmailPriority.LOW
+        elif "receipt" in text:
+            category, priority = EmailCategory.INFORMATIONAL, EmailPriority.NORMAL
+        elif "ambiguous" in text:
+            category, priority = EmailCategory.UNKNOWN, EmailPriority.NORMAL
+        elif "invoice overdue" in text or "security alert" in text:
+            category, priority = EmailCategory.ACTION_REQUIRED, EmailPriority.HIGH
+        else:
+            category, priority = EmailCategory.ACTION_REQUIRED, EmailPriority.NORMAL
+        return ClassificationExecution(
+            classification=EmailClassification(
+                category=category,
+                priority=priority,
+                reply_required=category
+                in {
+                    EmailCategory.ACTION_REQUIRED,
+                    EmailCategory.UNKNOWN,
+                },
+            ),
+            model="fake-email-classifier-v1",
+            prompt_version=EMAIL_CLASSIFICATION_PROMPT_VERSION,
+            latency_ms=1,
+            input_tokens=12,
+            output_tokens=4,
+            estimated_cost=0.0,
+        )
+
+
+async def _run(dataset_path: Path, *, persist: bool) -> int:
+    dataset = load_email_evaluation_dataset(dataset_path)
+    if persist:
+        from app.core.database import async_sessionmaker
+
+        async with async_sessionmaker() as session, session.begin():
+            run = await EmailEvaluationRunner(
+                DeterministicFakeEmailClassifier(),
+                EmailEvaluationRepository(session),
+            ).run(dataset)
+    else:
+        run = await EmailEvaluationRunner(DeterministicFakeEmailClassifier()).run(
+            dataset
+        )
+    payload = run.model_dump(mode="json")
+    payload["quality_targets"] = {
+        "macro_f1": 0.85,
+        "structured_output_success": 0.99,
+    }
+    payload["quality_targets_met"] = {
+        "macro_f1": run.macro_f1 >= 0.85,
+        "structured_output_success": run.structured_output_success >= 0.99,
+    }
+    print("safety-release-gates: separate; not evaluated by classification quality")
+    print("quality-targets: informational (not safety release gates)")
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument("--provider", required=True, choices=["fake"])
+    parser.add_argument("--no-persist", action="store_true")
+    args = parser.parse_args()
+    return asyncio.run(
+        _run(args.dataset, persist=bool(PERSIST_DATABASE_URL) and not args.no_persist)
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
