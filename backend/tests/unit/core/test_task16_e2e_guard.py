@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.task16_e2e_guard import validate_task16_e2e_environment
+from tests.task16_e2e_guard import _EXTERNAL_PROVIDER_ENV, validate_task16_e2e_environment
 
 
 def _environment(**overrides: str) -> dict[str, str]:
@@ -83,13 +83,7 @@ def test_unsafe_environment_fails_before_database_or_app_import(
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key
-        not in {
-            "ANTHROPIC_API_KEY",
-            "APP_ENV",
-            "DATABASE_URL",
-            "TASK16_E2E",
-        }
+        if key not in {*_EXTERNAL_PROVIDER_ENV, "APP_ENV", "DATABASE_URL", "TASK16_E2E"}
     }
     environment["DATABASE_URL"] = _environment()["DATABASE_URL"]
     environment.update(updates)
@@ -105,3 +99,57 @@ def test_unsafe_environment_fails_before_database_or_app_import(
     assert result.returncode != 0
     assert message in result.stderr
     assert "DATABASE_URL is required to configure the database" not in result.stderr
+
+
+def test_e2e_app_invokes_guard_before_database_or_application_import() -> None:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {*_EXTERNAL_PROVIDER_ENV, "APP_ENV", "DATABASE_URL", "TASK16_E2E"}
+    }
+    environment.update(_environment())
+    script = """
+import builtins
+import importlib
+
+import tests.task16_e2e_guard as guard
+
+events = []
+real_import = builtins.__import__
+
+class GuardReached(Exception):
+    pass
+
+def record_guard(environ):
+    events.append("guard")
+    raise GuardReached
+
+def track_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name in {"app.core.database", "app.main"}:
+        if events != ["guard"]:
+            raise AssertionError(f"production import occurred before guard: {name}")
+        events.append(name)
+    return real_import(name, globals, locals, fromlist, level)
+
+guard.validate_task16_e2e_environment = record_guard
+builtins.__import__ = track_import
+try:
+    importlib.import_module("tests.task16_e2e_app")
+except GuardReached:
+    pass
+else:
+    raise AssertionError("Task 16 guard was not invoked")
+
+if events != ["guard"]:
+    raise AssertionError(f"unexpected import order: {events}")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[3],
+        env=environment,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

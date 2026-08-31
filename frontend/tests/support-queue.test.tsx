@@ -206,3 +206,40 @@ it("keeps B selected when delayed A detail resolves after B's claim conflict", a
   expect(screen.getByText("Transcript B wins")).toBeVisible();
   expect(screen.queryByText("Delayed transcript A")).not.toBeInTheDocument();
 });
+
+it("unions equal-version detail and then applies a higher version for the selected handoff", async () => {
+  const first = conversation(queuedHandoff, "First durable message");
+  const equal = {
+    ...conversation(queuedHandoff, "Equal-version durable message"),
+    messages: [
+      {
+        ...conversation(queuedHandoff, "Equal-version durable message").messages[0],
+        sequence: 2,
+      },
+    ],
+  };
+  const newer = {
+    ...conversation(
+      { ...queuedHandoff, state: "HUMAN_ACTIVE", assigned_user_id: "staff-1", version: 4 },
+      "Higher-version detail",
+    ),
+  };
+  vi.mocked(getSupportConversation)
+    .mockResolvedValueOnce(first)
+    .mockResolvedValueOnce(equal)
+    .mockResolvedValueOnce(newer);
+
+  render(<StaffSupportPage />);
+  const selection = await screen.findByRole("button", { name: "Conversation session-1" });
+  fireEvent.click(selection);
+  expect(await screen.findByText("First durable message")).toBeVisible();
+
+  fireEvent.click(selection);
+  expect(await screen.findByText("Equal-version durable message")).toBeVisible();
+  expect(screen.getByText("First durable message")).toBeVisible();
+
+  fireEvent.click(selection);
+  expect(await screen.findByText("Higher-version detail")).toBeVisible();
+  expect(screen.queryByText("First durable message")).not.toBeInTheDocument();
+  expect(screen.queryByText("Equal-version durable message")).not.toBeInTheDocument();
+});

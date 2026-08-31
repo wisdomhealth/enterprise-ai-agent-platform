@@ -30,7 +30,6 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
       conversation.messages.forEach((message) => messages.set(message.sequence, message));
       return {
         ...value,
-        ...conversation,
         messages: [...messages.values()].sort((left, right) => left.sequence - right.sequence),
       };
     });

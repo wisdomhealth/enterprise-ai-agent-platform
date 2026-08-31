@@ -157,3 +157,34 @@
 - Scoped Ruff and strict mypy for the harness/guard/tests passed; `git diff
   --check` passed. Protected Task 7 files and the pre-existing Task 15 report
   remain unstaged and excluded from this round.
+
+## Fix round 4/5
+
+- Same-handoff equal-version synchronization now unions durable transcript
+  messages without overwriting the locally completed reply or Resume AI state.
+  A genuinely higher version still replaces the resource in both the staff page
+  and `ConversationPanel`.
+- Added page- and panel-level regressions for equal-version transcript union,
+  completed reply/Resume AI preservation, and higher-version application.
+- The E2E guard test now installs an import-order sentinel in a fresh subprocess:
+  importing `app.core.database` or `app.main` before the guard is invoked fails
+  the test. Every environment variable rejected by the guard is removed from the
+  subprocess environment before explicit test values are added.
+
+### Fix-round 4 TDD and verification evidence
+
+- RED exposed equal version 5 reverting a completed Resume AI action back to
+  `HUMAN_ACTIVE`. The minimal GREEN change keeps equal-version local state and
+  unions messages only.
+- Mutation REDs proved that removing equal-version union failed both page and
+  panel tests, removing higher-version application failed both consumers, and
+  moving the database import ahead of the guard failed the subprocess sentinel.
+- Full frontend Vitest passed `8 files / 22 tests`; ESLint, TypeScript, and the
+  optimized Next.js build passed under the bundled Node 24 runtime.
+- Guard unit/subprocess coverage passed `15`; scoped Ruff and strict mypy passed
+  for the guard, harness, and guard tests.
+- The live PostgreSQL route/service lifecycle passed `1`; live Playwright passed
+  `1` complete claim, stale-version conflict, reply, explicit Resume AI, and
+  stale-output fencing lifecycle against the approved disposable database.
+- Protected Task 7 files and the pre-existing Task 15 report remain unstaged and
+  excluded from this round.

@@ -81,6 +81,64 @@ it("keeps a reply when an older version of the same conversation arrives", async
   expect(screen.getByText("Reply sent.")).toBeVisible();
 });
 
+it("unions an equal-version transcript without removing a completed reply", async () => {
+  vi.mocked(replyToHandoff).mockResolvedValue({
+    sequence: 2,
+    actor: "STAFF",
+    body: "Durable staff reply",
+  });
+  const view = render(<ConversationPanel conversation={humanActiveConversation} />);
+  fireEvent.change(screen.getByLabelText("Reply to customer"), {
+    target: { value: "Durable staff reply" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send reply" }));
+  expect(await screen.findByText("Durable staff reply")).toBeVisible();
+
+  view.rerender(
+    <ConversationPanel
+      conversation={{
+        ...humanActiveConversation,
+        version: 5,
+        messages: [
+          humanActiveConversation.messages[0],
+          {
+            ...humanActiveConversation.messages[0],
+            sequence: 3,
+            actor: "AI",
+            body: "Equal-version durable answer",
+          },
+        ],
+      }}
+    />,
+  );
+
+  expect(screen.getByText("Durable staff reply")).toBeVisible();
+  expect(screen.getByText("Equal-version durable answer")).toBeVisible();
+  expect(screen.getByText("Reply sent.")).toBeVisible();
+});
+
+it("does not roll back Resume AI at equal version and still applies a higher version", async () => {
+  vi.mocked(resumeAi).mockResolvedValue({
+    ...humanActiveConversation,
+    state: "AI_ACTIVE",
+    version: 5,
+  });
+  const view = render(<ConversationPanel conversation={humanActiveConversation} />);
+  fireEvent.click(screen.getByRole("button", { name: "Resume AI" }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm resume AI" }));
+  expect(await screen.findByText("AI will wait for the next customer message.")).toBeVisible();
+
+  view.rerender(<ConversationPanel conversation={{ ...humanActiveConversation, version: 5 }} />);
+  expect(screen.queryByRole("button", { name: "Resume AI" })).not.toBeInTheDocument();
+
+  view.rerender(
+    <ConversationPanel
+      conversation={{ ...humanActiveConversation, version: 6, state: "HUMAN_ACTIVE" }}
+    />,
+  );
+  expect(screen.getByRole("button", { name: "Resume AI" })).toBeVisible();
+});
+
 it("does not show Resume AI for an unclaimed or non-human conversation", () => {
   render(
     <ConversationPanel

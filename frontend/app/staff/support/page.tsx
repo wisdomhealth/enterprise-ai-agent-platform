@@ -28,7 +28,6 @@ export default function StaffSupportPage() {
       selected.messages.forEach((message) => messages.set(message.sequence, message));
       return {
         ...current,
-        ...selected,
         messages: [...messages.values()].sort((left, right) => left.sequence - right.sequence),
       };
     });
