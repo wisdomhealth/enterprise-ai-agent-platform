@@ -59,3 +59,48 @@
 - The protected pre-existing Task 7 changes in `knowledge/drive_gateway.py` and
   `knowledge/service.py`, and the pre-existing Task 15 report, were not modified, staged, or
   included.
+
+## Fix round 1/5 — independent-review findings
+
+Production fix commit: `e37d08e`.
+
+### Changes
+
+- Added append-only migration `0017_email_ingestion_hardening` from the published immutable
+  `0016_email_ingestion`. It grants the production `platform_app` role the Task 17 table privileges
+  required by workers while restricting `email_evaluation_runs` to `SELECT, INSERT`, adds versioned
+  complete classification metrics, and distinguishes nonhuman `SYSTEM` state-history actors.
+- Added a database-authoritative history-job lease heartbeat using the existing `JobLeaseService`.
+  Every execution uses a unique owner, renews only the exact live lease generation, cancels page
+  work on lease loss, and retains final completion/retry fencing so cursor/page changes cannot be
+  committed by a stale worker.
+- Extended evaluation evidence to category, priority, reply-required and exact-match outcomes. The
+  informational quality target now uses their aggregate macro F1, so correct categories cannot hide
+  incorrect priority or reply decisions.
+- Replaced arbitrary employee attribution with a deterministic, purpose- and knowledge-resource-
+  bound email worker principal. Automated state history and redacted audit evidence now retain the
+  actual `JobIntent` ID and system actor identity. Both PostgreSQL vector and FTS authorization
+  branches fail closed for a mismatched resource or purpose.
+- Scoped integration assertions to their own organization, connector, message and work item. This
+  preserves production-wide polling behavior while keeping cross-session durable test evidence from
+  contaminating unrelated assertions.
+
+### Verification
+
+- Fresh authorized PostgreSQL 17 + pgvector database `platform_task17_fix` upgraded from base
+  through `0017_email_ingestion_hardening`; the `0017 -> 0016 -> 0017` round trip passed and
+  `alembic check` reported no pending operations.
+- Real application-role migration verification passed `2` tests: Task 17 worker tables are usable,
+  `email_evaluation_runs` permits append/read and rejects update/delete, and the published `0016`
+  boundary remains unchanged.
+- Real PostgreSQL focused suites passed independently: Gmail ingestion `4`, durable email tasks and
+  lease heartbeat `3`, ingestion recovery/provenance `6`, grounded draft provenance `3`, generic job
+  leases `18`, and system-principal vector/FTS authorization `1` (`2` unrelated deselected).
+- Task 17 unit tests passed `12`. Scoped Ruff passed, strict `mypy app` passed for `90` source files,
+  changed-file format checks passed, and `git diff --check` passed.
+- The credential-free regression evaluator completed with metrics version
+  `email-classification-v2`; persisted readback reported category, priority, reply-required,
+  exact-match, aggregate macro F1 and structured-output success all `1.0`. Quality targets remained
+  explicitly separate from safety release gates.
+- No external Gmail, Google, Anthropic, or OpenAI call was made. The three protected pre-existing
+  files retained their exact hashes throughout the repair.
