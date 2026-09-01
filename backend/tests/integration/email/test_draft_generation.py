@@ -1,15 +1,24 @@
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.audit.models import AuditEvent
+from app.modules.email.actors import email_worker_principal
 from app.modules.email.classification import ClassificationExecution
 from app.modules.email.drafting import EmailDraftingService
 from app.modules.email.ingestion import EmailIngestionService
-from app.modules.email.models import EmailCategory, EmailPriority, EmailState
+from app.modules.email.models import (
+    EmailCategory,
+    EmailPriority,
+    EmailState,
+    EmailStateHistory,
+)
 from app.modules.email.schemas import EmailClassification
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
+from app.modules.jobs.service import JobService
 from app.modules.rag.answer_service import AnswerExecution
 from app.modules.rag.types import (
     AnswerAudience,
@@ -111,16 +120,17 @@ async def test_draft_contains_only_authorized_staff_citations(
     grounded = FakeGroundedAnswerService(
         AnswerExecution(answer, [chunk], retrieval_latency_ms=2, model_latency_ms=7)
     )
-    principal = Principal(
-        subject_id=email_context["staff_user"].id,
-        organization_id=item.organization_id,
-        email="reviewer@example.test",
-        role=UserRole.REVIEWER,
-        session_id=uuid4(),
-        csrf_hash="worker",
+    job = await JobService().enqueue(
+        db_session,
+        "email.draft",
+        f"draft-provenance-{uuid4()}",
+        {"work_item_id": str(item.id)},
     )
+    principal = email_worker_principal(item.organization_id, item.knowledge_base_id, job.id)
 
-    draft = await EmailDraftingService(db_session, grounded, principal).generate(item.id)
+    draft = await EmailDraftingService(db_session, grounded, principal).generate(
+        item.id, job_id=job.id
+    )
 
     assert draft.state is EmailState.AWAITING_REVIEW
     assert draft.citations
@@ -128,6 +138,27 @@ async def test_draft_contains_only_authorized_staff_citations(
     assert grounded.audiences == [AnswerAudience.STAFF]
     assert draft.provenance.model == "claude-draft"
     assert draft.provenance.retrieval_latency_ms == 2
+    assert draft.provenance.retrieval_actor_type == "SYSTEM"
+    history = await db_session.scalar(
+        select(EmailStateHistory).where(
+            EmailStateHistory.work_item_id == item.id,
+            EmailStateHistory.action == "DRAFT_READY",
+        )
+    )
+    audit = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.object_id == item.id,
+            AuditEvent.action == "email.draft.generate",
+        )
+    )
+    assert history is not None
+    assert history.job_id == job.id
+    assert history.actor_type == "SYSTEM"
+    assert history.actor_id == principal.subject_id
+    assert audit is not None
+    assert audit.actor_id == principal.subject_id
+    assert audit.details["actor_type"] == "SYSTEM"
+    assert audit.details["job_id"] == str(job.id)
 
 
 @pytest.mark.asyncio

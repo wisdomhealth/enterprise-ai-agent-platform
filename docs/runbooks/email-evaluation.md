@@ -21,8 +21,9 @@ scripts/run-email-evals \
 ```
 
 The fake provider is deterministic and uses no external credentials. The JSON report records the
-dataset version and SHA-256 digest, model and prompt version, category macro F1, structured-output
-success rate, total latency, input/output tokens, and estimated cost.
+dataset version and SHA-256 digest, model, prompt and metrics version, category/priority/reply-required
+macro F1, exact full-classification match, their aggregate classification macro F1,
+structured-output success rate, total latency, input/output tokens, and estimated cost.
 
 To append the same run evidence to `email_evaluation_runs`, point `DATABASE_URL` at an already
 migrated, isolated PostgreSQL database and omit `--no-persist`. Never point a local run at production.
@@ -38,7 +39,7 @@ scripts/run-email-evals \
 
 The informational quality targets are:
 
-- category macro F1: at least `0.85`
+- aggregate category/priority/reply-required macro F1: at least `0.85`
 - strict structured-output success: at least `0.99`
 
 The runner prints these targets separately from safety release gates. Passing the classification

@@ -47,6 +47,7 @@ class EmailDraftProvenance(BaseModel):
     output_tokens: int = Field(ge=0)
     estimated_cost: float = Field(ge=0)
     retrieval_principal_id: UUID
+    retrieval_actor_type: str = "STAFF"
 
 
 class EmailDraftResult(BaseModel):

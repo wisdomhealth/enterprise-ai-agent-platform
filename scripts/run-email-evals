@@ -91,11 +91,11 @@ async def _run(dataset_path: Path, *, persist: bool) -> int:
         )
     payload = run.model_dump(mode="json")
     payload["quality_targets"] = {
-        "macro_f1": 0.85,
+        "classification_macro_f1": 0.85,
         "structured_output_success": 0.99,
     }
     payload["quality_targets_met"] = {
-        "macro_f1": run.macro_f1 >= 0.85,
+        "classification_macro_f1": run.macro_f1 >= 0.85,
         "structured_output_success": run.structured_output_success >= 0.99,
     }
     print("safety-release-gates: separate; not evaluated by classification quality")

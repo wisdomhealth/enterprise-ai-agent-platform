@@ -13,11 +13,13 @@ from app.modules.email.models import (
     EmailCategory,
     EmailPriority,
     EmailState,
+    EmailStateHistory,
     EmailSyncState,
     EmailWorkItem,
 )
 from app.modules.email.schemas import EmailClassification
 from app.modules.jobs.models import JobIntent
+from app.modules.jobs.service import JobService
 from app.modules.outbox.models import OutboxEvent
 
 
@@ -99,6 +101,8 @@ async def test_cursor_does_not_advance_when_any_message_in_page_rolls_back(
 ) -> None:
     connector = email_context["connector"]
     knowledge_base = email_context["knowledge_base"]
+    connector_id = connector.id
+    organization_id = connector.organization_id
     gateway = FailingSecondMessageGateway(
         [email_context["message"], _second_message(email_context["message"])]
     )
@@ -106,10 +110,22 @@ async def test_cursor_does_not_advance_when_any_message_in_page_rolls_back(
     with pytest.raises(RuntimeError, match="temporary Gmail page failure"):
         await EmailIngestionService(
             db_session, gateway=gateway, classifier=FixedClassifier()
-        ).ingest_history(connector.id, knowledge_base.id)
+        ).ingest_history(connector_id, knowledge_base.id)
 
-    assert await db_session.scalar(select(func.count(EmailWorkItem.id))) == 0
-    assert await db_session.scalar(select(EmailSyncState.history_id)) is None
+    assert (
+        await db_session.scalar(
+            select(func.count(EmailWorkItem.id)).where(
+                EmailWorkItem.organization_id == organization_id
+            )
+        )
+        == 0
+    )
+    assert (
+        await db_session.scalar(
+            select(EmailSyncState.history_id).where(EmailSyncState.connector_id == connector_id)
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -118,17 +134,57 @@ async def test_history_worker_can_defer_page_commit_until_lease_completion(
 ) -> None:
     connector = email_context["connector"]
     knowledge_base = email_context["knowledge_base"]
+    connector_id = connector.id
+    organization_id = connector.organization_id
 
     await EmailIngestionService(
         db_session,
         gateway=FakeGmailGateway([email_context["message"]]),
         classifier=FixedClassifier(),
-    ).ingest_history(connector.id, knowledge_base.id, commit=False)
+    ).ingest_history(connector_id, knowledge_base.id, commit=False)
 
     assert db_session.in_transaction()
     await db_session.rollback()
-    assert await db_session.scalar(select(func.count(EmailWorkItem.id))) == 0
-    assert await db_session.scalar(select(func.count(EmailSyncState.id))) == 0
+    assert (
+        await db_session.scalar(
+            select(func.count(EmailWorkItem.id)).where(
+                EmailWorkItem.organization_id == organization_id
+            )
+        )
+        == 0
+    )
+    assert (
+        await db_session.scalar(
+            select(func.count(EmailSyncState.id)).where(EmailSyncState.connector_id == connector_id)
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_automated_ingestion_history_records_system_actor_and_job(
+    db_session: AsyncSession, email_context: dict[str, object]
+) -> None:
+    connector = email_context["connector"]
+    knowledge_base = email_context["knowledge_base"]
+    job = await JobService().enqueue(
+        db_session,
+        "email.gmail_history",
+        f"history-provenance-{uuid4()}",
+        {"connector_id": str(connector.id)},
+    )
+
+    await EmailIngestionService(
+        db_session,
+        gateway=FakeGmailGateway([email_context["message"]]),
+        classifier=FixedClassifier(),
+    ).ingest_history(connector.id, knowledge_base.id, job_id=job.id)
+
+    histories = list((await db_session.scalars(select(EmailStateHistory))).all())
+    assert histories
+    assert {history.job_id for history in histories} == {job.id}
+    assert {history.actor_type for history in histories} == {"SYSTEM"}
+    assert all(history.actor_id is not None for history in histories)
 
 
 @pytest.mark.asyncio

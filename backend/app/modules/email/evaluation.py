@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
@@ -35,6 +35,9 @@ class AcceptanceDatasetUseError(ValueError):
     pass
 
 
+EMAIL_CLASSIFICATION_METRICS_VERSION = "email-classification-v2"
+
+
 class EmailEvaluationCase(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -64,7 +67,12 @@ class EmailEvaluationRun(BaseModel):
     dataset_digest: str
     model: str
     prompt_version: str
+    metrics_version: str
     macro_f1: float = Field(ge=0, le=1)
+    category_macro_f1: float = Field(ge=0, le=1)
+    priority_macro_f1: float = Field(ge=0, le=1)
+    reply_required_f1: float = Field(ge=0, le=1)
+    exact_match_rate: float = Field(ge=0, le=1)
     structured_output_success: float = Field(ge=0, le=1)
     latency_ms: int = Field(ge=0)
     input_tokens: int = Field(ge=0)
@@ -76,8 +84,8 @@ class EvaluationClassifier(Protocol):
     async def classify(self, subject: str, body: str) -> ClassificationExecution: ...
 
 
-def calculate_macro_f1(
-    expected: Sequence[EmailCategory], predicted: Sequence[EmailCategory]
+def calculate_macro_f1[MetricLabel: Hashable](
+    expected: Sequence[MetricLabel], predicted: Sequence[MetricLabel]
 ) -> float:
     if len(expected) != len(predicted):
         raise ValueError("expected and predicted classifications must have equal length")
@@ -86,9 +94,9 @@ def calculate_macro_f1(
     labels = set(expected) | set(predicted)
     scores: list[float] = []
     for label in labels:
-        true_positive = sum(e is label and p is label for e, p in zip(expected, predicted))
-        false_positive = sum(e is not label and p is label for e, p in zip(expected, predicted))
-        false_negative = sum(e is label and p is not label for e, p in zip(expected, predicted))
+        true_positive = sum(e == label and p == label for e, p in zip(expected, predicted))
+        false_positive = sum(e != label and p == label for e, p in zip(expected, predicted))
+        false_negative = sum(e == label and p != label for e, p in zip(expected, predicted))
         denominator = 2 * true_positive + false_positive + false_negative
         scores.append(2 * true_positive / denominator if denominator else 0.0)
     return sum(scores) / len(scores)
@@ -132,7 +140,12 @@ class EmailEvaluationRepository:
                 dataset_digest=run.dataset_digest,
                 model=run.model,
                 prompt_version=run.prompt_version,
+                metrics_version=run.metrics_version,
                 macro_f1=run.macro_f1,
+                category_macro_f1=run.category_macro_f1,
+                priority_macro_f1=run.priority_macro_f1,
+                reply_required_f1=run.reply_required_f1,
+                exact_match_rate=run.exact_match_rate,
                 structured_output_success=run.structured_output_success,
                 latency_ms=run.latency_ms,
                 input_tokens=run.input_tokens,
@@ -153,22 +166,32 @@ class EmailEvaluationRunner:
         self._repository = repository
 
     async def run(self, dataset: EmailEvaluationDataset) -> EmailEvaluationRun:
-        expected: list[EmailCategory] = []
-        predicted: list[EmailCategory] = []
+        expected_categories: list[EmailCategory] = []
+        predicted_categories: list[EmailCategory] = []
+        expected_priorities: list[EmailPriority] = []
+        predicted_priorities: list[EmailPriority] = []
+        expected_replies: list[bool] = []
+        predicted_replies: list[bool] = []
         successful = 0
         latency_ms = input_tokens = output_tokens = 0
         estimated_cost = 0.0
         model = "unavailable"
         prompt_version = "unavailable"
         for case in dataset.cases:
-            expected.append(case.expected_category)
+            expected_categories.append(case.expected_category)
+            expected_priorities.append(case.expected_priority)
+            expected_replies.append(case.expected_reply_required)
             try:
                 result = await self._classifier.classify(case.subject, case.body)
             except Exception:
-                predicted.append(_always_wrong_label(case.expected_category))
+                predicted_categories.append(_always_wrong_label(case.expected_category))
+                predicted_priorities.append(_always_wrong_priority(case.expected_priority))
+                predicted_replies.append(not case.expected_reply_required)
                 continue
             successful += 1
-            predicted.append(result.classification.category)
+            predicted_categories.append(result.classification.category)
+            predicted_priorities.append(result.classification.priority)
+            predicted_replies.append(result.classification.reply_required)
             latency_ms += result.latency_ms
             input_tokens += result.input_tokens
             output_tokens += result.output_tokens
@@ -176,13 +199,33 @@ class EmailEvaluationRunner:
             model = result.model
             prompt_version = result.prompt_version
         case_count = len(dataset.cases)
+        category_macro_f1 = calculate_macro_f1(expected_categories, predicted_categories)
+        priority_macro_f1 = calculate_macro_f1(expected_priorities, predicted_priorities)
+        reply_required_f1 = calculate_macro_f1(expected_replies, predicted_replies)
+        exact_match_rate = (
+            sum(
+                expected == predicted
+                for expected, predicted in zip(
+                    zip(expected_categories, expected_priorities, expected_replies),
+                    zip(predicted_categories, predicted_priorities, predicted_replies),
+                )
+            )
+            / case_count
+            if case_count
+            else 0.0
+        )
         run = EmailEvaluationRun(
             dataset_version=dataset.version,
             dataset_kind=dataset.kind,
             dataset_digest=dataset.digest,
             model=model,
             prompt_version=prompt_version,
-            macro_f1=calculate_macro_f1(expected, predicted),
+            metrics_version=EMAIL_CLASSIFICATION_METRICS_VERSION,
+            macro_f1=(category_macro_f1 + priority_macro_f1 + reply_required_f1) / 3,
+            category_macro_f1=category_macro_f1,
+            priority_macro_f1=priority_macro_f1,
+            reply_required_f1=reply_required_f1,
+            exact_match_rate=exact_match_rate,
             structured_output_success=(successful / case_count if case_count else 0.0),
             latency_ms=latency_ms,
             input_tokens=input_tokens,
@@ -196,3 +239,7 @@ class EmailEvaluationRunner:
 
 def _always_wrong_label(expected: EmailCategory) -> EmailCategory:
     return EmailCategory.SPAM if expected is not EmailCategory.SPAM else EmailCategory.INFORMATIONAL
+
+
+def _always_wrong_priority(expected: EmailPriority) -> EmailPriority:
+    return EmailPriority.LOW if expected is not EmailPriority.LOW else EmailPriority.HIGH

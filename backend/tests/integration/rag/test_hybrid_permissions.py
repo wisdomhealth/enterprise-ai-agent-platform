@@ -1,9 +1,12 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.authorization.models import ResourceGrant
+from app.modules.email.actors import email_worker_principal
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffSession, StaffUser, UserRole, UserStatus
 from app.modules.knowledge.models import (
@@ -150,3 +153,57 @@ async def test_revoked_current_version_is_excluded_before_each_branch_ranks(db_s
 
     assert vector == []
     assert text == []
+
+
+@pytest.mark.asyncio
+async def test_email_worker_retrieval_is_limited_to_its_bound_knowledge_resource(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"Email RAG worker {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base, chunk = await _retrievable_chunk(
+        db_session,
+        organization,
+        text="policy refund",
+        embedding=[1.0] * 1536,
+    )
+    principal = email_worker_principal(organization.id, knowledge_base.id, uuid4())
+
+    vector = await VectorCandidateSource(db_session).search(
+        principal,
+        knowledge_base.id,
+        "policy",
+        10,
+        query_embedding=[1.0] * 1536,
+    )
+    text = await TextCandidateSource(db_session).search(
+        principal,
+        knowledge_base.id,
+        "policy",
+        10,
+    )
+    wrong_resource = replace(principal, resource_id=uuid4())
+    wrong_purpose = replace(principal, purpose="email.other")
+
+    assert {item.chunk_id for item in vector} == {chunk.id}
+    assert {item.chunk_id for item in text} == {chunk.id}
+    assert (
+        await VectorCandidateSource(db_session).search(
+            wrong_resource,
+            knowledge_base.id,
+            "policy",
+            10,
+            query_embedding=[1.0] * 1536,
+        )
+        == []
+    )
+    assert (
+        await TextCandidateSource(db_session).search(
+            wrong_purpose,
+            knowledge_base.id,
+            "policy",
+            10,
+        )
+        == []
+    )

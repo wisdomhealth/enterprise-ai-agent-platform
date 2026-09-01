@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
+from app.modules.email.actors import EMAIL_SYSTEM_ACTOR_TYPE, email_worker_actor_id
 from app.modules.email.classification import ClassificationExecution, EmailClassifier
 from app.modules.email.gmail_gateway import (
     GmailAuthorizationError,
@@ -67,6 +68,7 @@ class EmailIngestionService:
         organization_id: UUID,
         connector_id: UUID,
         knowledge_base_id: UUID,
+        job_id: UUID | None = None,
     ) -> EmailWorkItem:
         values = {
             "organization_id": organization_id,
@@ -105,7 +107,7 @@ class EmailIngestionService:
             raise RuntimeError("email ingestion did not return the inserted or existing item")
         if inserted_id is None:
             return item
-        await self._classify(item, retrying=False)
+        await self._classify(item, retrying=False, job_id=job_id)
         await self._db_session.flush()
         return item
 
@@ -115,6 +117,7 @@ class EmailIngestionService:
         knowledge_base_id: UUID,
         *,
         commit: bool = True,
+        job_id: UUID | None = None,
     ) -> EmailIngestionResult:
         connector = await self._db_session.scalar(
             select(Connector).where(Connector.id == connector_id).with_for_update()
@@ -141,6 +144,7 @@ class EmailIngestionService:
                     organization_id=connector.organization_id,
                     connector_id=connector.id,
                     knowledge_base_id=knowledge_base_id,
+                    job_id=job_id,
                 )
                 ingested += int(before is None)
             sync_state.pending_page_token = page.next_page_token
@@ -165,7 +169,9 @@ class EmailIngestionService:
             await self._db_session.rollback()
             raise
 
-    async def process_classification(self, work_item_id: UUID) -> EmailWorkItem:
+    async def process_classification(
+        self, work_item_id: UUID, *, job_id: UUID | None = None
+    ) -> EmailWorkItem:
         item = await self._db_session.scalar(
             select(EmailWorkItem).where(EmailWorkItem.id == work_item_id).with_for_update()
         )
@@ -174,10 +180,15 @@ class EmailIngestionService:
         if item.category is not None:
             return item
         if item.state is EmailState.DRAFT_RETRY_WAIT:
-            self._change_state(item, EmailAction.RETRY_DRAFT, reason_code="AUTOMATIC_RETRY")
+            self._change_state(
+                item,
+                EmailAction.RETRY_DRAFT,
+                reason_code="AUTOMATIC_RETRY",
+                job_id=job_id,
+            )
         if item.state is not EmailState.DRAFTING:
             raise ValueError("email classification is not retryable in its current state")
-        await self._classify(item, retrying=True)
+        await self._classify(item, retrying=True, job_id=job_id)
         return item
 
     async def retry_failed_work_item(self, work_item_id: UUID) -> EmailWorkItem:
@@ -194,12 +205,17 @@ class EmailIngestionService:
         await self._db_session.flush()
         return item
 
-    async def _classify(self, item: EmailWorkItem, *, retrying: bool) -> None:
+    async def _classify(self, item: EmailWorkItem, *, retrying: bool, job_id: UUID | None) -> None:
         try:
             execution = await self._classifier.classify(item.subject, item.body)
         except Exception:
             action = EmailAction.DRAFT_FAILED if retrying else EmailAction.CLASSIFICATION_FAILED
-            self._change_state(item, action, reason_code="EMAIL_CLASSIFICATION_FAILED")
+            self._change_state(
+                item,
+                action,
+                reason_code="EMAIL_CLASSIFICATION_FAILED",
+                job_id=job_id,
+            )
             item.last_error_code = "EMAIL_CLASSIFICATION_FAILED"
             await self._enqueue_work(item, kind="email.classify", phase="classification")
             return
@@ -209,10 +225,10 @@ class EmailIngestionService:
             EmailCategory.UNKNOWN,
         }:
             if item.state is EmailState.INGESTED:
-                self._change_state(item, EmailAction.START_DRAFT)
+                self._change_state(item, EmailAction.START_DRAFT, job_id=job_id)
             await self._enqueue_work(item, kind="email.draft", phase="draft")
         elif item.state is EmailState.DRAFTING:
-            self._change_state(item, EmailAction.CLASSIFIED_NO_DRAFT)
+            self._change_state(item, EmailAction.CLASSIFIED_NO_DRAFT, job_id=job_id)
 
     @staticmethod
     def _apply_classification(item: EmailWorkItem, execution: ClassificationExecution) -> None:
@@ -262,6 +278,7 @@ class EmailIngestionService:
         action: EmailAction,
         *,
         reason_code: str | None = None,
+        job_id: UUID | None = None,
     ) -> None:
         before = item.state
         after = transition(before, action)
@@ -275,6 +292,9 @@ class EmailIngestionService:
                 to_state=after,
                 action=action,
                 reason_code=reason_code,
+                actor_id=email_worker_actor_id(item.organization_id),
+                actor_type=EMAIL_SYSTEM_ACTOR_TYPE,
+                job_id=job_id,
                 resource_version=item.version,
             )
         )

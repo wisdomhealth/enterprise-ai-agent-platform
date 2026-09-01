@@ -55,9 +55,7 @@ class JobService:
         job_id = await db_session.scalar(
             insert(JobIntent)
             .values(kind=kind, idempotency_key=idempotency_key, payload=dict(payload))
-            .on_conflict_do_nothing(
-                index_elements=[JobIntent.kind, JobIntent.idempotency_key]
-            )
+            .on_conflict_do_nothing(index_elements=[JobIntent.kind, JobIntent.idempotency_key])
             .returning(JobIntent.id)
         )
         job = await db_session.scalar(
@@ -125,6 +123,37 @@ class JobLeaseService:
             .returning(JobIntent)
         )
 
+    async def renew(
+        self,
+        job_id: UUID,
+        worker_id: str,
+        lease_seconds: int,
+        *,
+        expected_version: int,
+    ) -> JobIntent:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        database_now = func.clock_timestamp()
+        renewed = await self._db_session.scalar(
+            update(JobIntent)
+            .where(
+                JobIntent.id == job_id,
+                JobIntent.state == JobState.RUNNING,
+                JobIntent.lease_owner == worker_id,
+                JobIntent.version == expected_version,
+                JobIntent.lease_expires_at.is_not(None),
+                JobIntent.lease_expires_at > database_now,
+            )
+            .values(
+                lease_expires_at=database_now + timedelta(seconds=lease_seconds),
+                updated_at=database_now,
+            )
+            .returning(JobIntent)
+        )
+        if renewed is None:
+            raise JobLeaseLost(job_id)
+        return renewed
+
     async def complete(
         self, job_id: UUID, worker_id: str, *, expected_version: int | None = None
     ) -> JobIntent:
@@ -181,9 +210,7 @@ class JobLeaseService:
         organization_id: UUID | None = None,
         actor_id: UUID | None = None,
     ) -> JobIntent:
-        if error_class is ErrorClass.SECURITY and (
-            organization_id is None or actor_id is None
-        ):
+        if error_class is ErrorClass.SECURITY and (organization_id is None or actor_id is None):
             raise ValueError("security job failures require organization_id and actor_id")
         database_now = func.clock_timestamp()
         lease_fence = [
@@ -196,9 +223,7 @@ class JobLeaseService:
         if expected_version is not None:
             lease_fence.append(JobIntent.version == expected_version)
         attempts = await self._db_session.scalar(
-            select(JobIntent.attempts)
-            .where(*lease_fence)
-            .with_for_update()
+            select(JobIntent.attempts).where(*lease_fence).with_for_update()
         )
         if attempts is None:
             raise JobLeaseLost(job_id)

@@ -41,6 +41,15 @@ class Principal:
         return subject_id == self.subject_id
 
 
+@dataclass(frozen=True, slots=True)
+class ServicePrincipal(Principal):
+    """Nonhuman principal restricted to one internal purpose and resource."""
+
+    resource_type: str
+    resource_id: UUID
+    purpose: str
+
+
 async def get_db_session() -> AsyncIterator[AsyncSession]:
     async with async_sessionmaker() as session:
         yield session

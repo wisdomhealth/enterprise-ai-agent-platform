@@ -80,7 +80,15 @@ async def test_duplicate_gmail_message_creates_one_work_item(
     )
 
     assert first.id == duplicate.id
-    assert await db_session.scalar(select(func.count(EmailWorkItem.id))) == 1
+    assert (
+        await db_session.scalar(
+            select(func.count(EmailWorkItem.id)).where(
+                EmailWorkItem.organization_id == connector.organization_id,
+                EmailWorkItem.gmail_message_id == message.id,
+            )
+        )
+        == 1
+    )
     assert (
         await db_session.scalar(
             select(func.count(JobIntent.id)).where(
@@ -110,7 +118,12 @@ async def test_ingestion_normalizes_headers_body_and_queues_durable_draft(
     assert item.subject == "Need refund help"
     assert item.body == "First line.\n\nSecond line."
     assert item.state is EmailState.DRAFTING
-    job = await db_session.scalar(select(JobIntent).where(JobIntent.kind == "email.draft"))
+    job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.kind == "email.draft",
+            JobIntent.payload["work_item_id"].astext == str(item.id),
+        )
+    )
     assert job is not None
     assert job.payload == {
         "work_item_id": str(item.id),
@@ -135,7 +148,12 @@ async def test_history_page_persists_messages_and_cursor_together(
     assert result.history_id == "102"
     assert result.ingested == 1
     assert gateway.list_calls == [(None, None)]
-    assert await db_session.scalar(select(func.count(EmailWorkItem.id))) == 1
+    assert (
+        await db_session.scalar(
+            select(func.count(EmailWorkItem.id)).where(EmailWorkItem.connector_id == connector.id)
+        )
+        == 1
+    )
 
 
 async def test_bootstrap_anchor_is_committed_with_each_page_for_crash_safe_resume(

@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.service import AuditService
+from app.modules.email.actors import EMAIL_SYSTEM_ACTOR_TYPE
 from app.modules.email.models import (
     EmailAction,
     EmailState,
@@ -13,7 +14,7 @@ from app.modules.email.models import (
 )
 from app.modules.email.schemas import EmailCitation, EmailDraftProvenance, EmailDraftResult
 from app.modules.email.state_machine import transition
-from app.modules.identity.dependencies import Principal
+from app.modules.identity.dependencies import Principal, ServicePrincipal
 from app.modules.jobs.service import JobService
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.answer_service import AnswerExecution
@@ -54,7 +55,7 @@ class EmailDraftingService:
         self._outbox_service = outbox_service or OutboxService()
         self._audit_service = audit_service or AuditService()
 
-    async def generate(self, work_item_id: UUID) -> EmailDraftResult:
+    async def generate(self, work_item_id: UUID, *, job_id: UUID | None = None) -> EmailDraftResult:
         item = await self._db_session.scalar(
             select(EmailWorkItem).where(EmailWorkItem.id == work_item_id).with_for_update()
         )
@@ -63,7 +64,12 @@ class EmailDraftingService:
         if item.state is EmailState.AWAITING_REVIEW:
             return self._result(item)
         if item.state is EmailState.DRAFT_RETRY_WAIT and item.category is not None:
-            self._change_state(item, EmailAction.RETRY_DRAFT, reason_code="AUTOMATIC_RETRY")
+            self._change_state(
+                item,
+                EmailAction.RETRY_DRAFT,
+                reason_code="AUTOMATIC_RETRY",
+                job_id=job_id,
+            )
         if item.state is not EmailState.DRAFTING:
             raise ValueError("email is not ready for drafting")
         try:
@@ -92,17 +98,18 @@ class EmailDraftingService:
                 output_tokens=execution.answer.output_tokens,
                 estimated_cost=execution.answer.estimated_cost,
                 retrieval_principal_id=self._principal.subject_id,
+                retrieval_actor_type=self._actor_type,
             )
         except _DraftFailure as error:
-            await self._fail(item, error.code)
+            await self._fail(item, error.code, job_id=job_id)
         except Exception:
-            await self._fail(item, "EMAIL_DRAFT_FAILED")
+            await self._fail(item, "EMAIL_DRAFT_FAILED", job_id=job_id)
         else:
             item.draft_body = execution.answer.text
             item.draft_citations = [citation.model_dump(mode="json") for citation in citations]
             item.draft_provenance = provenance.model_dump(mode="json")
             item.last_error_code = None
-            self._change_state(item, EmailAction.DRAFT_READY)
+            self._change_state(item, EmailAction.DRAFT_READY, job_id=job_id)
             await self._outbox_service.add(
                 self._db_session,
                 "email.draft.ready",
@@ -114,25 +121,16 @@ class EmailDraftingService:
                     "version": item.version,
                 },
             )
-            await self._audit_service.record(
-                self._db_session,
-                self._principal,
-                action="email.draft.generate",
-                object_type="email_work_item",
-                object_id=item.id,
-                outcome="SUCCESS",
-                details={"state": item.state.value, "version": item.version},
-                safe_detail_keys={"state", "version"},
-            )
+            await self._record_audit(item, "SUCCESS", job_id=job_id)
         await self._db_session.flush()
         return self._result(item)
 
-    async def _fail(self, item: EmailWorkItem, error_code: str) -> None:
+    async def _fail(self, item: EmailWorkItem, error_code: str, *, job_id: UUID | None) -> None:
         item.draft_body = None
         item.draft_citations = []
         item.draft_provenance = {}
         item.last_error_code = error_code
-        self._change_state(item, EmailAction.DRAFT_FAILED, reason_code=error_code)
+        self._change_state(item, EmailAction.DRAFT_FAILED, reason_code=error_code, job_id=job_id)
         payload: dict[str, object] = {
             "work_item_id": str(item.id),
             "organization_id": str(item.organization_id),
@@ -158,16 +156,7 @@ class EmailDraftingService:
             },
         )
         if self._principal.organization_id == item.organization_id:
-            await self._audit_service.record(
-                self._db_session,
-                self._principal,
-                action="email.draft.generate",
-                object_type="email_work_item",
-                object_id=item.id,
-                outcome="FAILED",
-                details={"error_code": error_code, "state": item.state.value},
-                safe_detail_keys={"error_code", "state"},
-            )
+            await self._record_audit(item, "FAILED", job_id=job_id, error_code=error_code)
 
     def _change_state(
         self,
@@ -175,6 +164,7 @@ class EmailDraftingService:
         action: EmailAction,
         *,
         reason_code: str | None = None,
+        job_id: UUID | None = None,
     ) -> None:
         before = item.state
         item.state = transition(before, action)
@@ -188,8 +178,56 @@ class EmailDraftingService:
                 action=action,
                 reason_code=reason_code,
                 actor_id=self._principal.subject_id,
+                actor_type=self._actor_type,
+                job_id=job_id,
                 resource_version=item.version,
             )
+        )
+
+    @property
+    def _actor_type(self) -> str:
+        return EMAIL_SYSTEM_ACTOR_TYPE if isinstance(self._principal, ServicePrincipal) else "STAFF"
+
+    async def _record_audit(
+        self,
+        item: EmailWorkItem,
+        outcome: str,
+        *,
+        job_id: UUID | None,
+        error_code: str | None = None,
+    ) -> None:
+        details: dict[str, object] = {
+            "actor_type": self._actor_type,
+            "state": item.state.value,
+            "version": item.version,
+        }
+        if job_id is not None:
+            details["job_id"] = str(job_id)
+        if error_code is not None:
+            details["error_code"] = error_code
+        safe_keys = {"actor_type", "state", "version", "job_id", "error_code"}
+        if isinstance(self._principal, ServicePrincipal):
+            await self._audit_service.record_actor(
+                self._db_session,
+                organization_id=item.organization_id,
+                actor_id=self._principal.subject_id,
+                action="email.draft.generate",
+                object_type="email_work_item",
+                object_id=item.id,
+                outcome=outcome,
+                details=details,
+                safe_detail_keys=safe_keys,
+            )
+            return
+        await self._audit_service.record(
+            self._db_session,
+            self._principal,
+            action="email.draft.generate",
+            object_type="email_work_item",
+            object_id=item.id,
+            outcome=outcome,
+            details=details,
+            safe_detail_keys=safe_keys,
         )
 
     @staticmethod

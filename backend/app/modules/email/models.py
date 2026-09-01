@@ -142,7 +142,12 @@ class EmailWorkItem(Base):
 
 class EmailStateHistory(Base):
     __tablename__ = "email_state_history"
-    __table_args__ = (Index("ix_email_state_history_item", "work_item_id", "created_at"),)
+    __table_args__ = (
+        CheckConstraint(
+            "actor_type IN ('SYSTEM', 'STAFF')", name="ck_email_state_history_actor_type"
+        ),
+        Index("ix_email_state_history_item", "work_item_id", "created_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
@@ -172,8 +177,10 @@ class EmailStateHistory(Base):
     reason_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
     actor_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
-        ForeignKey("staff_users.id", ondelete="SET NULL"),
         nullable=True,
+    )
+    actor_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="SYSTEM", server_default=text("'SYSTEM'")
     )
     job_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
@@ -229,6 +236,28 @@ class EmailEvaluationRun(Base):
             "structured_output_success >= 0 AND structured_output_success <= 1",
             name="ck_email_eval_structured_success",
         ),
+        CheckConstraint(
+            "category_macro_f1 IS NULL OR (category_macro_f1 >= 0 AND category_macro_f1 <= 1)",
+            name="ck_email_eval_category_macro_f1",
+        ),
+        CheckConstraint(
+            "priority_macro_f1 IS NULL OR (priority_macro_f1 >= 0 AND priority_macro_f1 <= 1)",
+            name="ck_email_eval_priority_macro_f1",
+        ),
+        CheckConstraint(
+            "reply_required_f1 IS NULL OR (reply_required_f1 >= 0 AND reply_required_f1 <= 1)",
+            name="ck_email_eval_reply_required_f1",
+        ),
+        CheckConstraint(
+            "exact_match_rate IS NULL OR (exact_match_rate >= 0 AND exact_match_rate <= 1)",
+            name="ck_email_eval_exact_match_rate",
+        ),
+        CheckConstraint(
+            "metrics_version <> 'email-classification-v2' OR "
+            "(category_macro_f1 IS NOT NULL AND priority_macro_f1 IS NOT NULL AND "
+            "reply_required_f1 IS NOT NULL AND exact_match_rate IS NOT NULL)",
+            name="ck_email_eval_complete_v2_metrics",
+        ),
         Index("ix_email_evaluation_runs_created", "created_at"),
     )
 
@@ -243,7 +272,14 @@ class EmailEvaluationRun(Base):
     dataset_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(200), nullable=False)
+    metrics_version: Mapped[str] = mapped_column(
+        String(100), nullable=False, server_default=text("'email-category-only-v1'")
+    )
     macro_f1: Mapped[float] = mapped_column(Float, nullable=False)
+    category_macro_f1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    priority_macro_f1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reply_required_f1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exact_match_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     structured_output_success: Mapped[float] = mapped_column(Float, nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)

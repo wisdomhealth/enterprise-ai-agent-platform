@@ -1,11 +1,11 @@
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import Select, and_, select
+from sqlalchemy import Select, and_, false, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.authorization.models import ResourceGrant
-from app.modules.identity.dependencies import Principal
+from app.modules.identity.dependencies import Principal, ServicePrincipal
 from app.modules.knowledge.models import (
     Document,
     DocumentChunk,
@@ -84,13 +84,22 @@ class VectorCandidateSource:
 def _authorized_chunks_query(
     principal: Principal, knowledge_base_id: UUID
 ) -> Select[tuple[DocumentChunk, DocumentVersion, Document]]:
-    return (
+    query = (
         select(DocumentChunk, DocumentVersion, Document)
         .join(DocumentVersion, DocumentVersion.id == DocumentChunk.document_version_id)
         .join(Document, Document.id == DocumentVersion.document_id)
         .join(DriveSource, DriveSource.id == Document.source_id)
         .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
-        .join(
+    )
+    if isinstance(principal, ServicePrincipal):
+        if (
+            principal.resource_type != "knowledge"
+            or principal.resource_id != knowledge_base_id
+            or principal.purpose != "email.draft"
+        ):
+            query = query.where(false())
+    else:
+        query = query.join(
             ResourceGrant,
             and_(
                 ResourceGrant.organization_id == principal.organization_id,
@@ -100,16 +109,15 @@ def _authorized_chunks_query(
                 ResourceGrant.actions.contains(["knowledge.read"]),
             ),
         )
-        .where(
-            Document.organization_id == principal.organization_id,
-            Document.knowledge_base_id == knowledge_base_id,
-            KnowledgeBase.organization_id == principal.organization_id,
-            DocumentVersion.state == DocumentVersionState.RETRIEVABLE,
-            Document.current_version_id == DocumentVersion.id,
-            DriveSource.organization_id == principal.organization_id,
-            DriveSource.knowledge_base_id == knowledge_base_id,
-            DriveSource.status == DriveSourceStatus.ACTIVE,
-        )
+    return query.where(
+        Document.organization_id == principal.organization_id,
+        Document.knowledge_base_id == knowledge_base_id,
+        KnowledgeBase.organization_id == principal.organization_id,
+        DocumentVersion.state == DocumentVersionState.RETRIEVABLE,
+        Document.current_version_id == DocumentVersion.id,
+        DriveSource.organization_id == principal.organization_id,
+        DriveSource.knowledge_base_id == knowledge_base_id,
+        DriveSource.status == DriveSourceStatus.ACTIVE,
     )
 
 
