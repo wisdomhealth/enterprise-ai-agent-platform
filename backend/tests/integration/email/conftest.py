@@ -6,13 +6,11 @@ from uuid import uuid4
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.connectors.models import (
-    Connector,
-    ConnectorKind,
-    ConnectorSecret,
-    ConnectorStatus,
-)
+from app.modules.authorization.models import ResourceGrant
+from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
 from app.modules.email.gmail_gateway import GmailMessage
+from app.modules.email.models import EmailDraftVersion, EmailState, EmailWorkItem
+from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffUser, UserRole, UserStatus
 from app.modules.knowledge.models import KnowledgeBase
 
@@ -74,4 +72,91 @@ async def email_context(
         "staff_user": staff_user,
         "message": message,
         "tmp_path": tmp_path,
+    }
+
+
+@pytest_asyncio.fixture
+async def email_review_context(
+    db_session: AsyncSession, email_context: dict[str, object]
+) -> AsyncIterator[dict[str, object]]:
+    organization = email_context["organization"]
+    knowledge_base = email_context["knowledge_base"]
+    connector = email_context["connector"]
+    staff_user = email_context["staff_user"]
+    db_session.add(
+        ResourceGrant(
+            organization_id=organization.id,
+            subject_id=staff_user.id,
+            resource_type="knowledge",
+            resource_id=knowledge_base.id,
+            actions=["knowledge.review"],
+        )
+    )
+    item = EmailWorkItem(
+        organization_id=organization.id,
+        connector_id=connector.id,
+        knowledge_base_id=knowledge_base.id,
+        gmail_message_id=f"review-{uuid4().hex}",
+        gmail_thread_id="thread-review-1",
+        sender="customer@example.test",
+        recipients=["support@example.test"],
+        subject="Need help",
+        body="Please help with this request.",
+        received_at=datetime(2026, 9, 1, 8, 30, tzinfo=UTC),
+        raw_content_ref="gmail://fixture/review",
+        state=EmailState.AWAITING_REVIEW,
+        draft_body="Original grounded draft.",
+        draft_citations=[],
+        draft_provenance={
+            "model": "claude-fixture",
+            "prompt_version": "email-draft-v1",
+            "retrieval_chunk_ids": [],
+            "retrieval_document_version_ids": [],
+            "retrieval_latency_ms": 1,
+            "model_latency_ms": 1,
+            "end_to_end_latency_ms": 2,
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "estimated_cost": 0.0,
+            "retrieval_principal_id": str(staff_user.id),
+            "retrieval_actor_type": "STAFF",
+        },
+        version=3,
+    )
+    db_session.add(item)
+    await db_session.flush()
+    draft = EmailDraftVersion(
+        work_item_id=item.id,
+        organization_id=item.organization_id,
+        version=1,
+        body=item.draft_body,
+        to=["customer@example.test"],
+        cc=[],
+        subject="Re: Need help",
+        thread_id=item.gmail_thread_id,
+        reviewer_instruction=None,
+        model="claude-fixture",
+        prompt_version="email-draft-v1",
+        retrieval_config={"retrieval_chunk_ids": []},
+        citations=[],
+        created_by_id=staff_user.id,
+        creator_type="STAFF",
+    )
+    db_session.add(draft)
+    await db_session.flush()
+    item.current_draft_id = draft.id
+    await db_session.flush()
+    principal = Principal(
+        staff_user.id,
+        organization.id,
+        staff_user.email,
+        staff_user.role,
+        uuid4(),
+        "fixture-csrf",
+    )
+    yield {
+        **email_context,
+        "item": item,
+        "draft": draft,
+        "principal": principal,
     }

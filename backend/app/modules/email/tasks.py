@@ -278,7 +278,9 @@ async def _renew_history_lease(job_id: UUID, execution_owner: str, expected_vers
             await heartbeat_session.commit()
 
 
-async def _consume_history(db_session, job: JobIntent, settings: Settings) -> bool:  # type: ignore[no-untyped-def]
+async def _consume_history(
+    db_session: AsyncSession, job: JobIntent, settings: Settings
+) -> bool:
     connector_service = ConnectorService.from_settings(settings)
     gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
     if connector_service is None or gateway_factory is None:
@@ -299,9 +301,9 @@ async def _consume_history(db_session, job: JobIntent, settings: Settings) -> bo
 
 
 async def _consume_classification(
-    db_session,
+    db_session: AsyncSession,
     job: JobIntent,
-    settings: Settings,  # type: ignore[no-untyped-def]
+    settings: Settings,
 ) -> None:
     await EmailIngestionService(
         db_session, classifier=_build_classifier(settings)
@@ -309,9 +311,9 @@ async def _consume_classification(
 
 
 async def _consume_draft(
-    db_session,
+    db_session: AsyncSession,
     job: JobIntent,
-    settings: Settings,  # type: ignore[no-untyped-def]
+    settings: Settings,
 ) -> None:
     item_id = UUID(str(job.payload["work_item_id"]))
     item = await db_session.get(EmailWorkItem, item_id)

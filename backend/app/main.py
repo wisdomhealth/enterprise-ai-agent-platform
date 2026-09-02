@@ -10,6 +10,7 @@ from app.modules.chat.router import router as chat_router
 from app.modules.connectors.router import router as connectors_router
 from app.modules.connectors.service import ConnectorService
 from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
+from app.modules.email.router import router as email_router
 from app.modules.identity.oidc import configure_google_oidc
 from app.modules.identity.router import router as identity_router
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
@@ -75,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(chat_router)
     app.include_router(support_public_router)
     app.include_router(support_staff_router)
+    app.include_router(email_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

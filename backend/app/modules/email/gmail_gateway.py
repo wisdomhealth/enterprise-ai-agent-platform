@@ -197,7 +197,7 @@ class GoogleGmailGatewayFactory:
         )
 
     async def create(self, *, refresh_token: str) -> GmailConnection:
-        credentials = Credentials(
+        credentials = Credentials(  # type: ignore[no-untyped-call]
             token=None,
             refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",

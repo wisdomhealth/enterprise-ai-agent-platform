@@ -12,6 +12,11 @@ _TRANSITIONS: dict[tuple[EmailState, EmailAction], EmailState] = {
     (EmailState.DRAFTING, EmailAction.DRAFT_READY): EmailState.AWAITING_REVIEW,
     (EmailState.DRAFTING, EmailAction.DRAFT_FAILED): EmailState.DRAFT_RETRY_WAIT,
     (EmailState.DRAFT_RETRY_WAIT, EmailAction.RETRY_DRAFT): EmailState.DRAFTING,
+    (EmailState.AWAITING_REVIEW, EmailAction.START_DRAFT): EmailState.DRAFTING,
+    (EmailState.AWAITING_REVIEW, EmailAction.DRAFT_READY): EmailState.AWAITING_REVIEW,
+    (EmailState.APPROVED, EmailAction.DRAFT_READY): EmailState.AWAITING_REVIEW,
+    (EmailState.AWAITING_REVIEW, EmailAction.APPROVE): EmailState.APPROVED,
+    (EmailState.AWAITING_REVIEW, EmailAction.REJECT): EmailState.REJECTED,
 }
 
 

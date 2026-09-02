@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.modules.jobs.models import JobIntent
 
 
 class EmailState(StrEnum):
@@ -73,6 +74,7 @@ class EmailWorkItem(Base):
         CheckConstraint("version > 0", name="ck_email_work_items_version_positive"),
         Index("ix_email_work_items_queue", "organization_id", "state", "received_at"),
         Index("ix_email_work_items_connector", "connector_id", "received_at"),
+        Index("ix_email_work_items_current_draft", "current_draft_id"),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -129,6 +131,16 @@ class EmailWorkItem(Base):
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     last_error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    current_draft_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey(
+            "email_draft_versions.id",
+            name="fk_email_work_items_current_draft",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
     version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")
     )
@@ -138,6 +150,104 @@ class EmailWorkItem(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class EmailDraftVersion(Base):
+    __tablename__ = "email_draft_versions"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="ck_email_draft_versions_version_positive"),
+        CheckConstraint(
+            "creator_type IN ('SYSTEM', 'STAFF')", name="ck_email_draft_versions_creator_type"
+        ),
+        UniqueConstraint(
+            "work_item_id", "version", name="uq_email_draft_versions_item_version"
+        ),
+        Index("ix_email_draft_versions_item_created", "work_item_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    work_item_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_work_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    to: Mapped[list[str]] = mapped_column("to_recipients", JSONB, nullable=False)
+    cc: Mapped[list[str]] = mapped_column(
+        "cc_recipients", JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    reviewer_instruction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(200), nullable=False)
+    retrieval_config: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    citations: Mapped[list[dict[str, object]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    created_by_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
+    creator_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="SYSTEM", server_default=text("'SYSTEM'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class EmailApproval(Base):
+    __tablename__ = "email_approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "invalidated_at IS NULL OR invalidated_at >= approved_at",
+            name="ck_email_approvals_invalidation_order",
+        ),
+        UniqueConstraint("draft_version_id", name="uq_email_approvals_draft_version"),
+        Index("ix_email_approvals_item_active", "work_item_id", "invalidated_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    work_item_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_work_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    draft_version_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_draft_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    reviewer_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("staff_users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    approved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class EmailStateHistory(Base):
@@ -184,7 +294,7 @@ class EmailStateHistory(Base):
     )
     job_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
-        ForeignKey("job_intents.id", ondelete="SET NULL"),
+        ForeignKey(JobIntent.id, ondelete="SET NULL"),
         nullable=True,
     )
     resource_version: Mapped[int] = mapped_column(Integer, nullable=False)

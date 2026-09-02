@@ -29,6 +29,32 @@ def test_0017_round_trip_preserves_the_published_0016_boundary() -> None:
     assert restore.returncode == 0, restore.stderr
 
 
+def test_0018_round_trip_creates_current_draft_index() -> None:
+    upgrade = _run_alembic("upgrade", "0018_email_review")
+    assert upgrade.returncode == 0, upgrade.stderr
+
+    import asyncpg
+
+    async def index_exists() -> bool:
+        connection = await asyncpg.connect(_owner_dsn())
+        try:
+            return bool(
+                await connection.fetchval(
+                    "SELECT to_regclass('public.ix_email_work_items_current_draft') IS NOT NULL"
+                )
+            )
+        finally:
+            await connection.close()
+
+    import asyncio
+
+    assert asyncio.run(index_exists())
+    downgrade = _run_alembic("downgrade", "0017_email_ingestion_hardening")
+    assert downgrade.returncode == 0, downgrade.stderr
+    restore = _run_alembic("upgrade", "0018_email_review")
+    assert restore.returncode == 0, restore.stderr
+
+
 def _owner_dsn() -> str:
     return os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
 

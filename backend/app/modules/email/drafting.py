@@ -12,6 +12,7 @@ from app.modules.email.models import (
     EmailStateHistory,
     EmailWorkItem,
 )
+from app.modules.email.review import persist_generated_draft_version
 from app.modules.email.schemas import EmailCitation, EmailDraftProvenance, EmailDraftResult
 from app.modules.email.state_machine import transition
 from app.modules.identity.dependencies import Principal, ServicePrincipal
@@ -55,7 +56,13 @@ class EmailDraftingService:
         self._outbox_service = outbox_service or OutboxService()
         self._audit_service = audit_service or AuditService()
 
-    async def generate(self, work_item_id: UUID, *, job_id: UUID | None = None) -> EmailDraftResult:
+    async def generate(
+        self,
+        work_item_id: UUID,
+        *,
+        job_id: UUID | None = None,
+        reviewer_instruction: str | None = None,
+    ) -> EmailDraftResult:
         item = await self._db_session.scalar(
             select(EmailWorkItem).where(EmailWorkItem.id == work_item_id).with_for_update()
         )
@@ -110,6 +117,12 @@ class EmailDraftingService:
             item.draft_provenance = provenance.model_dump(mode="json")
             item.last_error_code = None
             self._change_state(item, EmailAction.DRAFT_READY, job_id=job_id)
+            draft_version = await persist_generated_draft_version(
+                self._db_session,
+                item,
+                self._principal,
+                reviewer_instruction=reviewer_instruction,
+            )
             await self._outbox_service.add(
                 self._db_session,
                 "email.draft.ready",
@@ -119,6 +132,7 @@ class EmailDraftingService:
                     "organization_id": str(item.organization_id),
                     "state": item.state.value,
                     "version": item.version,
+                    "draft_version_id": str(draft_version.id),
                 },
             )
             await self._record_audit(item, "SUCCESS", job_id=job_id)
