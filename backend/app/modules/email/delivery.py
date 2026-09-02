@@ -262,6 +262,15 @@ class EmailDeliveryService:
         try:
             gateway = await self._resolve_gateway(item)
             raw_message = _build_mime(draft, intent.deterministic_message_id)
+            # Keep the database-authoritative claim locked from the final
+            # provider-I/O fence through result publication.  A concurrent
+            # expired-lease takeover can therefore happen either before this
+            # boundary (and reject this worker) or after its transaction, but
+            # never between validation and the Gmail call.
+            await self._lock_active_delivery_job(claimed_job)
+        except JobLeaseLost:
+            await db_session.rollback()
+            raise
         except Exception:
             return await self._record_failure(
                 intent,
@@ -349,6 +358,7 @@ class EmailDeliveryService:
         self, intent: DeliveryIntent, job: JobIntent
     ) -> DeliveryIntent:
         assert self._db_session is not None
+        await self._lock_active_delivery_job(job)
         locked_intent = await self._db_session.scalar(
             select(DeliveryIntent)
             .where(
@@ -369,7 +379,6 @@ class EmailDeliveryService:
             actor_type="SYSTEM",
             job_id=job.id,
         )
-        await self._db_session.commit()
         return intent
 
     async def _intent_for_job(self, job: JobIntent) -> DeliveryIntent:
@@ -387,6 +396,10 @@ class EmailDeliveryService:
         self, intent: DeliveryIntent, job: JobIntent
     ) -> tuple[DeliveryIntent, EmailWorkItem, EmailDraftVersion, DeliveryAttempt]:
         assert self._db_session is not None
+        # Lock the live job generation before touching any delivery state.  The
+        # lock and all intent/attempt writes commit together, making a lease
+        # takeover race-safe rather than an application-level pre-check.
+        await self._lock_active_delivery_job(job)
         item = await self._db_session.scalar(
             select(EmailWorkItem).where(EmailWorkItem.id == intent.work_item_id).with_for_update()
         )
@@ -451,6 +464,28 @@ class EmailDeliveryService:
         )
         await self._db_session.flush()
         return claimed, item, draft, attempt
+
+    async def _lock_active_delivery_job(self, job: JobIntent) -> JobIntent:
+        assert self._db_session is not None
+        job_id = job.id
+        locked = await self._db_session.scalar(
+            select(JobIntent)
+            .where(
+                JobIntent.id == job.id,
+                JobIntent.kind == EMAIL_DELIVERY_KIND,
+                JobIntent.state == JobState.RUNNING,
+                JobIntent.lease_owner == self._worker_id,
+                JobIntent.version == job.version,
+                JobIntent.lease_expires_at.is_not(None),
+                JobIntent.lease_expires_at > func.clock_timestamp(),
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked is None:
+            await self._db_session.rollback()
+            raise JobLeaseLost(job_id)
+        return locked
 
     async def _record_success(
         self,

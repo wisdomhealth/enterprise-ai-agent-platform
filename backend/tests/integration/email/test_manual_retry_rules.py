@@ -8,6 +8,7 @@ from app.modules.email.delivery import EmailDeliveryService
 from app.modules.email.models import DeliveryAttempt, DeliveryIntent, EmailState
 from app.modules.email.review import EmailReviewService
 from app.modules.jobs.models import JobIntent, JobState
+from app.modules.outbox.models import OutboxEvent
 
 
 @pytest.mark.asyncio
@@ -34,6 +35,13 @@ async def test_definitive_failure_and_manual_retry_use_same_state_machine(
 
     pending = await service.request_retry(intent.id, email_review_context["principal"])
     assert pending.state is EmailState.SEND_PENDING
+    retry_event = await db_session.scalar(
+        select(OutboxEvent).where(
+            OutboxEvent.event_type == "email.delivery.retry_requested",
+            OutboxEvent.aggregate_id == intent.id,
+        )
+    )
+    assert retry_event is not None and retry_event.published_at is None
     gateway.mode = "success"
     sent = await EmailDeliveryService(db_session, gateway, worker_id="worker-b").send(intent.job_id)
 

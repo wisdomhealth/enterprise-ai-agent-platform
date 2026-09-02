@@ -22,10 +22,11 @@ from app.modules.email.delivery import EMAIL_DELIVERY_KIND, EmailDeliveryService
 from app.modules.email.drafting import EmailDraftingService
 from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
 from app.modules.email.ingestion import EmailIngestionService
-from app.modules.email.models import EmailSyncState, EmailWorkItem
+from app.modules.email.models import DeliveryIntent, EmailSyncState, EmailWorkItem
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.knowledge.models import KnowledgeBase
+from app.modules.outbox.models import OutboxEvent, ProcessedEvent
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.answer_service import GroundedAnswerService
 
@@ -33,6 +34,11 @@ EMAIL_HISTORY_KIND = "email.gmail_history"
 EMAIL_CLASSIFY_KIND = "email.classify"
 EMAIL_DRAFT_KIND = "email.draft"
 EMAIL_JOB_TASK_NAME = "app.modules.email.tasks.email_job"
+EMAIL_DELIVERY_OUTBOX_TASK_NAME = "app.modules.email.tasks.email_delivery_outbox_event"
+EMAIL_DELIVERY_OUTBOX_CONSUMER = "email-delivery-requested-v1"
+EMAIL_DELIVERY_OUTBOX_EVENT_TYPES = frozenset(
+    {"email.delivery.requested", "email.delivery.retry_requested"}
+)
 EMAIL_WORKER_ID = "celery-email"
 EMAIL_LEASE_SECONDS = 300
 
@@ -45,6 +51,25 @@ class _UnavailableEmailClassifier:
 @shared_task(name=EMAIL_JOB_TASK_NAME)  # type: ignore[untyped-decorator]
 def email_job(job_id: str) -> None:
     asyncio.run(_consume_email_job(UUID(job_id)))
+
+
+@shared_task(  # type: ignore[untyped-decorator]
+    name=EMAIL_DELIVERY_OUTBOX_TASK_NAME,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=5,
+)
+def email_delivery_outbox_event(event_id: str) -> None:
+    """Consume one durable delivery request with bounded broker retries."""
+    asyncio.run(_consume_email_delivery_outbox_event(UUID(event_id)))
+
+
+@shared_task(  # type: ignore[untyped-decorator]
+    name="app.modules.email.tasks.dispatch_pending_email_delivery_outbox_events"
+)
+def dispatch_pending_email_delivery_outbox_events() -> None:
+    """Redeliver durable email intents left pending across restart/failure."""
+    asyncio.run(_dispatch_pending_email_delivery_outbox_events())
 
 
 @shared_task(name="app.modules.email.tasks.gmail_history_poll")  # type: ignore[untyped-decorator]
@@ -194,21 +219,112 @@ async def _dispatch_pending_email_jobs() -> None:
         email_job.delay(str(job_id))
 
 
+async def _dispatch_email_delivery_outbox_event(
+    event_id: UUID, *, db_session: AsyncSession | None = None
+) -> bool:
+    """Publish one durable delivery event and mark it only after broker acceptance."""
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            return await _dispatch_email_delivery_outbox_event(
+                event_id, db_session=owned_session
+            )
+    event = await db_session.scalar(
+        select(OutboxEvent)
+        .where(OutboxEvent.event_id == event_id)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    if (
+        event is None
+        or event.event_type not in EMAIL_DELIVERY_OUTBOX_EVENT_TYPES
+        or event.aggregate_type != "email_delivery_intent"
+        or event.published_at is not None
+    ):
+        return False
+    try:
+        email_delivery_outbox_event.delay(str(event.event_id))
+    except Exception:
+        event.publish_attempts += 1
+        await db_session.commit()
+        raise
+    event.publish_attempts += 1
+    event.published_at = func.clock_timestamp()
+    await db_session.commit()
+    return True
+
+
+async def _dispatch_pending_email_delivery_outbox_events(
+    *, db_session: AsyncSession | None = None
+) -> None:
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            await _dispatch_pending_email_delivery_outbox_events(db_session=owned_session)
+            return
+    event_ids = list(
+        (
+            await db_session.scalars(
+                select(OutboxEvent.event_id)
+                .where(
+                    OutboxEvent.event_type.in_(EMAIL_DELIVERY_OUTBOX_EVENT_TYPES),
+                    OutboxEvent.aggregate_type == "email_delivery_intent",
+                    OutboxEvent.published_at.is_(None),
+                )
+                .order_by(OutboxEvent.occurred_at, OutboxEvent.event_id)
+            )
+        ).all()
+    )
+    for event_id in event_ids:
+        await _dispatch_email_delivery_outbox_event(event_id, db_session=db_session)
+
+
+async def _consume_email_delivery_outbox_event(event_id: UUID) -> bool:
+    """Idempotently connect one Outbox event to the durable delivery consumer."""
+    settings = Settings()
+    async with async_sessionmaker() as db_session:
+        event = await db_session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_id == event_id,
+                OutboxEvent.event_type.in_(EMAIL_DELIVERY_OUTBOX_EVENT_TYPES),
+                OutboxEvent.aggregate_type == "email_delivery_intent",
+            )
+        )
+        if event is None:
+            return False
+        first_delivery = await OutboxService().begin_processing(
+            db_session, EMAIL_DELIVERY_OUTBOX_CONSUMER, event.event_id
+        )
+        if not first_delivery:
+            await db_session.rollback()
+            return False
+        intent = await db_session.get(DeliveryIntent, event.aggregate_id)
+        if intent is None:
+            raise LookupError("email delivery intent not found")
+        if event.payload.get("delivery_intent_id") != str(intent.id):
+            raise ValueError("delivery Outbox event identity mismatch")
+        if event.payload.get("organization_id") != str(intent.organization_id):
+            raise ValueError("delivery Outbox organization mismatch")
+        await _consume_delivery_job(db_session, intent.job_id, settings)
+        # ``EmailDeliveryService`` commits its durable claim before Gmail I/O;
+        # on terminal/idempotent paths this explicit commit makes the consumer
+        # marker equally durable.  A rolled-back competing claim leaves no
+        # false ProcessedEvent and the JobIntent sweep remains authoritative.
+        await db_session.commit()
+        processed = await db_session.get(
+            ProcessedEvent,
+            {
+                "consumer_name": EMAIL_DELIVERY_OUTBOX_CONSUMER,
+                "event_id": event.event_id,
+            },
+        )
+        return processed is not None
+
+
 async def _consume_email_job(job_id: UUID) -> None:
     settings = Settings()
     async with async_sessionmaker() as db_session:
         pending_job = await db_session.get(JobIntent, job_id)
         if pending_job is not None and pending_job.kind == EMAIL_DELIVERY_KIND:
-            connector_service = ConnectorService.from_settings(settings)
-            gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
-            if connector_service is None or gateway_factory is None:
-                raise RuntimeError("Gmail delivery settings are incomplete")
-            await EmailDeliveryService(
-                db_session,
-                worker_id=f"{EMAIL_WORKER_ID}:{uuid4()}",
-                connector_service=connector_service,
-                gateway_factory=gateway_factory,
-            ).send(job_id)
+            await _consume_delivery_job(db_session, job_id, settings)
             return
         lease_service = JobLeaseService(db_session)
         execution_owner = f"{EMAIL_WORKER_ID}:{uuid4()}"
@@ -262,6 +378,21 @@ async def _consume_email_job(job_id: UUID) -> None:
             )
             await db_session.commit()
             raise
+
+
+async def _consume_delivery_job(
+    db_session: AsyncSession, job_id: UUID, settings: Settings
+) -> None:
+    connector_service = ConnectorService.from_settings(settings)
+    gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
+    if connector_service is None or gateway_factory is None:
+        raise RuntimeError("Gmail delivery settings are incomplete")
+    await EmailDeliveryService(
+        db_session,
+        worker_id=f"{EMAIL_WORKER_ID}:{uuid4()}",
+        connector_service=connector_service,
+        gateway_factory=gateway_factory,
+    ).send(job_id)
 
 
 async def _consume_history_with_lease_renewal(

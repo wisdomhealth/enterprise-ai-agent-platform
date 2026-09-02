@@ -39,6 +39,13 @@ def create_celery(settings: Settings | None = None) -> Celery:
                 "task": "app.modules.email.tasks.dispatch_pending_email_jobs",
                 "schedule": 60,
             },
+            "email-delivery-outbox-dispatch": {
+                "task": (
+                    "app.modules.email.tasks."
+                    "dispatch_pending_email_delivery_outbox_events"
+                ),
+                "schedule": 60,
+            },
         },
     )
     return celery_app
