@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from sqlalchemy.engine import make_url
 
 BACKEND_DIR = Path(__file__).resolve().parents[3]
 
@@ -60,7 +61,9 @@ def _owner_dsn() -> str:
 
 
 def _application_dsn() -> str:
-    return _owner_dsn().replace("postgres@", "platform_app@", 1)
+    return make_url(_owner_dsn()).set(username="platform_app").render_as_string(
+        hide_password=False
+    )
 
 
 @pytest.mark.asyncio
@@ -76,6 +79,7 @@ async def test_application_role_can_use_email_tables_but_evaluation_runs_are_app
     history_id = uuid4()
     run_id = uuid4()
     try:
+        assert await app.fetchval("SELECT current_user") == "platform_app"
         await owner.execute(
             "INSERT INTO organizations (id, name) VALUES ($1, 'Email privilege owner')",
             organization_id,
