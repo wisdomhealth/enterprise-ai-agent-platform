@@ -3,7 +3,7 @@ from collections.abc import Awaitable, Callable
 from hashlib import sha256
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +15,8 @@ from app.modules.email.delivery import (
     ReconciliationRequired,
 )
 from app.modules.email.drafting import EmailDraftingService
+from app.modules.email.models import EmailState
+from app.modules.email.reads import EmailReadAuthorizationError, EmailReadService
 from app.modules.email.reconciliation import ReconciliationService
 from app.modules.email.review import (
     EmailReviewAuthorizationError,
@@ -22,6 +24,7 @@ from app.modules.email.review import (
     EmailReviewResult,
     EmailReviewService,
 )
+from app.modules.email.schemas import StaffEmailDetail, StaffEmailQueueItem
 from app.modules.idempotency.models import IdempotencyState
 from app.modules.idempotency.service import (
     IdempotencyConflict,
@@ -29,9 +32,40 @@ from app.modules.idempotency.service import (
     IdempotencyLeaseLost,
     IdempotencyService,
 )
-from app.modules.identity.dependencies import Principal, get_db_session, require_staff_csrf
+from app.modules.identity.dependencies import (
+    Principal,
+    get_db_session,
+    require_staff_csrf,
+    require_staff_session,
+)
 
 router = APIRouter(prefix="/api/v1/staff/email", tags=["email-review"])
+
+
+@router.get("", response_model=list[StaffEmailQueueItem])
+async def list_email_queue(
+    states: list[EmailState] | None = Query(default=None, alias="state"),
+    principal: Principal = Depends(require_staff_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, object]]:
+    try:
+        return await EmailReadService(db_session, principal).queue(states)
+    except EmailReadAuthorizationError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from None
+
+
+@router.get("/{work_item_id}", response_model=StaffEmailDetail)
+async def read_email_detail(
+    work_item_id: UUID,
+    principal: Principal = Depends(require_staff_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    try:
+        return await EmailReadService(db_session, principal).detail(work_item_id)
+    except EmailReadAuthorizationError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from None
+    except LookupError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from None
 
 
 class ReviewActionPayload(BaseModel):

@@ -1,4 +1,4 @@
-"""Fail-closed environment gate for the Task 16 test-only ASGI harness."""
+"""Fail-closed environment gate for the Task 16/20 test-only ASGI harness."""
 
 from collections.abc import Mapping
 from urllib.parse import unquote, urlsplit
@@ -35,9 +35,10 @@ def validate_task16_e2e_environment(environ: Mapping[str, str]) -> str:
     if parsed.hostname is None or parsed.hostname.lower() not in _LOOPBACK_HOSTS:
         raise RuntimeError("Task 16 test harness requires a loopback database host")
     database_name = unquote(parsed.path.removeprefix("/"))
-    disposable_name = database_name.startswith(("test_", "task16_")) or (
-        database_name == "platform_task15_fix"
-    )
+    disposable_name = database_name.startswith(("test_", "task16_")) or database_name in {
+        "platform_task15_fix",
+        "platform_task20_fix",
+    }
     if not disposable_name or "/" in database_name or parsed.query or parsed.fragment:
         raise RuntimeError("Task 16 test harness requires a disposable database name")
 

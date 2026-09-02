@@ -1,3 +1,5 @@
+from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
@@ -59,3 +61,101 @@ class EmailDraftResult(BaseModel):
     citations: list[EmailCitation]
     provenance: EmailDraftProvenance | None
     error_code: str | None = None
+
+
+class StaffEmailQueueItem(BaseModel):
+    """Safe staff-facing projection of an email work item."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    state: EmailState
+    version: int = Field(ge=1)
+    sender: str
+    subject: str
+    received_at: datetime
+    category: EmailCategory | None
+    priority: EmailPriority | None
+
+
+class StaffEmailCitation(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    title: str
+    section: str | None
+    page_number: int | None
+    chunk_id: UUID
+    document_version_id: UUID
+    internal_drive_link: str | None
+
+
+class StaffEmailApproval(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    approved_at: datetime
+    invalidated_at: datetime | None
+
+
+class StaffEmailDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    version: int = Field(ge=1)
+    body: str
+    to: list[str]
+    cc: list[str]
+    subject: str
+    thread_id: str
+    reviewer_instruction: str | None
+    model: str
+    prompt_version: str
+    created_at: datetime
+    citations: list[StaffEmailCitation]
+    approval: StaffEmailApproval | None
+
+
+class StaffEmailAuditTransition(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    from_state: EmailState
+    to_state: EmailState
+    action: str
+    reason_code: str | None
+    actor_type: Literal["SYSTEM", "STAFF"]
+    created_at: datetime
+
+
+class StaffEmailDeliveryAttempt(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    attempt_number: int = Field(ge=1)
+    outcome: Literal["IN_PROGRESS", "SENT", "DEFINITIVE_FAILURE", "UNKNOWN"]
+    error_code: str | None
+    started_at: datetime
+    completed_at: datetime | None
+
+
+class StaffEmailDelivery(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    state: EmailState
+    version: int = Field(ge=1)
+    deterministic_message_id: str
+    last_error_code: str | None
+    attempts: list[StaffEmailDeliveryAttempt]
+
+
+class StaffEmailDetail(StaffEmailQueueItem):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    recipients: list[str]
+    body: str
+    reply_required: bool | None
+    classification_rationale: str
+    current_draft_id: UUID | None
+    drafts: list[StaffEmailDraft]
+    audit_transitions: list[StaffEmailAuditTransition]
+    delivery: StaffEmailDelivery | None
