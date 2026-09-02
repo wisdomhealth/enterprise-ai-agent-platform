@@ -13,7 +13,7 @@ from app.modules.authorization.policy import AuthorizationDenied, AuthorizationS
 from app.modules.authorization.types import ResourceRef, ResourceState
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
-from app.modules.jobs.models import JobIntent, JobState
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobService
 from app.modules.knowledge.models import (
     Document,
@@ -198,6 +198,15 @@ class DriveSyncOperations:
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "JOB_NOT_RETRYABLE", "state": job.state.value},
             )
+        if job.error_class is not ErrorClass.RETRYABLE:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "JOB_NOT_RETRYABLE",
+                    "state": job.state.value,
+                    "error_class": job.error_class.value if job.error_class is not None else None,
+                },
+            )
         database_now = func.clock_timestamp()
         retried = await self._db_session.scalar(
             update(JobIntent)
@@ -205,6 +214,7 @@ class DriveSyncOperations:
                 JobIntent.id == job.id,
                 JobIntent.state == JobState.FAILED,
                 JobIntent.version == job.version,
+                JobIntent.error_class == ErrorClass.RETRYABLE,
             )
             .values(
                 state=JobState.PENDING,

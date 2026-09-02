@@ -3,6 +3,7 @@
 import { useState } from "react";
 
 import { AdminFailedJob } from "../../lib/staff-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { formatUtc, statusLabel } from "./format";
 
 export function JobFailures({
@@ -39,13 +40,14 @@ export function JobFailures({
         ))}
       </ul>
       {pending ? (
-        <div role="dialog" aria-label={`${pending.action === "RETRY_DRIVE_SYNC" ? "Retry Drive sync" : "Retry email delivery"} confirmation`}>
+        <ConfirmDialog
+          label={`${pending.action === "RETRY_DRIVE_SYNC" ? "Retry Drive sync" : "Retry email delivery"} confirmation`}
+          confirmLabel="Confirm retry"
+          onConfirm={() => void onRetry(pending.job_id).finally(() => setPending(null))}
+          onCancel={() => setPending(null)}
+        >
           <p>Retry through the owning domain state machine?</p>
-          <button type="button" onClick={() => void onRetry(pending.job_id).finally(() => setPending(null))}>
-            Confirm retry
-          </button>
-          <button type="button" onClick={() => setPending(null)}>Cancel</button>
-        </div>
+        </ConfirmDialog>
       ) : null}
     </section>
   );

@@ -3,6 +3,7 @@
 import { useState } from "react";
 
 import { AdminConnectorStatus } from "../../lib/staff-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { formatUtc, statusLabel } from "./format";
 
 export function ConnectorStatus({
@@ -31,18 +32,16 @@ export function ConnectorStatus({
         ))}
       </ul>
       {pending ? (
-        <div role="dialog" aria-label={`Reauthorize ${pending.kind === "GMAIL" ? "Gmail" : "Google Drive"} confirmation`}>
+        <ConfirmDialog
+          label={`Reauthorize ${pending.kind === "GMAIL" ? "Gmail" : "Google Drive"} confirmation`}
+          confirmLabel="Continue to Google"
+          onConfirm={() => {
+            void onReauthorize(pending.id).finally(() => setPending(null));
+          }}
+          onCancel={() => setPending(null)}
+        >
           <p>Continue to Google to rotate this connector&apos;s authorization.</p>
-          <button
-            type="button"
-            onClick={() => {
-              void onReauthorize(pending.id).finally(() => setPending(null));
-            }}
-          >
-            Continue to Google
-          </button>
-          <button type="button" onClick={() => setPending(null)}>Cancel</button>
-        </div>
+        </ConfirmDialog>
       ) : null}
     </section>
   );

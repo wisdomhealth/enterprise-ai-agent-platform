@@ -388,7 +388,7 @@ export type AdminOperationsSummary = {
 export type AdminFailedJob = {
   job_id: string;
   kind: string;
-  state: "FAILED" | "RECONCILIATION";
+  state: "PENDING" | "FAILED" | "RECONCILIATION";
   attempts: number;
   error_code: string | null;
   updated_at: string;

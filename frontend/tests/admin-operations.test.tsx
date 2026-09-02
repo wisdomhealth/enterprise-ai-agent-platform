@@ -1,11 +1,33 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { ConnectorStatus } from "../components/admin/ConnectorStatus";
 import { JobFailures } from "../components/admin/JobFailures";
 import { KnowledgeStatus } from "../components/admin/KnowledgeStatus";
 import { QualitySummary } from "../components/admin/QualitySummary";
 import { UserManagement } from "../components/admin/UserManagement";
+
+afterEach(cleanup);
+
+function expectDialogKeyboardBoundary(triggerName: string, dialogName: string) {
+  const trigger = screen.getByRole("button", { name: triggerName });
+  trigger.focus();
+  fireEvent.click(trigger);
+  const dialog = screen.getByRole("dialog", { name: dialogName });
+  const cancel = screen.getByRole("button", { name: "Cancel" });
+  expect(cancel).toHaveFocus();
+  const confirm = within(dialog)
+    .getAllByRole("button")
+    .find((button) => button.textContent !== "Cancel");
+  expect(confirm).toBeDefined();
+  fireEvent.keyDown(cancel, { key: "Tab" });
+  expect(confirm).toHaveFocus();
+  fireEvent.keyDown(confirm!, { key: "Tab", shiftKey: true });
+  expect(cancel).toHaveFocus();
+  fireEvent.keyDown(dialog, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: dialogName })).not.toBeInTheDocument();
+  expect(trigger).toHaveFocus();
+}
 
 const deliveryUnknownJob = {
   job_id: "job-email",
@@ -80,6 +102,27 @@ it("confirms connector reauthorization and displays exact minimum scopes", async
   await waitFor(() => expect(reauthorize).toHaveBeenCalledWith("connector-1"));
 });
 
+it("keeps connector confirmation keyboard focus inside and restores its trigger", () => {
+  render(
+    <ConnectorStatus
+      connectors={[
+        {
+          id: "connector-keyboard",
+          kind: "DRIVE",
+          status: "REAUTH_REQUIRED",
+          updated_at: "2026-09-02T07:00:00Z",
+          requested_scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+        },
+      ]}
+      onReauthorize={vi.fn().mockResolvedValue(undefined)}
+    />,
+  );
+  expectDialogKeyboardBoundary(
+    "Reauthorize Google Drive",
+    "Reauthorize Google Drive confirmation",
+  );
+});
+
 it("shows authorized Drive roots and confirms manual synchronization", async () => {
   const sync = vi.fn().mockResolvedValue(undefined);
   const configure = vi.fn().mockResolvedValue(undefined);
@@ -119,6 +162,43 @@ it("shows authorized Drive roots and confirms manual synchronization", async () 
   await waitFor(() =>
     expect(configure).toHaveBeenCalledWith("new-approved-root", true),
   );
+});
+
+it("keeps both Drive confirmations keyboard-contained and restores each trigger", () => {
+  render(
+    <KnowledgeStatus
+      sources={[
+        {
+          source_id: "source-keyboard",
+          status: "ACTIVE",
+          root_folder_id: "approved-root",
+          include_descendants: true,
+          descendant_count: 0,
+          cursor: null,
+          last_success_at: null,
+          backlog: 0,
+          isolated_files: 0,
+          retry_count: 0,
+          recent_error_codes: [],
+        },
+      ]}
+      onSync={vi.fn().mockResolvedValue(undefined)}
+      onConfigure={vi.fn().mockResolvedValue(undefined)}
+    />,
+  );
+  expectDialogKeyboardBoundary("Sync Drive now", "Manual Drive sync confirmation");
+  expectDialogKeyboardBoundary("Save Drive scope", "Drive scope change confirmation");
+});
+
+it("keeps job retry confirmation keyboard-contained and restores its trigger", () => {
+  render(
+    <JobFailures
+      jobs={[driveRetryJob]}
+      onRetry={vi.fn().mockResolvedValue(undefined)}
+      onReconcile={vi.fn()}
+    />,
+  );
+  expectDialogKeyboardBoundary("Retry Drive sync", "Retry Drive sync confirmation");
 });
 
 it("shows quality, latency, and cost without model content", () => {
@@ -176,5 +256,27 @@ it("versions user changes and confirms disable", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Confirm disable" }));
   await waitFor(() =>
     expect(update).toHaveBeenCalledWith("user-1", 4, { status: "DISABLED" }),
+  );
+});
+
+it("keeps disable confirmation keyboard-contained and restores its trigger", () => {
+  render(
+    <UserManagement
+      users={[
+        {
+          id: "user-keyboard",
+          email: "keyboard@example.test",
+          role: "MEMBER",
+          status: "ACTIVE",
+          version: 1,
+        },
+      ]}
+      onInvite={vi.fn().mockResolvedValue(undefined)}
+      onUpdate={vi.fn().mockResolvedValue(undefined)}
+    />,
+  );
+  expectDialogKeyboardBoundary(
+    "Disable keyboard@example.test",
+    "Disable user confirmation",
   );
 });

@@ -3,6 +3,7 @@
 import { FormEvent, useState } from "react";
 
 import { AdminUser } from "../../lib/staff-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { statusLabel } from "./format";
 
 export function UserManagement({
@@ -49,11 +50,18 @@ export function UserManagement({
         ))}
       </ul>
       {pendingDisable ? (
-        <div role="dialog" aria-label="Disable user confirmation">
+        <ConfirmDialog
+          label="Disable user confirmation"
+          confirmLabel="Confirm disable"
+          onConfirm={() =>
+            void onUpdate(pendingDisable.id, pendingDisable.version, {
+              status: "DISABLED",
+            }).finally(() => setPendingDisable(null))
+          }
+          onCancel={() => setPendingDisable(null)}
+        >
           <p>Disabling this user immediately revokes active sessions.</p>
-          <button type="button" onClick={() => void onUpdate(pendingDisable.id, pendingDisable.version, { status: "DISABLED" }).finally(() => setPendingDisable(null))}>Confirm disable</button>
-          <button type="button" onClick={() => setPendingDisable(null)}>Cancel</button>
-        </div>
+        </ConfirmDialog>
       ) : null}
     </section>
   );

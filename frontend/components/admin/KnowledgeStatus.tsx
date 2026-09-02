@@ -3,6 +3,7 @@
 import { useState } from "react";
 
 import { AdminKnowledgeStatus } from "../../lib/staff-api";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { formatUtc, statusLabel } from "./format";
 
 export function KnowledgeStatus({
@@ -61,31 +62,28 @@ export function KnowledgeStatus({
         ))}
       </ul>
       {pending ? (
-        <div role="dialog" aria-label="Manual Drive sync confirmation">
+        <ConfirmDialog
+          label="Manual Drive sync confirmation"
+          confirmLabel="Confirm sync"
+          onConfirm={() => void onSync(pending).finally(() => setPending(null))}
+          onCancel={() => setPending(null)}
+        >
           <p>Start a durable Drive synchronization now?</p>
-          <button type="button" onClick={() => void onSync(pending).finally(() => setPending(null))}>
-            Confirm sync
-          </button>
-          <button type="button" onClick={() => setPending(null)}>Cancel</button>
-        </div>
+        </ConfirmDialog>
       ) : null}
       {scopePending ? (
-        <div role="dialog" aria-label="Drive scope change confirmation">
+        <ConfirmDialog
+          label="Drive scope change confirmation"
+          confirmLabel="Confirm scope change"
+          onConfirm={() =>
+            void onConfigure(rootFolderId, includeDescendants).finally(() =>
+              setScopePending(false),
+            )
+          }
+          onCancel={() => setScopePending(false)}
+        >
           <p>Change the authorized read-only Drive scope?</p>
-          <button
-            type="button"
-            onClick={() =>
-              void onConfigure(rootFolderId, includeDescendants).finally(() =>
-                setScopePending(false),
-              )
-            }
-          >
-            Confirm scope change
-          </button>
-          <button type="button" onClick={() => setScopePending(false)}>
-            Cancel
-          </button>
-        </div>
+        </ConfirmDialog>
       ) : null}
     </section>
   );

@@ -7,7 +7,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.service import AuditService
-from app.modules.chat.models import ConversationState
+from app.modules.authorization.models import ResourceGrant
+from app.modules.chat.models import ChatSession, ConversationState
 from app.modules.connectors.models import Connector
 from app.modules.connectors.schemas import GOOGLE_CONNECTOR_SCOPES
 from app.modules.connectors.service import ConnectorService
@@ -20,7 +21,7 @@ from app.modules.email.delivery import (
 from app.modules.email.models import DeliveryIntent, EmailEvaluationRun, EmailState, EmailWorkItem
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
-from app.modules.jobs.models import JobIntent, JobState
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.knowledge.models import (
     Document,
     DocumentVersion,
@@ -28,6 +29,7 @@ from app.modules.knowledge.models import (
     DriveSource,
 )
 from app.modules.knowledge.operations import DriveSyncOperations
+from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.operations.schemas import (
     ConnectorReauthorizationRead,
     ConnectorStatusRead,
@@ -73,31 +75,51 @@ class OperationsService:
 
     async def summary(self, principal: Principal) -> OperationsSummaryRead:
         self.require_admin(principal)
+        connector_ids = await self._granted_resource_ids(principal, "connector")
         connectors = list(
             (
                 await self._db_session.scalars(
                     select(Connector)
-                    .where(Connector.organization_id == principal.organization_id)
+                    .where(
+                        Connector.organization_id == principal.organization_id,
+                        Connector.id.in_(connector_ids),
+                    )
                     .order_by(Connector.kind, Connector.id)
                 )
             ).all()
         )
-        sources = list(
-            (
-                await self._db_session.scalars(
-                    select(DriveSource)
-                    .where(DriveSource.organization_id == principal.organization_id)
-                    .order_by(DriveSource.id)
-                )
-            ).all()
+        can_manage_sources = await self._has_action_grant(
+            principal,
+            resource_type="knowledge",
+            resource_id=KnowledgeSourceService.configuration_resource_id(principal.organization_id),
+            action="knowledge.write",
+        )
+        sources = (
+            list(
+                (
+                    await self._db_session.scalars(
+                        select(DriveSource)
+                        .where(DriveSource.organization_id == principal.organization_id)
+                        .order_by(DriveSource.id)
+                    )
+                ).all()
+            )
+            if can_manage_sources
+            else []
         )
         source_statuses = [await self._source_status(source) for source in sources]
         source_ids = {str(source.id) for source in sources}
+        reviewable_knowledge_base_ids = await self._granted_resource_ids(
+            principal, "knowledge", action="knowledge.review"
+        )
         delivery_job_ids = set(
             (
                 await self._db_session.scalars(
-                    select(DeliveryIntent.job_id).where(
-                        DeliveryIntent.organization_id == principal.organization_id
+                    select(DeliveryIntent.job_id)
+                    .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
+                    .where(
+                        DeliveryIntent.organization_id == principal.organization_id,
+                        EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
                     )
                 )
             ).all()
@@ -116,6 +138,7 @@ class OperationsService:
             await self._db_session.scalar(
                 select(func.count(EmailWorkItem.id)).where(
                     EmailWorkItem.organization_id == principal.organization_id,
+                    EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
                     EmailWorkItem.state.in_(
                         [EmailState.DRAFT_RETRY_WAIT, EmailState.SEND_RETRY_WAIT]
                     ),
@@ -125,8 +148,11 @@ class OperationsService:
         )
         delivery_unknown = int(
             await self._db_session.scalar(
-                select(func.count(DeliveryIntent.id)).where(
+                select(func.count(DeliveryIntent.id))
+                .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
+                .where(
                     DeliveryIntent.organization_id == principal.organization_id,
+                    EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
                     DeliveryIntent.state == EmailState.DELIVERY_UNKNOWN,
                 )
             )
@@ -134,8 +160,11 @@ class OperationsService:
         )
         support_backlog = int(
             await self._db_session.scalar(
-                select(func.count(Handoff.id)).where(
+                select(func.count(Handoff.id))
+                .join(ChatSession, ChatSession.id == Handoff.session_id)
+                .where(
                     Handoff.organization_id == principal.organization_id,
+                    ChatSession.knowledge_base_id.in_(reviewable_knowledge_base_ids),
                     Handoff.state.in_(
                         [ConversationState.HANDOFF_REQUESTED, ConversationState.QUEUED]
                     ),
@@ -171,12 +200,21 @@ class OperationsService:
                 retry_wait=email_retry_wait,
                 delivery_unknown=delivery_unknown,
             ),
-            rag_quality=await self._latest_rag_quality(principal.organization_id),
+            rag_quality=await self._latest_rag_quality(
+                principal.organization_id,
+                await self._granted_resource_ids(principal, "knowledge", action="knowledge.read"),
+            ),
             email_quality=await self._latest_email_quality(),
         )
 
     async def failed_jobs(self, principal: Principal) -> list[FailedJobRead]:
         self.require_admin(principal)
+        can_manage_sources = await self._has_action_grant(
+            principal,
+            resource_type="knowledge",
+            resource_id=KnowledgeSourceService.configuration_resource_id(principal.organization_id),
+            action="knowledge.write",
+        )
         source_ids = set(
             (
                 await self._db_session.scalars(
@@ -185,12 +223,20 @@ class OperationsService:
                     )
                 )
             ).all()
+            if can_manage_sources
+            else []
+        )
+        reviewable_knowledge_base_ids = await self._granted_resource_ids(
+            principal, "knowledge", action="knowledge.review"
         )
         delivery_intents = list(
             (
                 await self._db_session.scalars(
-                    select(DeliveryIntent).where(
-                        DeliveryIntent.organization_id == principal.organization_id
+                    select(DeliveryIntent)
+                    .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
+                    .where(
+                        DeliveryIntent.organization_id == principal.organization_id,
+                        EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
                     )
                 )
             ).all()
@@ -219,7 +265,9 @@ class OperationsService:
                 and job.state in {JobState.FAILED, JobState.RECONCILIATION}
             ):
                 action = (
-                    JobAction.RETRY_DRIVE_SYNC if job.state is JobState.FAILED else JobAction.NONE
+                    JobAction.RETRY_DRIVE_SYNC
+                    if job.state is JobState.FAILED and job.error_class is ErrorClass.RETRYABLE
+                    else JobAction.NONE
                 )
                 action_resource_id = source_id
             elif intent is not None:
@@ -252,9 +300,14 @@ class OperationsService:
         if job is None:
             raise OperationsNotFound(job_id)
         if job.kind == "knowledge.drive_source.sync":
-            retried = await DriveSyncOperations(self._db_session).retry_failed_job(
-                principal=principal, job_id=job_id
-            )
+            try:
+                retried = await DriveSyncOperations(self._db_session).retry_failed_job(
+                    principal=principal, job_id=job_id
+                )
+            except HTTPException as error:
+                if error.status_code in {status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND}:
+                    raise OperationsNotFound(job_id) from None
+                raise
             return JobRetryRead(
                 job_id=retried.id,
                 state=retried.state.value,
@@ -402,10 +455,15 @@ class OperationsService:
             return value
         return "UNSAFE_ERROR_REDACTED"
 
-    async def _latest_rag_quality(self, organization_id: UUID) -> QualityStatusRead | None:
+    async def _latest_rag_quality(
+        self, organization_id: UUID, knowledge_base_ids: set[UUID]
+    ) -> QualityStatusRead | None:
         run = await self._db_session.scalar(
             select(RAGEvaluationRun)
-            .where(RAGEvaluationRun.organization_id == organization_id)
+            .where(
+                RAGEvaluationRun.organization_id == organization_id,
+                RAGEvaluationRun.knowledge_base_id.in_(knowledge_base_ids),
+            )
             .order_by(RAGEvaluationRun.completed_at.desc())
             .limit(1)
         )
@@ -439,6 +497,42 @@ class OperationsService:
             quality_score=run.macro_f1,
             latency_ms=float(run.latency_ms),
             estimated_cost=run.estimated_cost,
+        )
+
+    async def _granted_resource_ids(
+        self,
+        principal: Principal,
+        resource_type: str,
+        *,
+        action: str | None = None,
+    ) -> set[UUID]:
+        statement = select(ResourceGrant.resource_id).where(
+            ResourceGrant.organization_id == principal.organization_id,
+            ResourceGrant.subject_id == principal.subject_id,
+            ResourceGrant.resource_type == resource_type,
+        )
+        if action is not None:
+            statement = statement.where(ResourceGrant.actions.contains([action]))
+        return set((await self._db_session.scalars(statement)).all())
+
+    async def _has_action_grant(
+        self,
+        principal: Principal,
+        *,
+        resource_type: str,
+        resource_id: UUID,
+        action: str,
+    ) -> bool:
+        return bool(
+            await self._db_session.scalar(
+                select(ResourceGrant.id).where(
+                    ResourceGrant.organization_id == principal.organization_id,
+                    ResourceGrant.subject_id == principal.subject_id,
+                    ResourceGrant.resource_type == resource_type,
+                    ResourceGrant.resource_id == resource_id,
+                    ResourceGrant.actions.contains([action]),
+                )
+            )
         )
 
     @staticmethod

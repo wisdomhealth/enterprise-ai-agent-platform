@@ -113,6 +113,52 @@ async def test_manual_retry_uses_original_job_intent(db_session, operations_cont
     )
 
 
+@pytest.mark.parametrize("error_class", [ErrorClass.NON_RETRYABLE, ErrorClass.SECURITY])
+@pytest.mark.asyncio
+async def test_drive_retry_rejects_non_retryable_error_classes(
+    db_session, operations_context, error_class: ErrorClass
+) -> None:  # type: ignore[no-untyped-def]
+    source = operations_context["source"]
+    job = JobIntent(
+        kind="knowledge.drive_source.sync",
+        idempotency_key=f"drive-no-retry-{error_class.value}-{uuid4()}",
+        payload={"source_id": str(source.id)},
+        state=JobState.FAILED,
+        last_error_code="DRIVE_ACCESS_REVOKED",
+        error_class=error_class,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    job_id = job.id
+
+    async with operations_context["client_for"](operations_context["admin"]) as client:
+        response = await client.post(
+            f"/api/v1/admin/jobs/{job_id}/retry",
+            headers={"Idempotency-Key": f"reject-{error_class.value.lower()}"},
+        )
+        listed = await client.get("/api/v1/admin/jobs/failed")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "JOB_NOT_RETRYABLE",
+        "state": "FAILED",
+        "error_class": error_class.value,
+    }
+    visible = next(entry for entry in listed.json() if entry["job_id"] == str(job_id))
+    assert visible["action"] == "NONE"
+    db_session.expire_all()
+    unchanged = await db_session.get(JobIntent, job_id)
+    assert unchanged is not None
+    assert unchanged.state is JobState.FAILED
+    assert unchanged.error_class is error_class
+    assert not await db_session.scalar(
+        select(OutboxEvent.event_id).where(
+            OutboxEvent.event_type == "knowledge.drive_source.sync.requested",
+            OutboxEvent.aggregate_id == job_id,
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_safe_email_retry_uses_delivery_owner_service(db_session, operations_context) -> None:  # type: ignore[no-untyped-def]
     organization = operations_context["organization"]
@@ -193,12 +239,14 @@ async def test_safe_email_retry_uses_delivery_owner_service(db_session, operatio
     knowledge_base_id = source.knowledge_base_id
 
     async with operations_context["client_for"](admin) as client:
+        ungranted_list = await client.get("/api/v1/admin/jobs/failed")
         unauthorized = await client.post(
             f"/api/v1/admin/jobs/{job_id}/retry",
             headers={"Idempotency-Key": "email-retry-without-resource-grant"},
         )
 
     assert unauthorized.status_code == 404
+    assert str(job_id) not in {entry["job_id"] for entry in ungranted_list.json()}
     db_session.add(
         ResourceGrant(
             organization_id=organization_id,

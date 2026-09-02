@@ -1,9 +1,11 @@
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.modules.audit.models import AuditEvent
+from app.modules.authorization.models import ResourceGrant
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.jobs.models import JobIntent, JobState
+from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.outbox.models import OutboxEvent
 
 
@@ -69,6 +71,60 @@ async def test_admin_cannot_probe_unowned_operational_resources(
 
     assert job_response.status_code == 404
     assert connector_response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_admin_read_projections_hide_resources_without_current_grants(
+    db_session, operations_context
+) -> None:  # type: ignore[no-untyped-def]
+    organization = operations_context["organization"]
+    source = operations_context["source"]
+    existing_connector = operations_context["connector"]
+    ungranted_connector = Connector(
+        organization_id=organization.id,
+        kind=ConnectorKind.GMAIL,
+        status=ConnectorStatus.REAUTH_REQUIRED,
+        secret_id=existing_connector.secret_id,
+    )
+    ungranted_job = JobIntent(
+        kind="knowledge.drive_source.sync",
+        idempotency_key="ungranted-drive-failure",
+        payload={"source_id": str(source.id)},
+        state=JobState.FAILED,
+    )
+
+    async with operations_context["client_for"](operations_context["admin"]) as client:
+        db_session.add_all((ungranted_connector, ungranted_job))
+        await db_session.commit()
+        connector_id = str(ungranted_connector.id)
+        ungranted_job_id = ungranted_job.id
+
+        with_grant = await client.get("/api/v1/admin/operations/summary")
+
+        await db_session.execute(
+            delete(ResourceGrant).where(
+                ResourceGrant.organization_id == organization.id,
+                ResourceGrant.subject_id == operations_context["admin"].id,
+                ResourceGrant.resource_type == "knowledge",
+                ResourceGrant.resource_id
+                == KnowledgeSourceService.configuration_resource_id(organization.id),
+            )
+        )
+        await db_session.commit()
+        without_grant = await client.get("/api/v1/admin/operations/summary")
+        failures = await client.get("/api/v1/admin/jobs/failed")
+        retry = await client.post(
+            f"/api/v1/admin/jobs/{ungranted_job_id}/retry",
+            headers={"Idempotency-Key": "ungranted-drive-retry"},
+        )
+
+    assert with_grant.status_code == 200
+    assert connector_id not in {entry["id"] for entry in with_grant.json()["connectors"]}
+    assert without_grant.status_code == 200
+    assert without_grant.json()["knowledge_sources"] == []
+    assert failures.status_code == 200
+    assert str(ungranted_job_id) not in {entry["job_id"] for entry in failures.json()}
+    assert retry.status_code == 404
 
 
 @pytest.mark.asyncio

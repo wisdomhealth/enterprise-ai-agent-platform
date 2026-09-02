@@ -3,6 +3,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.modules.authorization.models import ResourceGrant
 from app.modules.email.models import EmailState, EmailWorkItem
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.operations.service import OperationsService  # noqa: F401
@@ -39,7 +40,14 @@ async def test_failure_views_and_summary_expose_safe_status_not_bodies(
         state=EmailState.DRAFT_RETRY_WAIT,
         last_error_code="EMAIL_MODEL_RATE_LIMITED",
     )
-    db_session.add_all((job, email))
+    review_grant = ResourceGrant(
+        organization_id=organization.id,
+        subject_id=operations_context["admin"].id,
+        resource_type="knowledge",
+        resource_id=source.knowledge_base_id,
+        actions=["knowledge.review"],
+    )
+    db_session.add_all((job, email, review_grant))
     await db_session.commit()
 
     async with operations_context["client_for"](operations_context["admin"]) as client:
