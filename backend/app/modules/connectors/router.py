@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.modules.connectors.models import ConnectorKind
-from app.modules.connectors.schemas import ConnectorRead
+from app.modules.connectors.schemas import GOOGLE_CONNECTOR_SCOPES, ConnectorRead
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.dependencies import (
     Principal,
@@ -22,13 +22,6 @@ router = APIRouter(prefix="/api/v1/admin/connectors", tags=["connectors"])
 
 _GOOGLE_AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-_SCOPES = {
-    ConnectorKind.DRIVE: ("https://www.googleapis.com/auth/drive.readonly",),
-    ConnectorKind.GMAIL: (
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
-    ),
-}
 
 
 def _connector_service(request: Request) -> ConnectorService:
@@ -141,7 +134,7 @@ async def authorize(
             "response_type": "code",
             "access_type": "offline",
             "prompt": "consent",
-            "scope": " ".join(_SCOPES[kind]),
+            "scope": " ".join(GOOGLE_CONNECTOR_SCOPES[kind]),
             "state": state,
         }
     )

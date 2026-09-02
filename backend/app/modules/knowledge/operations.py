@@ -5,9 +5,10 @@ from datetime import datetime
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.audit.service import AuditService
 from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
 from app.modules.authorization.types import ResourceRef, ResourceState
 from app.modules.identity.dependencies import Principal
@@ -47,7 +48,7 @@ class DriveSyncOperations:
     def __init__(
         self,
         db_session: AsyncSession,
-        knowledge_source_service: KnowledgeSourceService,
+        knowledge_source_service: KnowledgeSourceService | None = None,
         *,
         job_service: JobService | None = None,
         outbox_service: OutboxService | None = None,
@@ -74,12 +75,35 @@ class DriveSyncOperations:
         )
         if source is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        return await enqueue_drive_sync_intent(
+        enqueued = await enqueue_drive_sync_intent(
             self._db_session,
             source,
             job_service=self._job_service,
             outbox_service=self._outbox_service,
         )
+        await AuditService().record(
+            self._db_session,
+            principal,
+            action="knowledge.drive_source.sync.request",
+            object_type="knowledge_source",
+            object_id=source.id,
+            outcome="SUCCESS",
+            details={"job_id": str(enqueued.job.id)},
+            safe_detail_keys={"job_id"},
+        )
+        if enqueued.outbox_event_id is None:
+            event = await self._outbox_service.add(
+                self._db_session,
+                "knowledge.drive_source.sync.requested",
+                "job",
+                enqueued.job.id,
+                {"source_id": str(source.id)},
+            )
+            enqueued = EnqueuedDriveSync(
+                job=enqueued.job,
+                outbox_event_id=event.event_id,
+            )
+        return enqueued
 
     async def status(self, *, principal: Principal, source_id: UUID) -> DriveSyncStatus:
         if principal.role is not UserRole.ADMIN:
@@ -137,13 +161,92 @@ class DriveSyncOperations:
             recent_error_codes=[error for error in errors if error is not None],
         )
 
+    async def retry_failed_job(self, *, principal: Principal, job_id: UUID) -> JobIntent:
+        """Retry one Drive sync through its owning state transition."""
+        if principal.role is not UserRole.ADMIN:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        await self._require_configuration_authorization(principal)
+        job = await self._db_session.scalar(
+            select(JobIntent)
+            .where(
+                JobIntent.id == job_id,
+                JobIntent.kind == "knowledge.drive_source.sync",
+            )
+            .with_for_update()
+        )
+        if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        try:
+            source_id = UUID(str(job.payload.get("source_id")))
+        except (TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "JOB_INTENT_INVALID"},
+            ) from error
+        source = await self._db_session.scalar(
+            select(DriveSource).where(
+                DriveSource.id == source_id,
+                DriveSource.organization_id == principal.organization_id,
+            )
+        )
+        if source is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        if job.state is JobState.PENDING:
+            return job
+        if job.state is not JobState.FAILED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "JOB_NOT_RETRYABLE", "state": job.state.value},
+            )
+        database_now = func.clock_timestamp()
+        retried = await self._db_session.scalar(
+            update(JobIntent)
+            .where(
+                JobIntent.id == job.id,
+                JobIntent.state == JobState.FAILED,
+                JobIntent.version == job.version,
+            )
+            .values(
+                state=JobState.PENDING,
+                lease_owner=None,
+                lease_expires_at=None,
+                next_attempt_at=None,
+                last_error_code=None,
+                error_class=None,
+                version=JobIntent.version + 1,
+                updated_at=database_now,
+            )
+            .returning(JobIntent)
+        )
+        if retried is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "RESOURCE_VERSION_CONFLICT"},
+            )
+        await AuditService().record(
+            self._db_session,
+            principal,
+            action="knowledge.drive_source.sync.retry",
+            object_type="job",
+            object_id=retried.id,
+            outcome="SUCCESS",
+            details={"source_id": str(source.id)},
+            safe_detail_keys={"source_id"},
+        )
+        await self._outbox_service.add(
+            self._db_session,
+            "knowledge.drive_source.sync.requested",
+            "job",
+            retried.id,
+            {"source_id": str(source.id)},
+        )
+        return retried
+
     async def _require_configuration_authorization(self, principal: Principal) -> None:
         resource = ResourceRef(
             organization_id=principal.organization_id,
             resource_type="knowledge",
-            resource_id=self._knowledge_source_service.configuration_resource_id(
-                principal.organization_id
-            ),
+            resource_id=KnowledgeSourceService.configuration_resource_id(principal.organization_id),
             state=ResourceState.ACTIVE,
         )
         try:
@@ -181,11 +284,7 @@ async def enqueue_drive_sync_intent(
         JobState.RECONCILIATION,
     ):
         return EnqueuedDriveSync(job=existing, outbox_event_id=None)
-    idempotency_key = (
-        base_key
-        if existing is None
-        else f"{base_key}:run:{existing.version}"
-    )
+    idempotency_key = base_key if existing is None else f"{base_key}:run:{existing.version}"
     job = await job_service.enqueue(
         db_session,
         "knowledge.drive_source.sync",

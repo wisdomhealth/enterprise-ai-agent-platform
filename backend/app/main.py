@@ -12,9 +12,11 @@ from app.modules.connectors.service import ConnectorService
 from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
 from app.modules.email.router import router as email_router
 from app.modules.identity.oidc import configure_google_oidc
+from app.modules.identity.router import admin_router as identity_admin_router
 from app.modules.identity.router import router as identity_router
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.router import router as knowledge_router
+from app.modules.operations.router import router as operations_router
 from app.modules.rag.answer_service import GroundedAnswerService
 from app.modules.rag.router import router as rag_router
 from app.modules.support.router import public_router as support_public_router
@@ -70,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(identity_router)
+    app.include_router(identity_admin_router)
     app.include_router(connectors_router)
     app.include_router(knowledge_router)
     app.include_router(rag_router)
@@ -77,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(support_public_router)
     app.include_router(support_staff_router)
     app.include_router(email_router)
+    app.include_router(operations_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

@@ -150,9 +150,9 @@ function csrfToken(): string | null {
   return value ? decodeURIComponent(value) : null;
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function requestAt<T>(prefix: "/api/v1/staff" | "/api/v1/admin", path: string, init: RequestInit = {}): Promise<T> {
   const csrf = init.method === undefined || init.method === "GET" ? null : csrfToken();
-  const response = await fetch(`/api/v1/staff${path}`, {
+  const response = await fetch(`${prefix}${path}`, {
     ...init,
     credentials: "same-origin",
     headers: {
@@ -191,6 +191,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     );
   }
   return (await response.json()) as T;
+}
+
+function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return requestAt<T>("/api/v1/staff", path, init);
+}
+
+function adminRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return requestAt<T>("/api/v1/admin", path, init);
 }
 
 export function listSupportQueue(): Promise<SupportHandoff[]> {
@@ -333,5 +341,133 @@ export function reconcileEmailDelivery(
     method: "POST",
     headers: { "Idempotency-Key": idempotencyKey("delivery-reconcile", deliveryIntentId) },
     body: JSON.stringify({ expected_version: expectedVersion, confirm_absent: false }),
+  });
+}
+
+export type AdminConnectorStatus = {
+  id: string;
+  kind: "DRIVE" | "GMAIL";
+  status: "ACTIVE" | "REAUTH_REQUIRED" | "ERROR";
+  updated_at: string;
+  requested_scopes: string[];
+};
+
+export type AdminKnowledgeStatus = {
+  source_id: string;
+  status: string;
+  root_folder_id: string;
+  include_descendants: boolean;
+  descendant_count: number;
+  cursor: string | null;
+  last_success_at: string | null;
+  backlog: number;
+  isolated_files: number;
+  retry_count: number;
+  recent_error_codes: string[];
+};
+
+export type AdminQualityStatus = {
+  completed_at: string;
+  status: string;
+  quality_score: number;
+  latency_ms: number;
+  estimated_cost: number;
+};
+
+export type AdminOperationsSummary = {
+  generated_at: string;
+  connectors: AdminConnectorStatus[];
+  knowledge_sources: AdminKnowledgeStatus[];
+  jobs: { queue_depth: number; failed: number };
+  support: { backlog: number };
+  email: { retry_wait: number; delivery_unknown: number };
+  rag_quality: AdminQualityStatus | null;
+  email_quality: AdminQualityStatus | null;
+};
+
+export type AdminFailedJob = {
+  job_id: string;
+  kind: string;
+  state: "FAILED" | "RECONCILIATION";
+  attempts: number;
+  error_code: string | null;
+  updated_at: string;
+  action: "RETRY_DRIVE_SYNC" | "RETRY_EMAIL_DELIVERY" | "RECONCILE_GMAIL" | "NONE";
+  action_resource_id: string | null;
+};
+
+export type AdminUser = {
+  id: string;
+  email: string;
+  role: "ADMIN" | "REVIEWER" | "MEMBER";
+  status: "INVITED" | "ACTIVE" | "DISABLED";
+  version: number;
+};
+
+export function getAdminOperationsSummary(): Promise<AdminOperationsSummary> {
+  return adminRequest<AdminOperationsSummary>("/operations/summary");
+}
+
+export function listAdminFailedJobs(): Promise<AdminFailedJob[]> {
+  return adminRequest<AdminFailedJob[]>("/jobs/failed");
+}
+
+export function retryAdminJob(jobId: string): Promise<void> {
+  return adminRequest(`/jobs/${jobId}/retry`, {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey("admin-job-retry", jobId) },
+  });
+}
+
+export function beginConnectorReauthorization(
+  connectorId: string,
+): Promise<{ connector_id: string; authorization_url: string; requested_scopes: string[] }> {
+  return adminRequest(`/connectors/${connectorId}/reauthorize`, {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey("connector-reauthorize", connectorId) },
+  });
+}
+
+export function requestAdminDriveSync(sourceId: string): Promise<void> {
+  return adminRequest(`/knowledge-sources/${sourceId}/sync`, { method: "POST" });
+}
+
+export function configureAdminDriveScope(
+  rootFolderId: string,
+  includeDescendants: boolean,
+): Promise<void> {
+  return adminRequest("/knowledge-sources/drive", {
+    method: "PUT",
+    body: JSON.stringify({
+      root_folder_id: rootFolderId,
+      include_descendants: includeDescendants,
+    }),
+  });
+}
+
+export function listAdminUsers(): Promise<AdminUser[]> {
+  return adminRequest<AdminUser[]>("/users");
+}
+
+export function inviteAdminUser(
+  email: string,
+  role: AdminUser["role"],
+): Promise<AdminUser> {
+  return adminRequest<AdminUser>("/users/invitations", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey("admin-user-invite", email) },
+    body: JSON.stringify({ email, role }),
+  });
+}
+
+export function updateAdminUser(
+  userId: string,
+  expectedVersion: number,
+  change: Partial<Pick<AdminUser, "role" | "status">>,
+): Promise<AdminUser> {
+  return adminRequest<AdminUser>(`/users/${userId}`, {
+    method: "PATCH",
+    headers: { "Idempotency-Key": idempotencyKey("admin-user-update", userId) },
+    body: JSON.stringify({ expected_version: expectedVersion, ...change }),
   });
 }

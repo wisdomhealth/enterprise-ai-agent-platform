@@ -13,6 +13,7 @@ from app.modules.knowledge.schemas import (
     DriveSyncStatusRead,
 )
 from app.modules.knowledge.service import KnowledgeSourceService
+from app.modules.outbox.service import OutboxService
 
 router = APIRouter(prefix="/api/v1/admin/knowledge-sources", tags=["knowledge-sources"])
 
@@ -47,6 +48,13 @@ async def configure_drive_source(
         principal=principal,
         root_folder_id=payload.root_folder_id,
         include_descendants=payload.include_descendants,
+    )
+    await OutboxService().add(
+        db_session,
+        "knowledge.drive_source.configured",
+        "knowledge_source",
+        source.id,
+        {"organization_id": str(principal.organization_id)},
     )
     await db_session.commit()
     return DriveSourceRead.model_validate(source)
