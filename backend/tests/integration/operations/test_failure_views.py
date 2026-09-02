@@ -4,7 +4,7 @@ from uuid import uuid4
 import pytest
 
 from app.modules.authorization.models import ResourceGrant
-from app.modules.email.models import EmailState, EmailWorkItem
+from app.modules.email.models import EmailEvaluationRun, EmailState, EmailWorkItem
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.operations.service import OperationsService  # noqa: F401
 
@@ -47,7 +47,20 @@ async def test_failure_views_and_summary_expose_safe_status_not_bodies(
         resource_id=source.knowledge_base_id,
         actions=["knowledge.review"],
     )
-    db_session.add_all((job, email, review_grant))
+    email_quality = EmailEvaluationRun(
+        dataset_version="task21-visible-quality",
+        dataset_kind="regression",
+        dataset_digest="2" * 64,
+        model="safe-model-id",
+        prompt_version="safe-prompt-id",
+        macro_f1=0.91,
+        structured_output_success=1.0,
+        latency_ms=12,
+        input_tokens=1,
+        output_tokens=1,
+        estimated_cost=0.02,
+    )
+    db_session.add_all((job, email, review_grant, email_quality))
     await db_session.commit()
 
     async with operations_context["client_for"](operations_context["admin"]) as client:
@@ -66,3 +79,4 @@ async def test_failure_views_and_summary_expose_safe_status_not_bodies(
     assert "private-error-detail" not in serialized
     assert summary.json()["knowledge_sources"][0]["cursor"] == "drive-cursor-9"
     assert summary.json()["email"]["retry_wait"] == 1
+    assert summary.json()["email_quality"]["quality_score"] == 0.91

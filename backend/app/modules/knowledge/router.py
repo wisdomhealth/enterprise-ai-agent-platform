@@ -18,6 +18,12 @@ from app.modules.outbox.service import OutboxService
 router = APIRouter(prefix="/api/v1/admin/knowledge-sources", tags=["knowledge-sources"])
 
 
+def _raise_nondisclosing(error: HTTPException) -> None:
+    if error.status_code == status.HTTP_403_FORBIDDEN:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from None
+    raise error
+
+
 def _knowledge_source_service(request: Request) -> KnowledgeSourceService:
     connector_service = getattr(request.app.state, "connector_service", None)
     gateway_factory = getattr(request.app.state, "drive_gateway_factory", None)
@@ -43,12 +49,16 @@ async def configure_drive_source(
     principal: Principal = Depends(require_staff_csrf),
     service: KnowledgeSourceService = Depends(_knowledge_source_service),
 ) -> DriveSourceRead:
-    source = await service.configure_drive_source(
-        db_session,
-        principal=principal,
-        root_folder_id=payload.root_folder_id,
-        include_descendants=payload.include_descendants,
-    )
+    try:
+        source = await service.configure_drive_source(
+            db_session,
+            principal=principal,
+            root_folder_id=payload.root_folder_id,
+            include_descendants=payload.include_descendants,
+        )
+    except HTTPException as error:
+        await db_session.rollback()
+        _raise_nondisclosing(error)
     await OutboxService().add(
         db_session,
         "knowledge.drive_source.configured",
@@ -71,7 +81,13 @@ async def request_drive_sync(
     principal: Principal = Depends(require_staff_csrf),
     operations: DriveSyncOperations = Depends(_drive_sync_operations),
 ) -> DriveSyncEnqueued:
-    enqueued = await operations.enqueue_sync_for_dispatch(principal=principal, source_id=source_id)
+    try:
+        enqueued = await operations.enqueue_sync_for_dispatch(
+            principal=principal, source_id=source_id
+        )
+    except HTTPException as error:
+        await db_session.rollback()
+        _raise_nondisclosing(error)
     await db_session.commit()
     from app.modules.knowledge.tasks import dispatch_drive_sync_outbox_event
 
@@ -91,7 +107,10 @@ async def drive_sync_status(
     principal: Principal = Depends(require_staff_csrf),
     operations: DriveSyncOperations = Depends(_drive_sync_operations),
 ) -> DriveSyncStatusRead:
-    sync_status = await operations.status(principal=principal, source_id=source_id)
+    try:
+        sync_status = await operations.status(principal=principal, source_id=source_id)
+    except HTTPException as error:
+        _raise_nondisclosing(error)
     return DriveSyncStatusRead(
         source_id=sync_status.source_id,
         cursor=sync_status.cursor,

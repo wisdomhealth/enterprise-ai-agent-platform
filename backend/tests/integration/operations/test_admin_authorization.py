@@ -4,6 +4,7 @@ from sqlalchemy import delete, select
 from app.modules.audit.models import AuditEvent
 from app.modules.authorization.models import ResourceGrant
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
+from app.modules.email.models import EmailEvaluationRun
 from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.outbox.models import OutboxEvent
@@ -92,9 +93,23 @@ async def test_admin_read_projections_hide_resources_without_current_grants(
         payload={"source_id": str(source.id)},
         state=JobState.FAILED,
     )
+    global_email_quality = EmailEvaluationRun(
+        dataset_version="task21-review",
+        dataset_kind="regression",
+        dataset_digest="1" * 64,
+        model="safe-model-id",
+        prompt_version="safe-prompt-id",
+        macro_f1=0.9,
+        structured_output_success=1.0,
+        latency_ms=10,
+        input_tokens=1,
+        output_tokens=1,
+        estimated_cost=0.01,
+    )
+    source_id = source.id
 
     async with operations_context["client_for"](operations_context["admin"]) as client:
-        db_session.add_all((ungranted_connector, ungranted_job))
+        db_session.add_all((ungranted_connector, ungranted_job, global_email_quality))
         await db_session.commit()
         connector_id = str(ungranted_connector.id)
         ungranted_job_id = ungranted_job.id
@@ -117,14 +132,24 @@ async def test_admin_read_projections_hide_resources_without_current_grants(
             f"/api/v1/admin/jobs/{ungranted_job_id}/retry",
             headers={"Idempotency-Key": "ungranted-drive-retry"},
         )
+        configure = await client.put(
+            "/api/v1/admin/knowledge-sources/drive",
+            json={"root_folder_id": "must-not-disclose", "include_descendants": True},
+        )
+        sync = await client.post(f"/api/v1/admin/knowledge-sources/{source_id}/sync")
+        status_response = await client.get(f"/api/v1/admin/knowledge-sources/{source_id}/status")
 
     assert with_grant.status_code == 200
     assert connector_id not in {entry["id"] for entry in with_grant.json()["connectors"]}
     assert without_grant.status_code == 200
     assert without_grant.json()["knowledge_sources"] == []
+    assert without_grant.json()["email_quality"] is None
     assert failures.status_code == 200
     assert str(ungranted_job_id) not in {entry["job_id"] for entry in failures.json()}
     assert retry.status_code == 404
+    assert configure.status_code == 404
+    assert sync.status_code == 404
+    assert status_response.status_code == 404
 
 
 @pytest.mark.asyncio

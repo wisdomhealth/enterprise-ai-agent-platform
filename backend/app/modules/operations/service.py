@@ -204,7 +204,9 @@ class OperationsService:
                 principal.organization_id,
                 await self._granted_resource_ids(principal, "knowledge", action="knowledge.read"),
             ),
-            email_quality=await self._latest_email_quality(),
+            email_quality=await self._latest_email_quality(
+                has_authorized_email_resource=bool(reviewable_knowledge_base_ids)
+            ),
         )
 
     async def failed_jobs(self, principal: Principal) -> list[FailedJobRead]:
@@ -485,7 +487,13 @@ class OperationsService:
             return float(value)
         return 0.0
 
-    async def _latest_email_quality(self) -> QualityStatusRead | None:
+    async def _latest_email_quality(
+        self, *, has_authorized_email_resource: bool
+    ) -> QualityStatusRead | None:
+        # EmailEvaluationRun is a product-level baseline without resource ownership.
+        # Expose it only when this principal can review at least one email knowledge base.
+        if not has_authorized_email_resource:
+            return None
         run = await self._db_session.scalar(
             select(EmailEvaluationRun).order_by(EmailEvaluationRun.created_at.desc()).limit(1)
         )
