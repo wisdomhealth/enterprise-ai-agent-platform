@@ -18,6 +18,7 @@ from app.modules.email.classification import (
     EmailClassifier,
     EmailClassifierUnavailable,
 )
+from app.modules.email.delivery import EMAIL_DELIVERY_KIND, EmailDeliveryService
 from app.modules.email.drafting import EmailDraftingService
 from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
 from app.modules.email.ingestion import EmailIngestionService
@@ -164,7 +165,12 @@ async def _dispatch_pending_email_jobs() -> None:
                 await db_session.scalars(
                     select(JobIntent.id).where(
                         JobIntent.kind.in_(
-                            (EMAIL_HISTORY_KIND, EMAIL_CLASSIFY_KIND, EMAIL_DRAFT_KIND)
+                            (
+                                EMAIL_HISTORY_KIND,
+                                EMAIL_CLASSIFY_KIND,
+                                EMAIL_DRAFT_KIND,
+                                EMAIL_DELIVERY_KIND,
+                            )
                         ),
                         or_(
                             and_(
@@ -191,6 +197,19 @@ async def _dispatch_pending_email_jobs() -> None:
 async def _consume_email_job(job_id: UUID) -> None:
     settings = Settings()
     async with async_sessionmaker() as db_session:
+        pending_job = await db_session.get(JobIntent, job_id)
+        if pending_job is not None and pending_job.kind == EMAIL_DELIVERY_KIND:
+            connector_service = ConnectorService.from_settings(settings)
+            gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
+            if connector_service is None or gateway_factory is None:
+                raise RuntimeError("Gmail delivery settings are incomplete")
+            await EmailDeliveryService(
+                db_session,
+                worker_id=f"{EMAIL_WORKER_ID}:{uuid4()}",
+                connector_service=connector_service,
+                gateway_factory=gateway_factory,
+            ).send(job_id)
+            return
         lease_service = JobLeaseService(db_session)
         execution_owner = f"{EMAIL_WORKER_ID}:{uuid4()}"
         job = await lease_service.claim(job_id, execution_owner, lease_seconds=EMAIL_LEASE_SECONDS)

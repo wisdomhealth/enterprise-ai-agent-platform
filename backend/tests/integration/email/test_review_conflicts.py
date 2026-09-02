@@ -187,6 +187,6 @@ async def test_concurrent_approvals_create_one_approval() -> None:
         await engine.dispose()
     assert sum(result.__class__.__name__ == "EmailReviewResult" for result in results) == 1
     assert sum(isinstance(result, EmailReviewConflict) for result in results) == 1
-    assert stored is not None and stored.state is EmailState.APPROVED
+    assert stored is not None and stored.state is EmailState.SEND_PENDING
     assert len(approvals) == 1
     assert len(versions) == 1

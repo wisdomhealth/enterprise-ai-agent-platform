@@ -50,6 +50,14 @@ class EmailAction(StrEnum):
     APPROVE = "APPROVE"
     REJECT = "REJECT"
     SEND = "SEND"
+    QUEUE_SEND = "QUEUE_SEND"
+    CLAIM_SEND = "CLAIM_SEND"
+    SEND_SUCCEEDED = "SEND_SUCCEEDED"
+    SEND_FAILED = "SEND_FAILED"
+    RETRY_SEND = "RETRY_SEND"
+    DELIVERY_AMBIGUOUS = "DELIVERY_AMBIGUOUS"
+    RECONCILE_SENT = "RECONCILE_SENT"
+    RECONCILE_ABSENT = "RECONCILE_ABSENT"
 
 
 class EmailCategory(StrEnum):
@@ -248,6 +256,135 @@ class EmailApproval(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DeliveryIntent(Base):
+    __tablename__ = "email_delivery_intents"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="ck_email_delivery_intents_version_positive"),
+        UniqueConstraint(
+            "approved_draft_version_id", name="uq_email_delivery_intents_approved_draft"
+        ),
+        UniqueConstraint("deterministic_message_id", name="uq_email_delivery_intents_message_id"),
+        UniqueConstraint("job_id", name="uq_email_delivery_intents_job"),
+        Index("ix_email_delivery_intents_queue", "organization_id", "state", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    work_item_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_work_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    approved_draft_version_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_draft_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    approval_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_approvals.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey(JobIntent.id, ondelete="RESTRICT"),
+        nullable=False,
+    )
+    deterministic_message_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    state: Mapped[EmailState] = mapped_column(
+        Enum(EmailState, name="email_state", create_type=False),
+        nullable=False,
+        default=EmailState.SEND_PENDING,
+        server_default=text("'SEND_PENDING'::email_state"),
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeliveryAttempt(Base):
+    __tablename__ = "email_delivery_attempts"
+    __table_args__ = (
+        CheckConstraint("attempt_number > 0", name="ck_email_delivery_attempts_number_positive"),
+        CheckConstraint(
+            "outcome IN ('IN_PROGRESS', 'SENT', 'DEFINITIVE_FAILURE', 'UNKNOWN')",
+            name="ck_email_delivery_attempts_outcome",
+        ),
+        UniqueConstraint(
+            "delivery_intent_id", "attempt_number", name="uq_email_delivery_attempt_number"
+        ),
+        Index("ix_email_delivery_attempts_intent", "delivery_intent_id", "started_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    delivery_intent_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_delivery_intents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="IN_PROGRESS", server_default=text("'IN_PROGRESS'")
+    )
+    error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SuccessfulDelivery(Base):
+    __tablename__ = "email_successful_deliveries"
+    __table_args__ = (
+        UniqueConstraint("delivery_intent_id", name="uq_email_success_delivery_intent"),
+        Index("ix_email_successful_deliveries_message", "gmail_message_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    delivery_intent_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("email_delivery_intents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    gmail_message_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    gmail_thread_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    reconciled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class EmailStateHistory(Base):

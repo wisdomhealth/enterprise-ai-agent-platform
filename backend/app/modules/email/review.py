@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.audit.service import AuditService
 from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
 from app.modules.authorization.types import ResourceRef, ResourceState
+from app.modules.email.delivery import cancel_pending_delivery_for_draft, queue_approved_email
 from app.modules.email.models import (
     EmailAction,
     EmailApproval,
@@ -115,6 +116,7 @@ class EmailReviewService:
         authorization_service: AuthorizationService | None = None,
         audit_service: AuditService | None = None,
         outbox_service: OutboxService | None = None,
+        message_id_domain: str = "mail.invalid",
     ) -> None:
         self._db_session = db_session
         self._principal = principal
@@ -122,6 +124,7 @@ class EmailReviewService:
         self._authorization = authorization_service or AuthorizationService(db_session)
         self._audit = audit_service or AuditService()
         self._outbox = outbox_service or OutboxService()
+        self._message_id_domain = message_id_domain
 
     async def regenerate(
         self,
@@ -168,7 +171,11 @@ class EmailReviewService:
         item, current = await self._lock_current(
             work_item_id, expected_version=expected_version, current_draft_id=current_draft_id
         )
-        if item.state not in {EmailState.AWAITING_REVIEW, EmailState.APPROVED}:
+        if item.state not in {
+            EmailState.AWAITING_REVIEW,
+            EmailState.APPROVED,
+            EmailState.SEND_PENDING,
+        }:
             raise EmailReviewConflict(item)
         next_body = current.body if body is None else body
         next_to = list(current.to) if to is None else to
@@ -197,6 +204,8 @@ class EmailReviewService:
             raise ValueError("cc recipients must not be empty")
 
         invalidated = await self._invalidate_approval(item)
+        if item.state is EmailState.SEND_PENDING:
+            await cancel_pending_delivery_for_draft(self._db_session, item.id, current.id)
         draft = EmailDraftVersion(
             work_item_id=item.id,
             organization_id=item.organization_id,
@@ -255,6 +264,16 @@ class EmailReviewService:
         self._db_session.add(approval)
         self._change_state(item, EmailAction.APPROVE)
         await self._db_session.flush()
+        await queue_approved_email(
+            self._db_session,
+            item,
+            draft,
+            approval,
+            self._principal,
+            message_id_domain=self._message_id_domain,
+            audit_service=self._audit,
+            outbox_service=self._outbox,
+        )
         await self._record(
             item,
             "email.review.approve",

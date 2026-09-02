@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     google_gmail_client_secret: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_GMAIL_CLIENT_SECRET"
     )
+    gmail_message_id_domain: str = Field(
+        default="mail.invalid",
+        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$",
+        validation_alias="GMAIL_MESSAGE_ID_DOMAIN",
+    )
     google_cloud_project: str | None = Field(default=None, validation_alias="GOOGLE_CLOUD_PROJECT")
     google_kms_key_name: str | None = Field(default=None, validation_alias="GOOGLE_KMS_KEY_NAME")
     app_env: str = Field(default="development", validation_alias="APP_ENV")

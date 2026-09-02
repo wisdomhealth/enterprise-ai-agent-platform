@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -94,3 +95,44 @@ async def test_gmail_factory_uses_only_the_approved_connector_scopes(monkeypatch
     assert connection.gateway.oauth_scopes == GMAIL_SCOPES
     assert captured["scopes"] == [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE]
     assert captured["refresh_token"] == "encrypted-boundary-output"
+
+
+class _SentMessages:
+    def list(self, **_kwargs: object) -> _Request:
+        return _Request({"messages": [{"id": "gmail-sent-1"}]})
+
+    def get(self, **_kwargs: object) -> _Request:
+        return _Request(
+            {
+                "id": "gmail-sent-1",
+                "threadId": "thread-1",
+                "internalDate": "1788336000000",
+                "payload": {
+                    "headers": [
+                        {"name": "Message-ID", "value": "<delivery-1@mail.example>"},
+                        {
+                            "name": "To",
+                            "value": "customer@example.test, unintended@example.test",
+                        },
+                    ]
+                },
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_sent_reconciliation_requires_exact_recipient_binding() -> None:
+    messages = _SentMessages()
+    users = SimpleNamespace(messages=lambda: messages)
+    client = GoogleGmailReadClient(SimpleNamespace(users=lambda: users))
+    sent_at = datetime.fromtimestamp(1788336000, tz=UTC)
+
+    found = await client.find_sent(
+        deterministic_message_id="<delivery-1@mail.example>",
+        thread_id="thread-1",
+        recipients=("customer@example.test",),
+        sent_after=sent_at - timedelta(minutes=1),
+        sent_before=sent_at + timedelta(minutes=1),
+    )
+
+    assert found is None

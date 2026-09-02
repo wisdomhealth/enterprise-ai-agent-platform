@@ -21,6 +21,18 @@ class GmailAuthorizationError(RuntimeError):
     """The credential is revoked or does not grant the approved Gmail scopes."""
 
 
+class GmailDefinitiveDeliveryError(RuntimeError):
+    def __init__(self, error_code: str) -> None:
+        super().__init__(error_code)
+        self.error_code = error_code
+
+
+class GmailAmbiguousDeliveryError(RuntimeError):
+    def __init__(self, error_code: str) -> None:
+        super().__init__(error_code)
+        self.error_code = error_code
+
+
 @dataclass(frozen=True, slots=True)
 class GmailMessage:
     id: str
@@ -41,6 +53,19 @@ class GmailHistoryPage:
     next_page_token: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class GmailSendResult:
+    gmail_message_id: str
+    gmail_thread_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class GmailSentMessage:
+    gmail_message_id: str
+    gmail_thread_id: str
+    deterministic_message_id: str
+
+
 class GmailReadClient(Protocol):
     def list_history(
         self, start_history_id: str | None, page_token: str | None = None
@@ -48,9 +73,21 @@ class GmailReadClient(Protocol):
 
     def get_message(self, message_id: str) -> Awaitable[GmailMessage]: ...
 
+    def send_raw(self, raw_message: bytes, *, thread_id: str) -> Awaitable[GmailSendResult]: ...
+
+    def find_sent(
+        self,
+        *,
+        deterministic_message_id: str,
+        thread_id: str,
+        recipients: tuple[str, ...],
+        sent_after: datetime,
+        sent_before: datetime,
+    ) -> Awaitable[GmailSentMessage | None]: ...
+
 
 class GmailGateway:
-    """Narrow Gmail ingestion surface; no delivery operation is exposed in Task 17."""
+    """Narrow Gmail ingestion and approved-delivery surface."""
 
     oauth_scopes = GMAIL_SCOPES
 
@@ -69,6 +106,26 @@ class GmailGateway:
 
     async def get_message(self, message_id: str) -> GmailMessage:
         return await self._require_client().get_message(message_id)
+
+    async def send_raw(self, raw_message: bytes, *, thread_id: str) -> GmailSendResult:
+        return await self._require_client().send_raw(raw_message, thread_id=thread_id)
+
+    async def find_sent(
+        self,
+        *,
+        deterministic_message_id: str,
+        thread_id: str,
+        recipients: tuple[str, ...],
+        sent_after: datetime,
+        sent_before: datetime,
+    ) -> GmailSentMessage | None:
+        return await self._require_client().find_sent(
+            deterministic_message_id=deterministic_message_id,
+            thread_id=thread_id,
+            recipients=recipients,
+            sent_after=sent_after,
+            sent_before=sent_before,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +236,99 @@ class GoogleGmailReadClient:
             _raise_authorization_error(error)
             raise
 
+    async def send_raw(self, raw_message: bytes, *, thread_id: str) -> GmailSendResult:
+        raw = base64.urlsafe_b64encode(raw_message).decode().rstrip("=")
+        try:
+            response = await asyncio.to_thread(
+                lambda: (
+                    self._gmail_api.users()
+                    .messages()
+                    .send(userId="me", body={"raw": raw, "threadId": thread_id})
+                    .execute()
+                )
+            )
+        except Exception as error:
+            _raise_delivery_error(error)
+            raise
+        message_id = response.get("id")
+        result_thread_id = response.get("threadId")
+        if not isinstance(message_id, str) or not message_id:
+            raise GmailAmbiguousDeliveryError("GMAIL_RESPONSE_MISSING_MESSAGE_ID")
+        if not isinstance(result_thread_id, str) or not result_thread_id:
+            raise GmailAmbiguousDeliveryError("GMAIL_RESPONSE_MISSING_THREAD_ID")
+        return GmailSendResult(message_id, result_thread_id)
+
+    async def find_sent(
+        self,
+        *,
+        deterministic_message_id: str,
+        thread_id: str,
+        recipients: tuple[str, ...],
+        sent_after: datetime,
+        sent_before: datetime,
+    ) -> GmailSentMessage | None:
+        query = (
+            f"in:sent rfc822msgid:{deterministic_message_id} "
+            f"after:{int(sent_after.timestamp())} before:{int(sent_before.timestamp())}"
+        )
+        try:
+            response = await asyncio.to_thread(
+                lambda: (
+                    self._gmail_api.users()
+                    .messages()
+                    .list(userId="me", q=query, maxResults=10)
+                    .execute()
+                )
+            )
+            expected_recipients = {_address_only(value) for value in recipients}
+            for candidate in response.get("messages", []):
+                if not isinstance(candidate, Mapping) or not isinstance(candidate.get("id"), str):
+                    continue
+                candidate_id = candidate["id"]
+
+                def load_metadata() -> Any:
+                    return (
+                        self._gmail_api.users()
+                        .messages()
+                        .get(
+                            userId="me",
+                            id=candidate_id,
+                            format="metadata",
+                            metadataHeaders=["Message-ID", "To", "Cc"],
+                        )
+                        .execute()
+                    )
+
+                metadata = await asyncio.to_thread(load_metadata)
+                headers = _headers(metadata)
+                actual_recipients = {
+                    address.lower()
+                    for _name, address in getaddresses(
+                        [headers.get("to", ""), headers.get("cc", "")]
+                    )
+                    if address
+                }
+                internal_date = metadata.get("internalDate")
+                try:
+                    sent_at = datetime.fromtimestamp(int(internal_date) / 1_000, tz=UTC)
+                except (TypeError, ValueError, OSError):
+                    continue
+                if (
+                    headers.get("message-id") == deterministic_message_id
+                    and metadata.get("threadId") == thread_id
+                    and expected_recipients == actual_recipients
+                    and sent_after <= sent_at <= sent_before
+                ):
+                    return GmailSentMessage(
+                        gmail_message_id=candidate["id"],
+                        gmail_thread_id=thread_id,
+                        deterministic_message_id=deterministic_message_id,
+                    )
+            return None
+        except Exception as error:
+            _raise_authorization_error(error)
+            raise
+
 
 class GoogleGmailGatewayFactory:
     """Constructs Gmail clients with only the separately approved read/send scopes."""
@@ -271,6 +421,22 @@ def _message_from_payload(payload: Mapping[str, Any]) -> GmailMessage:
     )
 
 
+def _headers(payload: Mapping[str, Any]) -> dict[str, str]:
+    body = payload.get("payload")
+    if not isinstance(body, Mapping):
+        return {}
+    return {
+        str(item.get("name", "")).lower(): str(item.get("value", ""))
+        for item in body.get("headers", [])
+        if isinstance(item, Mapping)
+    }
+
+
+def _address_only(value: str) -> str:
+    parsed = getaddresses([value])
+    return parsed[0][1].lower() if parsed else value.strip().lower()
+
+
 def _plain_text_body(part: Mapping[str, Any]) -> str:
     mime_type = part.get("mimeType")
     body = part.get("body")
@@ -310,3 +476,16 @@ def _raise_authorization_error(error: Exception) -> None:
         "InvalidGrantError",
     }:
         raise GmailAuthorizationError("Gmail authorization is no longer valid") from error
+
+
+def _raise_delivery_error(error: Exception) -> None:
+    try:
+        _raise_authorization_error(error)
+    except GmailAuthorizationError as authorization_error:
+        raise GmailDefinitiveDeliveryError("GMAIL_AUTHORIZATION_FAILED") from authorization_error
+    status_code = getattr(getattr(error, "resp", None), "status", None)
+    if status_code is None:
+        status_code = getattr(error, "status_code", None)
+    if status_code in {400, 404, 429}:
+        raise GmailDefinitiveDeliveryError(f"GMAIL_HTTP_{status_code}") from error
+    raise GmailAmbiguousDeliveryError("GMAIL_RESPONSE_AMBIGUOUS") from error

@@ -26,7 +26,7 @@ def test_0017_round_trip_preserves_the_published_0016_boundary() -> None:
     assert upgrade.returncode == 0, upgrade.stderr
     downgrade = _run_alembic("downgrade", "0016_email_ingestion")
     assert downgrade.returncode == 0, downgrade.stderr
-    restore = _run_alembic("upgrade", "0017_email_ingestion_hardening")
+    restore = _run_alembic("upgrade", "head")
     assert restore.returncode == 0, restore.stderr
 
 
@@ -52,7 +52,7 @@ def test_0018_round_trip_creates_current_draft_index() -> None:
     assert asyncio.run(index_exists())
     downgrade = _run_alembic("downgrade", "0017_email_ingestion_hardening")
     assert downgrade.returncode == 0, downgrade.stderr
-    restore = _run_alembic("upgrade", "0018_email_review")
+    restore = _run_alembic("upgrade", "head")
     assert restore.returncode == 0, restore.stderr
 
 

@@ -132,5 +132,5 @@ async def test_approval_api_requires_idempotency_and_replays_safe_metadata(
     assert replay.status_code == 200
     assert replay.json() == first.json()
     assert set(first.json()) == {"id", "state", "version", "current_draft_id"}
-    assert first.json()["state"] == "APPROVED"
+    assert first.json()["state"] == "SEND_PENDING"
     assert len(list((await db_session.scalars(select(EmailApproval))).all())) == 1
