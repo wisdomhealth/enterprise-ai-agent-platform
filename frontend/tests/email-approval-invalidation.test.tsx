@@ -45,20 +45,53 @@ it("visibly clears approval before a critical draft edit is saved", async () => 
 });
 
 it("replaces stale local state from a 409 and disables stale actions", async () => {
-  vi.mocked(editEmailDraft).mockRejectedValue(
-    new StaffApiError("Email changed", 409, undefined, {
-      id: emailDetail.id,
-      state: "SEND_PENDING",
-      version: 8,
-      current_draft_id: "draft-4",
-    }),
-  );
+  const latest = {
+    ...emailDetail,
+    state: "DELIVERY_UNKNOWN" as const,
+    version: 8,
+    current_draft_id: "draft-4",
+    drafts: [
+      ...emailDetail.drafts,
+      {
+        ...emailDetail.drafts[1],
+        id: "draft-4",
+        version: 4,
+        body: "A concurrent review replaced the stale draft.",
+        approval: { approved_at: "2026-09-01T08:08:00Z", invalidated_at: null },
+      },
+    ],
+    delivery: {
+      id: "intent-concurrent",
+      state: "DELIVERY_UNKNOWN" as const,
+      version: 4,
+      deterministic_message_id: "<concurrent@mail.invalid>",
+      last_error_code: "GMAIL_RESPONSE_UNKNOWN",
+      attempts: [
+        {
+          id: "attempt-concurrent",
+          attempt_number: 2,
+          outcome: "UNKNOWN" as const,
+          error_code: "GMAIL_RESPONSE_UNKNOWN",
+          started_at: "2026-09-01T08:09:00Z",
+          completed_at: "2026-09-01T08:10:00Z",
+        },
+      ],
+    },
+  };
+  vi.mocked(editEmailDraft).mockRejectedValue(new StaffApiError("Email changed", 409));
+  vi.mocked(getEmailDetail).mockResolvedValue(latest);
   render(<EmailReviewPanel item={emailDetail} />);
 
   fireEvent.change(screen.getByLabelText("Reply body"), { target: { value: "Stale edit" } });
   fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
   expect(await screen.findByText("This email changed elsewhere. The latest state is shown.")).toBeVisible();
-  expect(screen.getByText("Send pending")).toBeVisible();
+  expect(getEmailDetail).toHaveBeenCalledWith(emailDetail.id);
+  expect(
+    await screen.findByDisplayValue("A concurrent review replaced the stale draft."),
+  ).toBeVisible();
+  expect(screen.getByText("Draft version 4 — current")).toBeVisible();
+  expect(screen.getByText(/Attempt 2: Unknown/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Check Gmail delivery" })).toBeVisible();
   expect(screen.queryByRole("button", { name: "Save changes" })).not.toBeInTheDocument();
 });

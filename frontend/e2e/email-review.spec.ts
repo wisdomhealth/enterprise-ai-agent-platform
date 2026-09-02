@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
 
-type Fixture = { staff_session_id: string; csrf_token: string; email_id: string };
+type Fixture = {
+  staff_session_id: string;
+  csrf_token: string;
+  email_id: string;
+  conflict_email_id: string;
+};
 
 test("real review lifecycle preserves history and fences unknown delivery", async ({
   browser,
@@ -59,6 +64,49 @@ test("real review lifecycle preserves history and fences unknown delivery", asyn
   await expect(page.getByText(/may already have been sent/i)).toBeVisible();
   await expect(page.getByRole("button", { name: /send again|retry delivery/i })).toHaveCount(0);
   await expect(page.getByText("Staff Assist")).toBeVisible();
+
+  await context.close();
+});
+
+test("a stale 409 reloads the complete durable email detail", async ({ browser, request }) => {
+  const fixtureResponse = await request.get("http://127.0.0.1:3100/__e2e__/fixture");
+  expect(fixtureResponse.ok()).toBeTruthy();
+  const fixture = (await fixtureResponse.json()) as Fixture;
+  const context = await browser.newContext();
+  await context.addCookies([
+    {
+      name: "staff_session",
+      value: fixture.staff_session_id,
+      domain: "127.0.0.1",
+      path: "/",
+    },
+    { name: "staff_csrf", value: fixture.csrf_token, domain: "127.0.0.1", path: "/" },
+  ]);
+  const page = await context.newPage();
+
+  await page.goto(`/staff/email/${fixture.conflict_email_id}`);
+  await expect(page.getByLabel("Reply body")).toHaveValue("Stale browser draft.");
+
+  const concurrent = await request.post(
+    "http://127.0.0.1:3100/__e2e__/email-concurrent-review",
+    {
+      headers: {
+        Cookie: `staff_session=${fixture.staff_session_id}; staff_csrf=${fixture.csrf_token}`,
+        "X-CSRF-Token": fixture.csrf_token,
+      },
+    },
+  );
+  expect(concurrent.ok()).toBeTruthy();
+
+  await page.getByLabel("Reply body").fill("Stale browser edit.");
+  await page.getByRole("button", { name: "Save changes" }).click();
+
+  await expect(page.getByText("This email changed elsewhere. The latest state is shown.")).toBeVisible();
+  await expect(page.getByLabel("Reply body")).toHaveValue("Concurrent durable draft.");
+  await expect(page.getByText("Draft version 2 — current")).toBeVisible();
+  await expect(page.getByText(/Attempt 2: Unknown/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check Gmail delivery" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /send again|retry delivery/i })).toHaveCount(0);
 
   await context.close();
 });

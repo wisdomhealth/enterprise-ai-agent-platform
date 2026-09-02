@@ -36,6 +36,7 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
   const [confirmRegeneration, setConfirmRegeneration] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [conflictLocked, setConflictLocked] = useState(false);
 
   useEffect(() => {
     setBody(draft?.body ?? "");
@@ -53,7 +54,9 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
       subject !== draft.subject ||
       threadId !== draft.thread_id);
   const editable =
-    draft !== null && ["AWAITING_REVIEW", "APPROVED", "SEND_PENDING"].includes(current.state);
+    !conflictLocked &&
+    draft !== null &&
+    ["AWAITING_REVIEW", "APPROVED", "SEND_PENDING"].includes(current.state);
   const displayState = dirty && ["APPROVED", "SEND_PENDING"].includes(current.state)
     ? "AWAITING_REVIEW"
     : current.state;
@@ -73,15 +76,21 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
     }
   }
 
-  function handleConflict(error: unknown): boolean {
-    if (!(error instanceof StaffApiError) || error.status !== 409 || !error.email) return false;
-    setCurrent((value) => ({
-      ...value,
-      state: error.email?.state ?? value.state,
-      version: error.email?.version ?? value.version,
-      current_draft_id: error.email?.current_draft_id ?? value.current_draft_id,
-    }));
-    setNotice("This email changed elsewhere. The latest state is shown.");
+  async function refreshCurrent(): Promise<void> {
+    const fresh = await getEmailDetail(current.id);
+    setCurrent(fresh);
+    setConflictLocked(false);
+  }
+
+  async function handleConflict(error: unknown): Promise<boolean> {
+    if (!(error instanceof StaffApiError) || error.status !== 409) return false;
+    setConflictLocked(true);
+    try {
+      await refreshCurrent();
+      setNotice("This email changed elsewhere. The latest state is shown.");
+    } catch {
+      setNotice("This email changed elsewhere. Reload before taking another action.");
+    }
     return true;
   }
 
@@ -102,7 +111,7 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
       );
       setNotice("Draft saved. Approval must be reviewed again.");
     } catch (error) {
-      if (!handleConflict(error)) setNotice("Unable to save the draft.");
+      if (!(await handleConflict(error))) setNotice("Unable to save the draft.");
     } finally {
       setBusy(false);
     }
@@ -120,7 +129,7 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
       await applyResult(result);
       setNotice(operation === "approve" ? "Email approved." : "Email rejected.");
     } catch (error) {
-      if (!handleConflict(error)) setNotice(`Unable to ${operation} the email.`);
+      if (!(await handleConflict(error))) setNotice(`Unable to ${operation} the email.`);
     } finally {
       setBusy(false);
     }
@@ -138,7 +147,7 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
       setConfirmRegeneration(false);
       setNotice("A new immutable draft version was generated.");
     } catch (error) {
-      if (!handleConflict(error)) setNotice("Unable to regenerate the draft.");
+      if (!(await handleConflict(error))) setNotice("Unable to regenerate the draft.");
     } finally {
       setBusy(false);
     }
@@ -227,7 +236,7 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
         <p>No reviewable draft is available.</p>
       )}
 
-      {draft && current.state === "AWAITING_REVIEW" ? (
+      {draft && !conflictLocked && current.state === "AWAITING_REVIEW" ? (
         <section aria-label="Review actions">
           <button type="button" disabled={busy} onClick={() => void review("approve")}>
             Approve
@@ -279,7 +288,9 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
           ))}
         </ol>
       </section>
-      {current.delivery ? <DeliveryStatus delivery={current.delivery} /> : null}
+      {current.delivery ? (
+        <DeliveryStatus delivery={current.delivery} onRefresh={refreshCurrent} />
+      ) : null}
     </article>
   );
 }

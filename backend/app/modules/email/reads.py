@@ -1,12 +1,14 @@
+import re
 from collections.abc import Iterable
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote
 from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.authorization.models import ResourceGrant
 from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
 from app.modules.authorization.types import ResourceRef, ResourceState
 from app.modules.email.models import (
@@ -21,6 +23,16 @@ from app.modules.email.models import (
 from app.modules.email.schemas import EmailCitation
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
+from app.modules.knowledge.models import (
+    Document,
+    DocumentChunk,
+    DocumentVersion,
+    DocumentVersionState,
+    DriveSource,
+    DriveSourceStatus,
+)
+
+_DRIVE_FILE_ID = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class EmailReadAuthorizationError(PermissionError):
@@ -138,10 +150,7 @@ class EmailReadService:
             "reply_required": item.reply_required,
             "classification_rationale": _classification_rationale(item),
             "current_draft_id": str(item.current_draft_id) if item.current_draft_id else None,
-            "drafts": [
-                _draft_projection(item, draft, approval_by_draft.get(draft.id))
-                for draft in drafts
-            ],
+            "drafts": await self._draft_projections(item, drafts, approval_by_draft),
             "audit_transitions": [_history_projection(entry) for entry in history],
             "delivery": _delivery_projection(intent, attempts),
         }
@@ -165,6 +174,60 @@ class EmailReadService:
         except AuthorizationDenied:
             raise EmailReadAuthorizationError from None
 
+    async def _draft_projections(
+        self,
+        item: EmailWorkItem,
+        drafts: list[EmailDraftVersion],
+        approval_by_draft: dict[UUID, EmailApproval],
+    ) -> list[dict[str, object]]:
+        requested: dict[UUID, list[EmailCitation]] = {
+            draft.id: _citation_identities(item, draft.citations) for draft in drafts
+        }
+        chunk_ids = {
+            citation.chunk_id for citations in requested.values() for citation in citations
+        }
+        evidence: dict[tuple[UUID, UUID], tuple[DocumentChunk, DocumentVersion, Document]] = {}
+        if chunk_ids:
+            rows = await self._db_session.execute(
+                select(DocumentChunk, DocumentVersion, Document)
+                .join(DocumentVersion, DocumentVersion.id == DocumentChunk.document_version_id)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .join(DriveSource, DriveSource.id == Document.source_id)
+                .join(
+                    ResourceGrant,
+                    ResourceGrant.organization_id == item.organization_id,
+                )
+                .where(
+                    DocumentChunk.id.in_(chunk_ids),
+                    Document.organization_id == item.organization_id,
+                    Document.knowledge_base_id == item.knowledge_base_id,
+                    Document.current_version_id == DocumentVersion.id,
+                    DocumentVersion.state == DocumentVersionState.RETRIEVABLE,
+                    DriveSource.organization_id == item.organization_id,
+                    DriveSource.knowledge_base_id == item.knowledge_base_id,
+                    DriveSource.status == DriveSourceStatus.ACTIVE,
+                    ResourceGrant.subject_id == self._principal.subject_id,
+                    ResourceGrant.resource_type == "knowledge",
+                    ResourceGrant.resource_id == item.knowledge_base_id,
+                    ResourceGrant.actions.contains(["knowledge.review"]),
+                )
+            )
+            for chunk, version, document in rows.all():
+                evidence[(chunk.id, version.id)] = (chunk, version, document)
+        return [
+            _draft_projection(
+                draft,
+                approval_by_draft.get(draft.id),
+                [
+                    _persisted_citation_projection(record)
+                    for citation in requested[draft.id]
+                    if (record := evidence.get((citation.chunk_id, citation.document_version_id)))
+                    is not None
+                ],
+            )
+            for draft in drafts
+        ]
+
 
 def _queue_projection(item: EmailWorkItem) -> dict[str, object]:
     return {
@@ -181,9 +244,7 @@ def _queue_projection(item: EmailWorkItem) -> dict[str, object]:
 
 def _classification_rationale(item: EmailWorkItem) -> str:
     category = (
-        "Unclassified"
-        if item.category is None
-        else item.category.value.replace("_", " ").title()
+        "Unclassified" if item.category is None else item.category.value.replace("_", " ").title()
     )
     priority = "No priority" if item.priority is None else f"{item.priority.value.title()} priority"
     reply = (
@@ -197,7 +258,9 @@ def _classification_rationale(item: EmailWorkItem) -> str:
 
 
 def _draft_projection(
-    item: EmailWorkItem, draft: EmailDraftVersion, approval: EmailApproval | None
+    draft: EmailDraftVersion,
+    approval: EmailApproval | None,
+    citations: list[dict[str, object]],
 ) -> dict[str, object]:
     return {
         "id": str(draft.id),
@@ -211,11 +274,7 @@ def _draft_projection(
         "model": draft.model,
         "prompt_version": draft.prompt_version,
         "created_at": draft.created_at.isoformat(),
-        "citations": [
-            citation
-            for value in draft.citations
-            if (citation := _citation_projection(item, value)) is not None
-        ],
+        "citations": citations,
         "approval": None
         if approval is None
         else {
@@ -227,29 +286,40 @@ def _draft_projection(
     }
 
 
-def _citation_projection(item: EmailWorkItem, raw: Any) -> dict[str, object] | None:
-    if not isinstance(raw, dict):
-        return None
-    try:
-        citation = EmailCitation.model_validate(raw)
-    except ValidationError:
-        return None
-    if (
-        citation.organization_id != item.organization_id
-        or citation.knowledge_base_id != item.knowledge_base_id
-    ):
-        return None
-    link = citation.internal_drive_link
-    if link is not None:
-        parsed = urlparse(link)
-        if parsed.scheme != "https" or parsed.hostname != "drive.google.com":
-            link = None
+def _citation_identities(item: EmailWorkItem, values: Any) -> list[EmailCitation]:
+    if not isinstance(values, list):
+        return []
+    citations: list[EmailCitation] = []
+    for raw in values:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            citation = EmailCitation.model_validate(raw)
+        except ValidationError:
+            continue
+        if (
+            citation.organization_id == item.organization_id
+            and citation.knowledge_base_id == item.knowledge_base_id
+        ):
+            citations.append(citation)
+    return citations
+
+
+def _persisted_citation_projection(
+    record: tuple[DocumentChunk, DocumentVersion, Document],
+) -> dict[str, object]:
+    chunk, version, document = record
+    link = (
+        f"https://drive.google.com/open?id={quote(document.external_id, safe='')}"
+        if _DRIVE_FILE_ID.fullmatch(document.external_id)
+        else None
+    )
     return {
-        "title": citation.title,
-        "section": citation.section,
-        "page_number": citation.page_number,
-        "chunk_id": str(citation.chunk_id),
-        "document_version_id": str(citation.document_version_id),
+        "title": document.title,
+        "section": chunk.section,
+        "page_number": chunk.page_number,
+        "chunk_id": str(chunk.id),
+        "document_version_id": str(version.id),
         "internal_drive_link": link,
     }
 
@@ -284,9 +354,7 @@ def _delivery_projection(
                 "outcome": attempt.outcome,
                 "error_code": attempt.error_code,
                 "started_at": attempt.started_at.isoformat(),
-                "completed_at": attempt.completed_at.isoformat()
-                if attempt.completed_at
-                else None,
+                "completed_at": attempt.completed_at.isoformat() if attempt.completed_at else None,
             }
             for attempt in attempts
         ],

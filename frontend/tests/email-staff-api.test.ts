@@ -57,7 +57,7 @@ it("sends versioned review actions with CSRF and an idempotency key", async () =
   });
 });
 
-it("returns authoritative email state from a stale-version conflict", async () => {
+it("does not mistake a partial stale-version conflict body for complete email detail", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
@@ -79,9 +79,5 @@ it("returns authoritative email state from a stale-version conflict", async () =
   expect(error).toBeInstanceOf(StaffApiError);
   expect((error as StaffApiError).message).toBe("The resource changed");
   expect((error as StaffApiError).handoff).toBeUndefined();
-  expect((error as StaffApiError).email).toEqual({
-    state: "SEND_PENDING",
-    version: 8,
-    current_draft_id: "draft-4",
-  });
+  expect("email" in (error as object)).toBe(false);
 });

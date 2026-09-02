@@ -38,6 +38,7 @@ from app.modules.email.models import (
     EmailStateHistory,
     EmailWorkItem,
 )
+from app.modules.email.review import EmailReviewService
 from app.modules.identity.dependencies import (
     Principal,
     get_db_session,
@@ -266,6 +267,52 @@ async def seed_task16_lifecycle() -> None:
         db_session.add(email_draft)
         await db_session.flush()
         email_item.current_draft_id = email_draft.id
+        conflict_email_item = EmailWorkItem(
+            organization_id=organization.id,
+            connector_id=gmail_connector.id,
+            knowledge_base_id=knowledge_base.id,
+            gmail_message_id=f"task20-conflict-{uuid4().hex}",
+            gmail_thread_id="task20-conflict-thread",
+            sender="concurrent@example.test",
+            recipients=["support@example.test"],
+            subject="Concurrent browser review",
+            body="Please review this email concurrently.",
+            received_at=datetime.now(UTC),
+            raw_content_ref="gmail://task20/concurrent-browser-fixture",
+            state=EmailState.AWAITING_REVIEW,
+            category=EmailCategory.ACTION_REQUIRED,
+            priority=EmailPriority.NORMAL,
+            reply_required=True,
+            draft_body="Stale browser draft.",
+            draft_citations=[],
+            draft_provenance={
+                "model": "claude-e2e",
+                "prompt_version": "email-e2e-v1",
+            },
+            version=3,
+        )
+        db_session.add(conflict_email_item)
+        await db_session.flush()
+        conflict_email_draft = EmailDraftVersion(
+            work_item_id=conflict_email_item.id,
+            organization_id=organization.id,
+            version=1,
+            body="Stale browser draft.",
+            to=["concurrent@example.test"],
+            cc=[],
+            subject="Re: Concurrent browser review",
+            thread_id=conflict_email_item.gmail_thread_id,
+            reviewer_instruction=None,
+            model="claude-e2e",
+            prompt_version="email-e2e-v1",
+            retrieval_config={},
+            citations=[],
+            created_by_id=reviewer.id,
+            creator_type="STAFF",
+        )
+        db_session.add(conflict_email_draft)
+        await db_session.flush()
+        conflict_email_item.current_draft_id = conflict_email_draft.id
         db_session.add(
             EmailStateHistory(
                 work_item_id=email_item.id,
@@ -289,6 +336,7 @@ async def seed_task16_lifecycle() -> None:
                 "job_id": stale_job.id,
                 "session_id": session.id,
                 "email_id": email_item.id,
+                "conflict_email_id": conflict_email_item.id,
             }
         )
         app.state.grounded_answer_service = BrowserGroundedAnswerService()
@@ -301,6 +349,7 @@ async def fixture_read() -> dict[str, object]:
         "csrf_token": CSRF_TOKEN,
         "handoff_id": str(fixture["handoff_id"]),
         "email_id": str(fixture["email_id"]),
+        "conflict_email_id": str(fixture["conflict_email_id"]),
     }
 
 
@@ -391,3 +440,71 @@ async def make_email_delivery_unknown(
     )
     await db_session.commit()
     return {"state": item.state.value, "delivery_intent_id": str(intent.id)}
+
+
+@app.post("/__e2e__/email-concurrent-review")
+async def make_concurrent_email_review(
+    principal: Principal = Depends(require_staff_csrf),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    item = await db_session.get(EmailWorkItem, fixture["conflict_email_id"])
+    assert (
+        item is not None
+        and item.organization_id == principal.organization_id
+        and item.current_draft_id is not None
+    )
+    service = EmailReviewService(db_session, principal)
+    edited = await service.edit(
+        item.id,
+        expected_version=item.version,
+        current_draft_id=item.current_draft_id,
+        body="Concurrent durable draft.",
+    )
+    approved = await service.approve(
+        item.id,
+        expected_version=edited.version,
+        current_draft_id=edited.current_draft_id,
+    )
+    intent = await db_session.scalar(
+        select(DeliveryIntent).where(
+            DeliveryIntent.work_item_id == item.id,
+            DeliveryIntent.organization_id == principal.organization_id,
+            DeliveryIntent.approved_draft_version_id == approved.current_draft_id,
+        )
+    )
+    assert intent is not None
+    previous = item.state
+    item.state = EmailState.DELIVERY_UNKNOWN
+    item.version += 1
+    intent.state = EmailState.DELIVERY_UNKNOWN
+    intent.version += 1
+    intent.attempts = 2
+    intent.last_error_code = "GMAIL_RESPONSE_TIMEOUT"
+    db_session.add_all(
+        [
+            DeliveryAttempt(
+                delivery_intent_id=intent.id,
+                attempt_number=2,
+                outcome="UNKNOWN",
+                error_code="GMAIL_RESPONSE_TIMEOUT",
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            ),
+            EmailStateHistory(
+                work_item_id=item.id,
+                organization_id=item.organization_id,
+                from_state=previous,
+                to_state=item.state,
+                action=EmailAction.DELIVERY_AMBIGUOUS,
+                reason_code="GMAIL_RESPONSE_TIMEOUT",
+                actor_type="SYSTEM",
+                resource_version=item.version,
+            ),
+        ]
+    )
+    await db_session.commit()
+    return {
+        "state": item.state.value,
+        "current_draft_id": str(item.current_draft_id),
+        "delivery_intent_id": str(intent.id),
+    }

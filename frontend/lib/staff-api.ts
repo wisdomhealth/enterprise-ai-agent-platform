@@ -136,7 +136,6 @@ export class StaffApiError extends Error {
     message: string,
     readonly status: number,
     readonly handoff?: SupportHandoff,
-    readonly email?: Partial<EmailActionResult>,
   ) {
     super(message);
   }
@@ -181,14 +180,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
             ...(detail as Pick<SupportHandoff, "state" | "version">),
           } as SupportHandoff)
         : undefined;
-    const email =
-      path.startsWith("/email") &&
-      typeof detail === "object" &&
-      detail !== null &&
-      "state" in detail &&
-      "version" in detail
-        ? (detail as Partial<EmailActionResult>)
-        : undefined;
     throw new StaffApiError(
       response.status === 409 && handoff
         ? "Already claimed"
@@ -197,7 +188,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
           : "Unable to complete the staff action.",
       response.status,
       handoff,
-      email,
     );
   }
   return (await response.json()) as T;

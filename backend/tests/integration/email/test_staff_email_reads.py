@@ -19,6 +19,14 @@ from app.modules.email.models import (
 from app.modules.email.review import EmailReviewService
 from app.modules.identity.dependencies import Principal, get_db_session, require_staff_session
 from app.modules.identity.models import StaffUser, UserRole, UserStatus
+from app.modules.knowledge.models import (
+    Document,
+    DocumentChunk,
+    DocumentVersion,
+    DocumentVersionState,
+    DriveSource,
+    DriveSourceStatus,
+)
 
 
 def _application(db_session: AsyncSession, principal: Principal):  # type: ignore[no-untyped-def]
@@ -119,10 +127,7 @@ async def test_authorized_staff_reads_queue_and_safe_persisted_detail(
     assert payload["drafts"][0]["reviewer_instruction"] == "Keep it concise."
     assert payload["drafts"][0]["model"] == "claude-fixture"
     assert payload["drafts"][0]["prompt_version"] == "email-draft-v1"
-    assert payload["drafts"][0]["citations"][0]["title"] == "Support policy"
-    assert payload["drafts"][0]["citations"][1]["title"] == "Unsafe link is removed"
-    assert payload["drafts"][0]["citations"][1]["internal_drive_link"] is None
-    assert len(payload["drafts"][0]["citations"]) == 2
+    assert payload["drafts"][0]["citations"] == []
     assert payload["delivery"] is None
     serialized = str(payload)
     assert "raw_content_ref" not in serialized
@@ -132,6 +137,169 @@ async def test_authorized_staff_reads_queue_and_safe_persisted_detail(
     assert str(item.knowledge_base_id) not in serialized
     assert "attacker.example" not in serialized
     assert "Cross-tenant source" not in serialized
+
+
+async def _persist_citation_evidence(
+    db_session: AsyncSession,
+    email_review_context: dict[str, object],
+    *,
+    version_state: DocumentVersionState = DocumentVersionState.RETRIEVABLE,
+    source_status: DriveSourceStatus = DriveSourceStatus.ACTIVE,
+) -> tuple[DocumentChunk, DocumentVersion, Document, DriveSource]:
+    item = email_review_context["item"]
+    source = DriveSource(
+        organization_id=item.organization_id,
+        knowledge_base_id=item.knowledge_base_id,
+        root_folder_id="approved-email-knowledge-root",
+        allowed_descendant_ids=["approved-email-knowledge-child"],
+        status=source_status,
+        connection_identity="task20-reader@example.test",
+    )
+    db_session.add(source)
+    await db_session.flush()
+    document = Document(
+        organization_id=item.organization_id,
+        knowledge_base_id=item.knowledge_base_id,
+        source_id=source.id,
+        external_id="canonical-drive-file-id",
+        title="Canonical support policy",
+        mime_type="application/pdf",
+    )
+    db_session.add(document)
+    await db_session.flush()
+    version = DocumentVersion(
+        document_id=document.id,
+        state=version_state,
+        content_sha256=uuid4().hex + uuid4().hex,
+    )
+    db_session.add(version)
+    await db_session.flush()
+    document.current_version_id = version.id
+    chunk = DocumentChunk(
+        id=uuid4(),
+        document_version_id=version.id,
+        ordinal=0,
+        text="Support responds within one business day.",
+        page_number=7,
+        section="Canonical response times",
+        token_count=7,
+        metadata_={"chunking_version": "v1"},
+        embedding=[1.0] * 1536,
+    )
+    db_session.add(chunk)
+    await db_session.flush()
+    return chunk, version, document, source
+
+
+@pytest.mark.asyncio
+async def test_email_detail_reconstructs_staff_citation_from_current_authorized_records(
+    db_session: AsyncSession, email_review_context: dict[str, object]
+) -> None:
+    item = email_review_context["item"]
+    draft = email_review_context["draft"]
+    principal = email_review_context["principal"]
+    chunk, version, document, _ = await _persist_citation_evidence(db_session, email_review_context)
+    draft.citations = [
+        {
+            "organization_id": str(item.organization_id),
+            "knowledge_base_id": str(item.knowledge_base_id),
+            "chunk_id": str(chunk.id),
+            "document_version_id": str(version.id),
+            "title": "Forged title from draft JSON",
+            "section": "Forged section",
+            "page_number": 999,
+            "internal_drive_link": "https://drive.google.com/open?id=forged-file-id",
+        }
+    ]
+    await db_session.flush()
+
+    application = _application(db_session, principal)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="https://testserver"
+        ) as client:
+            detail = await client.get(f"/api/v1/staff/email/{item.id}")
+    finally:
+        application.dependency_overrides.clear()
+
+    assert detail.status_code == 200
+    assert detail.json()["drafts"][0]["citations"] == [
+        {
+            "title": document.title,
+            "section": chunk.section,
+            "page_number": chunk.page_number,
+            "chunk_id": str(chunk.id),
+            "document_version_id": str(version.id),
+            "internal_drive_link": ("https://drive.google.com/open?id=canonical-drive-file-id"),
+        }
+    ]
+    assert "forged" not in str(detail.json()).lower()
+
+
+@pytest.mark.parametrize(
+    ("version_state", "source_status", "misbind_version", "replace_current"),
+    [
+        (DocumentVersionState.REVOKED, DriveSourceStatus.ACTIVE, False, False),
+        (DocumentVersionState.DELETED, DriveSourceStatus.ACTIVE, False, False),
+        (DocumentVersionState.PROCESSING, DriveSourceStatus.ACTIVE, False, False),
+        (DocumentVersionState.RETRIEVABLE, DriveSourceStatus.DISABLED, False, False),
+        (DocumentVersionState.RETRIEVABLE, DriveSourceStatus.ACTIVE, True, False),
+        (DocumentVersionState.RETRIEVABLE, DriveSourceStatus.ACTIVE, False, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_email_detail_omits_unprovable_or_revoked_staff_citations(
+    db_session: AsyncSession,
+    email_review_context: dict[str, object],
+    version_state: DocumentVersionState,
+    source_status: DriveSourceStatus,
+    misbind_version: bool,
+    replace_current: bool,
+) -> None:
+    item = email_review_context["item"]
+    draft = email_review_context["draft"]
+    principal = email_review_context["principal"]
+    chunk, version, document, _ = await _persist_citation_evidence(
+        db_session,
+        email_review_context,
+        version_state=version_state,
+        source_status=source_status,
+    )
+    if replace_current:
+        replacement = DocumentVersion(
+            document_id=document.id,
+            state=DocumentVersionState.RETRIEVABLE,
+            content_sha256=uuid4().hex + uuid4().hex,
+        )
+        db_session.add(replacement)
+        await db_session.flush()
+        document.current_version_id = replacement.id
+    draft.citations = [
+        {
+            "organization_id": str(item.organization_id),
+            "knowledge_base_id": str(item.knowledge_base_id),
+            "chunk_id": str(chunk.id),
+            "document_version_id": str(uuid4() if misbind_version else version.id),
+            "title": "Untrusted draft title",
+            "section": "Untrusted draft section",
+            "page_number": 999,
+            "internal_drive_link": "https://drive.google.com/open?id=untrusted",
+        }
+    ]
+    await db_session.flush()
+
+    application = _application(db_session, principal)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="https://testserver"
+        ) as client:
+            detail = await client.get(f"/api/v1/staff/email/{item.id}")
+    finally:
+        application.dependency_overrides.clear()
+
+    assert detail.status_code == 200
+    assert detail.json()["drafts"][0]["citations"] == []
+    assert "untrusted" not in str(detail.json()).lower()
 
 
 @pytest.mark.asyncio
