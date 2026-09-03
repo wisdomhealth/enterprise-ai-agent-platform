@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
+import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Protocol
@@ -119,6 +122,56 @@ EVENT_REQUIRED_FIELDS = MappingProxyType(
     }
 )
 
+SUPPORTED_EVENT_SCHEMAS = MappingProxyType(
+    {
+        (event_type, 1): (allowed_fields, EVENT_REQUIRED_FIELDS[event_type])
+        for event_type, allowed_fields in EVENT_DATA_FIELDS.items()
+    }
+)
+
+_UUID_FIELDS = frozenset(
+    {
+        "organization_id",
+        "source_id",
+        "document_id",
+        "handoff_id",
+        "session_id",
+        "assigned_user_id",
+        "message_id",
+        "draft_version_id",
+        "delivery_intent_id",
+    }
+)
+_ENUM_FIELDS = MappingProxyType(
+    {
+        "kind": frozenset({"DRIVE", "GMAIL"}),
+        "trigger": frozenset(
+            {
+                "CUSTOMER_REQUEST",
+                "LOW_CONFIDENCE",
+                "REPEATED_FAILURE",
+                "SENSITIVE_TOPIC",
+                "SYSTEM_ERROR",
+            }
+        ),
+        "state": frozenset(
+            {
+                "AI_ACTIVE",
+                "HANDOFF_REQUESTED",
+                "QUEUED",
+                "HUMAN_ACTIVE",
+                "RESOLVED",
+                "AWAITING_REVIEW",
+                "SENT",
+                "DELIVERY_UNKNOWN",
+            }
+        ),
+        "scope": frozenset({"CUSTOMER", "KNOWLEDGE_DOCUMENT"}),
+        "status": frozenset({"PENDING", "APPLIED", "FAILED"}),
+    }
+)
+_MAX_WEBHOOK_INTEGER = 2_147_483_647
+
 
 @dataclass(frozen=True, slots=True)
 class WebhookRequest:
@@ -152,6 +205,7 @@ class HttpxWebhookTransport:
         body: bytes,
         headers: dict[str, str],
     ) -> WebhookTransportResponse:
+        await _validate_delivery_endpoint(url)
         async with httpx.AsyncClient(
             follow_redirects=False,
             timeout=httpx.Timeout(15.0),
@@ -176,12 +230,68 @@ def _validated_endpoint_url(value: str) -> str:
     ):
         raise ValueError("webhook endpoint must be an HTTPS URL without credentials or fragments")
     try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("webhook endpoint has an invalid port") from exc
+    try:
         encoded = value.encode("ascii")
     except UnicodeEncodeError as exc:
         raise ValueError("webhook endpoint must use an ASCII URL") from exc
     if len(encoded) > 2048:
         raise ValueError("webhook endpoint is too long")
+    _require_global_ip_address(parsed.hostname)
     return value
+
+
+async def _resolve_endpoint_addresses(hostname: str, port: int) -> tuple[str, ...]:
+    try:
+        records = await asyncio.get_running_loop().getaddrinfo(
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise ValueError("webhook endpoint could not be resolved") from exc
+    addresses = tuple(dict.fromkeys(record[4][0] for record in records))
+    if not addresses:
+        raise ValueError("webhook endpoint could not be resolved")
+    return addresses
+
+
+async def _validate_delivery_endpoint(value: str) -> None:
+    """Re-resolve hostnames immediately before every external HTTP request."""
+
+    _validated_endpoint_url(value)
+    parsed = urlsplit(value)
+    assert parsed.hostname is not None
+    if _ip_address_or_none(parsed.hostname) is not None:
+        return
+    addresses = await _resolve_endpoint_addresses(parsed.hostname, parsed.port or 443)
+    for address in addresses:
+        _require_global_ip_address(address)
+
+
+def _ip_address_or_none(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if "%" in value:
+        raise ValueError("webhook endpoint must use a public IP address")
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
+def _require_global_ip_address(value: str) -> None:
+    address = _ip_address_or_none(value)
+    if address is not None and (
+        not address.is_global
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_private
+        or address.is_unspecified
+        or address.is_reserved
+        or address.is_multicast
+    ):
+        raise ValueError("webhook endpoint must use a public IP address")
 
 
 class WebhookSubscriptionService:
@@ -217,10 +327,11 @@ class WebhookSubscriptionService:
         if self._cipher is None:
             raise RuntimeError("webhook envelope encryption is not configured")
         encrypted = await self._cipher.encrypt(signing_secret)
+        await _validate_delivery_endpoint(endpoint_url)
         subscription = WebhookSubscription(
             organization_id=principal.organization_id,
             created_by_id=principal.subject_id,
-            endpoint_url=_validated_endpoint_url(endpoint_url),
+            endpoint_url=endpoint_url,
             event_types=normalized_types,
             secret_ciphertext=encrypted.ciphertext,
             secret_encrypted_data_key=encrypted.encrypted_data_key,
@@ -358,7 +469,7 @@ class WebhookSubscriptionService:
         )
 
     async def schedule(self, event: OutboxEvent) -> list[WebhookDelivery]:
-        if event.event_type not in EVENT_DATA_FIELDS:
+        if (event.event_type, event.event_version) not in SUPPORTED_EVENT_SCHEMAS:
             return []
         try:
             organization_id = UUID(str(event.payload["organization_id"]))
@@ -449,19 +560,7 @@ class WebhookDeliveryService:
     ) -> WebhookRequest:
         if attempt <= 0:
             raise ValueError("delivery attempt must be positive")
-        allowed_fields = EVENT_DATA_FIELDS.get(event.event_type)
-        if allowed_fields is None:
-            raise ValueError("event type is not allowed for webhook delivery")
-        required_fields = EVENT_REQUIRED_FIELDS[event.event_type]
-        if not required_fields.issubset(event.payload):
-            raise ValueError("webhook event has invalid data")
-        data = {key: value for key, value in event.payload.items() if key in allowed_fields}
-        if any(
-            not isinstance(value, (str, int, bool))
-            or (isinstance(value, str) and len(value.encode("utf-8")) > 1024)
-            for value in data.values()
-        ):
-            raise ValueError("webhook event has invalid data")
+        data = _validated_event_data(event)
         occurred_at = event.occurred_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
         body: dict[str, object] = {
             "event_id": str(event.event_id),
@@ -740,3 +839,69 @@ def _retry_after(headers: Mapping[str, str] | None) -> int | None:
 
 def retryable_for_attempt(*, requested: bool, attempt: int) -> bool:
     return requested and attempt < 5
+
+
+def _validated_event_data(event: OutboxEvent) -> dict[str, object]:
+    if not isinstance(event.event_type, str) or event.event_type not in EVENT_DATA_FIELDS:
+        raise ValueError("webhook event type is not allowed for webhook delivery")
+    if (
+        type(event.event_version) is not int
+        or (event.event_type, event.event_version) not in SUPPORTED_EVENT_SCHEMAS
+    ):
+        raise ValueError("webhook event schema is not supported")
+    if not isinstance(event.event_id, UUID):
+        raise ValueError("webhook event has invalid data")
+    if (
+        not isinstance(event.occurred_at, datetime)
+        or event.occurred_at.tzinfo is None
+        or event.occurred_at.utcoffset() is None
+    ):
+        raise ValueError("webhook event has invalid timestamp")
+    if not isinstance(event.payload, Mapping):
+        raise ValueError("webhook event has invalid data")
+    allowed_fields, required_fields = SUPPORTED_EVENT_SCHEMAS[
+        (event.event_type, event.event_version)
+    ]
+    data = {
+        key: event.payload[key]
+        for key in allowed_fields
+        if key in event.payload and event.payload[key] is not None
+    }
+    if not required_fields.issubset(data):
+        raise ValueError("webhook event has invalid data")
+    if any(not _valid_event_field(key, value) for key, value in data.items()):
+        raise ValueError("webhook event has invalid data")
+    return data
+
+
+def _valid_event_field(field: str, value: object) -> bool:
+    if field in _UUID_FIELDS:
+        return _is_canonical_uuid(value)
+    if field in _ENUM_FIELDS:
+        return isinstance(value, str) and value in _ENUM_FIELDS[field]
+    if field == "version":
+        return type(value) is int and 1 <= value <= _MAX_WEBHOOK_INTEGER
+    if field in {"handoff_boundary", "last_customer_sequence", "replay_generation", "sequence"}:
+        return type(value) is int and 0 <= value <= _MAX_WEBHOOK_INTEGER
+    if field == "await_customer_message":
+        return type(value) is bool
+    if field == "error_code":
+        return (
+            isinstance(value, str)
+            and 0 < len(value) <= 100
+            and value.isascii()
+            and all(
+                character.isupper() or character.isdigit() or character == "_"
+                for character in value
+            )
+        )
+    return isinstance(value, str) and 0 < len(value.encode("utf-8")) <= 1024
+
+
+def _is_canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value.lower()
+    except ValueError:
+        return False

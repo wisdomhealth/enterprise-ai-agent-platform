@@ -15,6 +15,7 @@ from app.modules.identity.dependencies import (
 )
 from app.modules.jobs.models import JobIntent
 from app.modules.outbox.models import OutboxEvent
+from app.modules.webhooks import delivery as webhook_delivery
 from app.modules.webhooks.delivery import WebhookSubscriptionService
 from app.modules.webhooks.models import WebhookDelivery, WebhookSubscription
 
@@ -71,6 +72,77 @@ async def test_subscription_secret_is_encrypted_and_event_intent_is_idempotent(
             select(func.count(JobIntent.id)).where(JobIntent.id == deliveries[0].job_id)
         )
         == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_event_version_creates_no_durable_delivery_intent(
+    db_session,
+    webhook_context,
+) -> None:  # type: ignore[no-untyped-def]
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    admin = webhook_context["principal"](webhook_context["admin"])
+    subscription = await service.create(
+        admin,
+        endpoint_url="https://hooks.example.test/unknown-version",
+        event_types=["support.handoff.queued"],
+        signing_secret="unknown-version-secret-with-at-least-32-bytes",
+    )
+    event = OutboxEvent(
+        event_type="support.handoff.queued",
+        event_version=999,
+        aggregate_type="support_handoff",
+        aggregate_id=subscription.id,
+        payload={
+            "organization_id": str(admin.organization_id),
+            "handoff_id": str(subscription.id),
+            "trigger": "CUSTOMER_REQUEST",
+            "last_customer_sequence": 1,
+        },
+        occurred_at=datetime.now(UTC),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    assert await service.schedule(event) == []
+    assert (
+        await db_session.scalar(
+            select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_subscription_creation_rejects_hostname_resolving_to_private_address(
+    db_session,
+    webhook_context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    async def private_resolution(*_args: object) -> tuple[str, ...]:
+        return ("10.0.0.1",)
+
+    monkeypatch.setattr(
+        webhook_delivery,
+        "_resolve_endpoint_addresses",
+        private_resolution,
+        raising=False,
+    )
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    admin = webhook_context["principal"](webhook_context["admin"])
+
+    with pytest.raises(ValueError, match="public"):
+        await service.create(
+            admin,
+            endpoint_url="https://private-resolution.example.test/webhook",
+            event_types=["support.handoff.queued"],
+            signing_secret="private-resolution-secret-with-at-least-32-bytes",
+        )
+    assert (
+        await db_session.scalar(
+            select(func.count(JobIntent.id)).where(JobIntent.kind == "webhook.deliver")
+        )
+        == 0
     )
 
 

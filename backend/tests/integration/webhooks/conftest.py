@@ -3,12 +3,24 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.connectors.encryption import EnvelopeCipher, FileKeyWrapper
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffUser, UserRole, UserStatus
+from app.modules.webhooks import delivery as webhook_delivery
+
+
+@pytest.fixture(autouse=True)
+def resolve_webhook_endpoints_to_public_test_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep subscription-creation tests deterministic without external DNS."""
+
+    async def public_resolution(*_args: object) -> tuple[str, ...]:
+        return ("8.8.8.8",)
+
+    monkeypatch.setattr(webhook_delivery, "_resolve_endpoint_addresses", public_resolution)
 
 
 @pytest_asyncio.fixture
