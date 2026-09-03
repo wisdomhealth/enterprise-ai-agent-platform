@@ -218,3 +218,69 @@ async def test_allowlisted_event_with_malformed_data_fails_closed() -> None:
             signing_secret=b"w" * 32,
             timestamp=1_800_000_000,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        (
+            "support.handoff.queued",
+            {
+                "organization_id": "00000000-0000-0000-0000-000000000002",
+                "handoff_id": "00000000-0000-0000-0000-000000000001",
+                "state": "HUMAN_ACTIVE",
+                "trigger": "CUSTOMER_REQUEST",
+                "last_customer_sequence": 1,
+            },
+        ),
+        (
+            "email.draft.ready",
+            {
+                "organization_id": "00000000-0000-0000-0000-000000000002",
+                "state": "SENT",
+                "version": 1,
+                "draft_version_id": "00000000-0000-0000-0000-000000000003",
+            },
+        ),
+        (
+            "email.delivery.sent",
+            {
+                "organization_id": "00000000-0000-0000-0000-000000000002",
+                "delivery_intent_id": "00000000-0000-0000-0000-000000000003",
+                "approved_draft_version_id": "00000000-0000-0000-0000-000000000004",
+                "state": "DELIVERY_UNKNOWN",
+            },
+        ),
+        (
+            "email.delivery.unknown",
+            {
+                "organization_id": "00000000-0000-0000-0000-000000000002",
+                "delivery_intent_id": "00000000-0000-0000-0000-000000000003",
+                "state": "SENT",
+                "error_code": "TIMEOUT",
+            },
+        ),
+    ],
+)
+async def test_event_schema_rejects_state_from_another_published_event(
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    event = OutboxEvent(
+        event_id=UUID("00000000-0000-0000-0000-000000000004"),
+        event_type=event_type,
+        event_version=1,
+        aggregate_type="event",
+        aggregate_id=UUID("00000000-0000-0000-0000-000000000001"),
+        payload=payload,
+        occurred_at=datetime(2026, 9, 3, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="invalid data"):
+        await WebhookDeliveryService.build(
+            event,
+            attempt=1,
+            signing_secret=b"w" * 32,
+            timestamp=1_800_000_000,
+        )

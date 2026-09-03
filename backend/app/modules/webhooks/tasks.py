@@ -20,6 +20,7 @@ from app.modules.webhooks.delivery import (
     HttpxWebhookTransport,
     WebhookDeliveryService,
     WebhookSubscriptionService,
+    validate_webhook_event,
 )
 
 WEBHOOK_DELIVERY_TASK_NAME = "app.modules.webhooks.tasks.webhook_delivery_job"
@@ -83,6 +84,11 @@ async def _dispatch_pending_webhook_events(*, db_session: AsyncSession | None = 
     job_ids: list[UUID] = []
     service = WebhookSubscriptionService(db_session, envelope_cipher_from_settings(settings))
     for event in events:
+        try:
+            validate_webhook_event(event)
+        except ValueError:
+            # Invalid producer data remains unprocessed for durable Outbox recovery.
+            continue
         if not await OutboxService().begin_processing(
             db_session,
             WEBHOOK_SCHEDULER_CONSUMER,

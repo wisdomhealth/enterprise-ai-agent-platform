@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import UUID
 
 import httpx
 import pytest
@@ -14,10 +15,14 @@ from app.modules.identity.dependencies import (
     require_staff_session,
 )
 from app.modules.jobs.models import JobIntent
-from app.modules.outbox.models import OutboxEvent
+from app.modules.outbox.models import OutboxEvent, ProcessedEvent
 from app.modules.webhooks import delivery as webhook_delivery
 from app.modules.webhooks.delivery import WebhookSubscriptionService
 from app.modules.webhooks.models import WebhookDelivery, WebhookSubscription
+from app.modules.webhooks.tasks import (
+    WEBHOOK_SCHEDULER_CONSUMER,
+    _dispatch_pending_webhook_events,
+)
 
 
 @pytest.mark.asyncio
@@ -157,6 +162,71 @@ async def test_malformed_published_event_creates_no_durable_delivery_or_job(
     await db_session.flush()
 
     assert await service.schedule(event) == []
+    assert (
+        await db_session.scalar(
+            select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)
+        )
+        == 0
+    )
+    assert (
+        await db_session.scalar(
+            select(func.count(JobIntent.id)).where(JobIntent.kind == "webhook.deliver")
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_version", "payload"),
+    [
+        (
+            999,
+            {
+                "organization_id": "00000000-0000-0000-0000-000000000002",
+                "handoff_id": "00000000-0000-0000-0000-000000000001",
+                "trigger": "CUSTOMER_REQUEST",
+                "last_customer_sequence": 1,
+            },
+        ),
+        (
+            1,
+            {
+                "organization_id": "not-a-uuid",
+                "handoff_id": "00000000-0000-0000-0000-000000000001",
+                "trigger": "CUSTOMER_REQUEST",
+                "last_customer_sequence": 1,
+            },
+        ),
+    ],
+)
+async def test_dispatcher_leaves_invalid_event_unprocessed_without_durable_delivery_intent(
+    db_session,
+    event_version: int,
+    payload: dict[str, object],
+) -> None:  # type: ignore[no-untyped-def]
+    event = OutboxEvent(
+        event_type="support.handoff.queued",
+        event_version=event_version,
+        aggregate_type="support_handoff",
+        aggregate_id=UUID("00000000-0000-0000-0000-000000000001"),
+        payload=payload,
+        occurred_at=datetime.now(UTC),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    await _dispatch_pending_webhook_events(db_session=db_session)
+
+    assert (
+        await db_session.scalar(
+            select(func.count(ProcessedEvent.event_id)).where(
+                ProcessedEvent.consumer_name == WEBHOOK_SCHEDULER_CONSUMER,
+                ProcessedEvent.event_id == event.event_id,
+            )
+        )
+        == 0
+    )
     assert (
         await db_session.scalar(
             select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)

@@ -143,10 +143,11 @@ _UUID_FIELDS = frozenset(
         "delivery_intent_id",
     }
 )
-_ENUM_FIELDS = MappingProxyType(
+_EVENT_ENUM_VALUES = MappingProxyType(
     {
-        "kind": frozenset({"DRIVE", "GMAIL"}),
-        "trigger": frozenset(
+        ("connector.authorized", "kind"): frozenset({"DRIVE", "GMAIL"}),
+        ("connector.reauthorization_required", "kind"): frozenset({"DRIVE", "GMAIL"}),
+        ("support.handoff.queued", "trigger"): frozenset(
             {
                 "CUSTOMER_REQUEST",
                 "LOW_CONFIDENCE",
@@ -155,20 +156,12 @@ _ENUM_FIELDS = MappingProxyType(
                 "SYSTEM_ERROR",
             }
         ),
-        "state": frozenset(
-            {
-                "AI_ACTIVE",
-                "HANDOFF_REQUESTED",
-                "QUEUED",
-                "HUMAN_ACTIVE",
-                "RESOLVED",
-                "AWAITING_REVIEW",
-                "SENT",
-                "DELIVERY_UNKNOWN",
-            }
-        ),
-        "scope": frozenset({"CUSTOMER", "KNOWLEDGE_DOCUMENT"}),
-        "status": frozenset({"PENDING", "APPLIED", "FAILED"}),
+        ("support.handoff.queued", "state"): frozenset({"QUEUED"}),
+        ("email.draft.ready", "state"): frozenset({"AWAITING_REVIEW"}),
+        ("email.delivery.sent", "state"): frozenset({"SENT"}),
+        ("email.delivery.unknown", "state"): frozenset({"DELIVERY_UNKNOWN"}),
+        ("retention.erasure.applied", "scope"): frozenset({"CUSTOMER", "KNOWLEDGE_DOCUMENT"}),
+        ("retention.erasure.applied", "status"): frozenset({"APPLIED"}),
     }
 )
 _MAX_WEBHOOK_INTEGER = 2_147_483_647
@@ -536,7 +529,7 @@ class WebhookSubscriptionService:
 
     async def schedule(self, event: OutboxEvent) -> list[WebhookDelivery]:
         try:
-            data = _validated_event_data(event)
+            data = validate_webhook_event(event)
         except ValueError:
             return []
         try:
@@ -628,7 +621,7 @@ class WebhookDeliveryService:
     ) -> WebhookRequest:
         if attempt <= 0:
             raise ValueError("delivery attempt must be positive")
-        data = _validated_event_data(event)
+        data = validate_webhook_event(event)
         occurred_at = event.occurred_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
         body: dict[str, object] = {
             "event_id": str(event.event_id),
@@ -909,7 +902,7 @@ def retryable_for_attempt(*, requested: bool, attempt: int) -> bool:
     return requested and attempt < 5
 
 
-def _validated_event_data(event: OutboxEvent) -> dict[str, object]:
+def validate_webhook_event(event: OutboxEvent) -> dict[str, object]:
     if not isinstance(event.event_type, str) or event.event_type not in EVENT_DATA_FIELDS:
         raise ValueError("webhook event type is not allowed for webhook delivery")
     if (
@@ -937,16 +930,16 @@ def _validated_event_data(event: OutboxEvent) -> dict[str, object]:
     }
     if not required_fields.issubset(data):
         raise ValueError("webhook event has invalid data")
-    if any(not _valid_event_field(key, value) for key, value in data.items()):
+    if any(not _valid_event_field(event.event_type, key, value) for key, value in data.items()):
         raise ValueError("webhook event has invalid data")
     return data
 
 
-def _valid_event_field(field: str, value: object) -> bool:
+def _valid_event_field(event_type: str, field: str, value: object) -> bool:
     if field in _UUID_FIELDS:
         return _is_canonical_uuid(value)
-    if field in _ENUM_FIELDS:
-        return isinstance(value, str) and value in _ENUM_FIELDS[field]
+    if (event_type, field) in _EVENT_ENUM_VALUES:
+        return isinstance(value, str) and value in _EVENT_ENUM_VALUES[(event_type, field)]
     if field == "version":
         return type(value) is int and 1 <= value <= _MAX_WEBHOOK_INTEGER
     if field in {"handoff_boundary", "last_customer_sequence", "replay_generation", "sequence"}:
