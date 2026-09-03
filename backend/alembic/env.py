@@ -21,6 +21,7 @@ from app.modules.outbox import models as outbox_models  # noqa: F401
 from app.modules.rag import evaluation_models  # noqa: F401
 from app.modules.retention import models as retention_models  # noqa: F401
 from app.modules.support import models as support_models  # noqa: F401
+from app.modules.webhooks import models as webhook_models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

@@ -97,7 +97,10 @@ class DriveSyncOperations:
                 "knowledge.drive_source.sync.requested",
                 "job",
                 enqueued.job.id,
-                {"source_id": str(source.id)},
+                {
+                    "organization_id": str(source.organization_id),
+                    "source_id": str(source.id),
+                },
             )
             enqueued = EnqueuedDriveSync(
                 job=enqueued.job,
@@ -248,7 +251,10 @@ class DriveSyncOperations:
             "knowledge.drive_source.sync.requested",
             "job",
             retried.id,
-            {"source_id": str(source.id)},
+            {
+                "organization_id": str(source.organization_id),
+                "source_id": str(source.id),
+            },
         )
         return retried
 
@@ -306,6 +312,9 @@ async def enqueue_drive_sync_intent(
         "knowledge.drive_source.sync.requested",
         "job",
         job.id,
-        {"source_id": str(source.id)},
+        {
+            "organization_id": str(source.organization_id),
+            "source_id": str(source.id),
+        },
     )
     return EnqueuedDriveSync(job=job, outbox_event_id=outbox_event.event_id)

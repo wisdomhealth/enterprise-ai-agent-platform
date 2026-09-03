@@ -13,6 +13,7 @@ def create_celery(settings: Settings | None = None) -> Celery:
             "app.modules.chat.tasks",
             "app.modules.email.tasks",
             "app.modules.retention.tasks",
+            "app.modules.webhooks.tasks",
         ),
         result_backend=None,
         task_ignore_result=True,
@@ -53,6 +54,14 @@ def create_celery(settings: Settings | None = None) -> Celery:
             },
             "retention-job-recovery": {
                 "task": "app.modules.retention.tasks.dispatch_pending_retention_jobs",
+                "schedule": 60,
+            },
+            "webhook-event-dispatch": {
+                "task": "app.modules.webhooks.tasks.dispatch_pending_webhook_events",
+                "schedule": 30,
+            },
+            "webhook-job-recovery": {
+                "task": "app.modules.webhooks.tasks.dispatch_pending_webhook_jobs",
                 "schedule": 60,
             },
         },

@@ -7,6 +7,7 @@ from app.core.config import Settings
 from app.core.logging import configure_logging
 from app.modules.chat.rate_limit import SlidingWindowRateLimiter
 from app.modules.chat.router import router as chat_router
+from app.modules.connectors.encryption import envelope_cipher_from_settings
 from app.modules.connectors.router import router as connectors_router
 from app.modules.connectors.service import ConnectorService
 from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
@@ -22,6 +23,7 @@ from app.modules.rag.router import router as rag_router
 from app.modules.retention.router import router as retention_router
 from app.modules.support.router import public_router as support_public_router
 from app.modules.support.router import staff_router as support_staff_router
+from app.modules.webhooks.router import router as webhooks_router
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -31,7 +33,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.celery = create_celery(settings)
     app.state.google_oidc_client = None
-    app.state.connector_service = ConnectorService.from_settings(settings)
+    envelope_cipher = envelope_cipher_from_settings(settings)
+    app.state.connector_service = (
+        ConnectorService(envelope_cipher) if envelope_cipher is not None else None
+    )
+    app.state.webhook_cipher = envelope_cipher
     app.state.drive_gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
     app.state.gmail_gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
     app.state.chat_rate_limiter = None
@@ -83,6 +89,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(email_router)
     app.include_router(operations_router)
     app.include_router(retention_router)
+    app.include_router(webhooks_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

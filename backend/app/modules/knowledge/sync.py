@@ -246,7 +246,11 @@ class DriveSyncService:
             "knowledge.document.parse.requested",
             "job",
             job.id,
-            {"source_id": str(source.id), "document_id": str(document.id)},
+            {
+                "organization_id": str(source.organization_id),
+                "source_id": str(source.id),
+                "document_id": str(document.id),
+            },
         )
 
     async def _revoke_file(self, source: DriveSource, file_id: str) -> bool:
@@ -279,7 +283,11 @@ class DriveSyncService:
             "knowledge.document.cleanup.requested",
             "document",
             document.id,
-            {"source_id": str(source.id), "document_id": str(document.id)},
+            {
+                "organization_id": str(source.organization_id),
+                "source_id": str(source.id),
+                "document_id": str(document.id),
+            },
         )
         return True
 

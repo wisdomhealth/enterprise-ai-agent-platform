@@ -100,6 +100,7 @@ class SupportService:
             "chat_session",
             session.id,
             {
+                "organization_id": str(session.organization_id),
                 "handoff_id": str(handoff.id),
                 "trigger": trigger.value,
                 "last_customer_sequence": boundary,
@@ -160,7 +161,11 @@ class SupportService:
             "support.handoff.claimed",
             "support_handoff",
             claimed.id,
-            {"session_id": str(claimed.session_id), "assigned_user_id": str(principal.subject_id)},
+            {
+                "organization_id": str(claimed.organization_id),
+                "session_id": str(claimed.session_id),
+                "assigned_user_id": str(principal.subject_id),
+            },
         )
         await self._db_session.flush()
         return claimed
@@ -190,7 +195,11 @@ class SupportService:
             "support.handoff.replied",
             "support_handoff",
             handoff.id,
-            {"message_id": str(message.id), "sequence": sequence},
+            {
+                "organization_id": str(handoff.organization_id),
+                "message_id": str(message.id),
+                "sequence": sequence,
+            },
         )
         await self._db_session.flush()
         return message
@@ -220,7 +229,10 @@ class SupportService:
             "support.handoff.resolved",
             "support_handoff",
             handoff.id,
-            {"session_id": str(session.id)},
+            {
+                "organization_id": str(handoff.organization_id),
+                "session_id": str(session.id),
+            },
         )
         await self._db_session.flush()
         return handoff
@@ -253,6 +265,7 @@ class SupportService:
             "support_handoff",
             handoff.id,
             {
+                "organization_id": str(handoff.organization_id),
                 "session_id": str(session.id),
                 "handoff_boundary": handoff.last_customer_sequence,
                 "await_customer_message": True,

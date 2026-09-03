@@ -13,7 +13,7 @@ from app.modules.connectors.encryption import (
     EncryptedSecret,
     EnvelopeCipher,
     FileKeyWrapper,
-    GoogleCloudKmsKeyWrapper,
+    envelope_cipher_from_settings,
 )
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
 from app.modules.identity.dependencies import Principal
@@ -48,15 +48,8 @@ class ConnectorService:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "ConnectorService | None":
-        if settings.google_kms_key_name is not None:
-            return cls(EnvelopeCipher(GoogleCloudKmsKeyWrapper(settings.google_kms_key_name)))
-        if settings.connector_file_key_path is None:
-            return None
-        return cls.for_file_key(
-            settings.connector_file_key_path,
-            app_env=settings.app_env,
-            self_hosted_file_key_allowed=settings.self_hosted_file_key_allowed,
-        )
+        cipher = envelope_cipher_from_settings(settings)
+        return cls(cipher) if cipher is not None else None
 
     @staticmethod
     def configuration_resource_id(organization_id: UUID, kind: ConnectorKind) -> UUID:

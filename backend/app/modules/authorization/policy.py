@@ -29,6 +29,8 @@ ROLE_ACTIONS: Final = MappingProxyType(
                 "retention.read",
                 "retention.write",
                 "retention.erase",
+                "webhook.read",
+                "webhook.write",
             }
         ),
         UserRole.REVIEWER: frozenset({"knowledge.read", "knowledge.review"}),
@@ -50,6 +52,8 @@ ACTION_STATES: Final = MappingProxyType(
         "retention.read": frozenset({ResourceState.ACTIVE}),
         "retention.write": frozenset({ResourceState.ACTIVE}),
         "retention.erase": frozenset({ResourceState.ACTIVE}),
+        "webhook.read": frozenset({ResourceState.ACTIVE, ResourceState.DISABLED}),
+        "webhook.write": frozenset({ResourceState.ACTIVE}),
     }
 )
 

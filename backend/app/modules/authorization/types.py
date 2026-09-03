@@ -14,8 +14,10 @@ type Action = Literal[
     "retention.read",
     "retention.write",
     "retention.erase",
+    "webhook.read",
+    "webhook.write",
 ]
-type ResourceType = Literal["connector", "knowledge", "retention"]
+type ResourceType = Literal["connector", "knowledge", "retention", "webhook"]
 
 
 class ResourceState(StrEnum):

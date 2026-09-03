@@ -1,10 +1,13 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from google.cloud import kms
+
+if TYPE_CHECKING:
+    from app.core.config import Settings
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,3 +104,17 @@ class EnvelopeCipher:
             raise ValueError("unsupported connector secret algorithm")
         data_key = await self._key_wrapper.unwrap(secret.encrypted_data_key, secret.key_version)
         return AESGCM(data_key).decrypt(secret.nonce, secret.ciphertext, None).decode("utf-8")
+
+
+def envelope_cipher_from_settings(settings: "Settings") -> EnvelopeCipher | None:
+    if settings.google_kms_key_name is not None:
+        return EnvelopeCipher(GoogleCloudKmsKeyWrapper(settings.google_kms_key_name))
+    if settings.connector_file_key_path is None:
+        return None
+    return EnvelopeCipher(
+        FileKeyWrapper(
+            settings.connector_file_key_path,
+            app_env=settings.app_env,
+            self_hosted_file_key_allowed=settings.self_hosted_file_key_allowed,
+        )
+    )
