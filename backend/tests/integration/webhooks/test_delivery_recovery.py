@@ -9,7 +9,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from app.core.database import async_sessionmaker, engine
 from app.modules.connectors.encryption import EnvelopeCipher, FileKeyWrapper
@@ -324,6 +324,64 @@ async def test_delivery_retry_and_success_recover_across_fresh_sessions(tmp_path
                 is None
             )
         assert len(transport.calls) == 2
+    finally:
+        await _cleanup_committed_webhook(context)
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_corrupt_persisted_event_before_claim_or_delivery(
+    tmp_path: Path,
+) -> None:
+    """A legacy/corrupt linked event must not become a retryable transport failure."""
+    context = await _seed_committed_webhook(tmp_path, schedule=True)
+    assert context.job_id is not None
+    transport = RecordingTransport([WebhookTransportResponse(204, b"must-not-send")])
+    try:
+        # Simulate durable legacy/corrupt producer data after the original scheduling
+        # transaction already created its delivery and JobIntent.
+        async with async_sessionmaker() as corrupting_session:
+            await corrupting_session.execute(
+                update(OutboxEvent)
+                .where(OutboxEvent.event_id == context.event_id)
+                .values(
+                    payload={
+                        "organization_id": str(context.organization_id),
+                        "handoff_id": str(context.subscription_id),
+                        "trigger": "NOT_A_TRIGGER",
+                        "last_customer_sequence": 1,
+                    }
+                )
+            )
+            await corrupting_session.commit()
+
+        async with async_sessionmaker() as recovery_worker:
+            with pytest.raises(ValueError, match="invalid data"):
+                await WebhookDeliveryService(
+                    recovery_worker,
+                    context.cipher,
+                    transport,
+                    worker_id="webhook-corrupt-recovery-worker",
+                ).deliver(context.job_id)
+
+        # A fresh session observes no claim, no attempt, and no retry/transport side effect.
+        async with async_sessionmaker() as verify:
+            delivery = await verify.scalar(
+                select(WebhookDelivery).where(WebhookDelivery.job_id == context.job_id)
+            )
+            job = await verify.get(JobIntent, context.job_id)
+            assert delivery is not None
+            assert delivery.state is WebhookDeliveryState.PENDING
+            assert delivery.delivery_attempt == 0
+            assert delivery.last_http_status is None
+            assert delivery.response_summary is None
+            assert delivery.last_error_code is None
+            assert job is not None
+            assert job.state is JobState.PENDING
+            assert job.attempts == 0
+            assert job.lease_owner is None
+            assert job.lease_expires_at is None
+            assert job.last_error_code is None
+        assert transport.calls == []
     finally:
         await _cleanup_committed_webhook(context)
 

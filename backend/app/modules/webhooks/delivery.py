@@ -655,9 +655,14 @@ class WebhookDeliveryService:
         job = await self._db_session.get(JobIntent, job_id)
         if job is None or job.kind != self.JOB_KIND:
             raise LookupError("webhook delivery job not found")
-        delivery = await self._delivery_for_job(job_id)
+        # Recovery can resume a delivery created by an older producer revision.
+        # Validate its durable source before claiming the job or recording any
+        # delivery side effect, so corrupt data cannot become a retryable
+        # transport failure.
+        delivery, subscription, event = await self._context(job_id)
         if delivery.state is WebhookDeliveryState.SUCCEEDED:
             return None
+        validate_webhook_event(event)
         claimed = await JobLeaseService(self._db_session).claim(
             job_id,
             self._worker_id,
