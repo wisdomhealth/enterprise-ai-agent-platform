@@ -75,8 +75,11 @@ class Settings(BaseSettings):
         default=None, validation_alias="CONNECTOR_FILE_KEY_PATH"
     )
     session_secret: SecretStr | None = Field(default=None, validation_alias="SESSION_SECRET")
-    erasure_hash_key: SecretStr | None = Field(
-        default=None, validation_alias="ERASURE_HASH_KEY"
+    erasure_hash_key: SecretStr | None = Field(default=None, validation_alias="ERASURE_HASH_KEY")
+    restore_generation: int = Field(
+        default=0,
+        ge=0,
+        validation_alias="RESTORE_GENERATION",
     )
     staff_session_ttl_seconds: int = Field(
         default=28_800,

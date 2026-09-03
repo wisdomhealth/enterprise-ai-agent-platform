@@ -1,10 +1,21 @@
+from time import monotonic
+
 from authlib.integrations.starlette_client import OAuth  # type: ignore[import-untyped]
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.core.celery import create_celery
 from app.core.config import Settings
+from app.core.database import async_sessionmaker
 from app.core.logging import configure_logging
+from app.core.telemetry import (
+    DEPENDENCY_UP,
+    HTTP_REQUEST_LATENCY_SECONDS,
+    prometheus_payload,
+    record_http_request,
+    refresh_operational_metrics,
+)
 from app.modules.chat.rate_limit import SlidingWindowRateLimiter
 from app.modules.chat.router import router as chat_router
 from app.modules.connectors.encryption import envelope_cipher_from_settings
@@ -17,6 +28,7 @@ from app.modules.identity.router import admin_router as identity_admin_router
 from app.modules.identity.router import router as identity_router
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.router import router as knowledge_router
+from app.modules.operations.health import ConfiguredHealthReporter, HealthReport
 from app.modules.operations.router import router as operations_router
 from app.modules.rag.answer_service import GroundedAnswerService
 from app.modules.rag.router import router as rag_router
@@ -48,6 +60,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         chat_redis = Redis.from_url(settings.redis_url.unicode_string(), decode_responses=True)
         app.state.chat_rate_limiter = SlidingWindowRateLimiter(chat_redis)
         app.state.chat_sse_redis = chat_redis
+    app.state.health_reporter = ConfiguredHealthReporter(
+        settings,
+        async_sessionmaker,
+        redis_client=app.state.chat_sse_redis,
+        key_cipher=envelope_cipher,
+    )
     app.state.grounded_answer_service = (
         GroundedAnswerService.from_settings(settings)
         if (
@@ -91,8 +109,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(retention_router)
     app.include_router(webhooks_router)
 
+    @app.middleware("http")
+    async def observe_http(request: Request, call_next):  # type: ignore[no-untyped-def]
+        started = monotonic()
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", "unmatched")
+            record_http_request(request.method, route_path, status_code)
+            HTTP_REQUEST_LATENCY_SECONDS.labels(method=request.method, path=route_path).observe(
+                monotonic() - started
+            )
+
     @app.get("/health/live")
     async def live() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/health/ready")
+    async def ready(request: Request) -> Response:
+        reporter = getattr(request.app.state, "health_reporter", None)
+        if reporter is None:
+            report = HealthReport(ready=False, status="not_ready", dependencies={})
+        else:
+            report = await reporter()
+        _record_dependency_health(report)
+        return JSONResponse(
+            report.as_dict(),
+            status_code=status.HTTP_200_OK if report.ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    @app.get("/metrics")
+    async def metrics(request: Request) -> Response:
+        reporter = getattr(request.app.state, "health_reporter", None)
+        report = await reporter() if reporter is not None else None
+        if report is not None:
+            _record_dependency_health(report)
+        try:
+            async with async_sessionmaker() as session:
+                await refresh_operational_metrics(
+                    session,
+                    restore_generation=request.app.state.settings.restore_generation,
+                )
+            DEPENDENCY_UP.labels(dependency="database").set(1)
+        except Exception:
+            DEPENDENCY_UP.labels(dependency="database").set(0)
+        payload, content_type = prometheus_payload()
+        return Response(content=payload, media_type=content_type)
+
     return app
+
+
+def _record_dependency_health(report: HealthReport) -> None:
+    for name, dependency in report.dependencies.items():
+        DEPENDENCY_UP.labels(dependency=name).set(1 if dependency.status.value == "up" else 0)

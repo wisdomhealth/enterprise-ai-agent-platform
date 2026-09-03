@@ -67,3 +67,7 @@ def create_celery(settings: Settings | None = None) -> Celery:
         },
     )
     return celery_app
+
+
+# Stable CLI entrypoint for production worker and beat processes.
+celery_app = create_celery()

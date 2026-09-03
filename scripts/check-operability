@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Fail closed when a production subsystem loses its operational contract."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNBOOK = "docs/runbooks/observability.md"
+
+SUBSYSTEMS = {
+    "S0": ("identity", "audit", "outbox", "platform_job_backlog"),
+    "S1": ("knowledge", "connector", "platform_connector_staleness_seconds"),
+    "S2": ("rag", "platform_rag_retrieval_latency_seconds", "PlatformModelErrorsSustained"),
+    "S3": ("chat", "platform_http_request_latency_seconds", "X-Accel-Buffering"),
+    "S4": ("support", "platform_support_handoff_backlog", "PlatformSupportBacklog"),
+    "S5": ("email", "platform_email_state", "gmail"),
+    "S6": ("email", "platform_email_delivery_unknown", "PlatformDeliveryUnknownOld"),
+    "S7": ("operations", "platform_erasure_backlog", "PlatformErasureBacklog"),
+}
+
+
+def _combined_text(compose_file: Path) -> str:
+    paths = (
+        compose_file,
+        ROOT / "backend/app/main.py",
+        ROOT / "backend/app/core/telemetry.py",
+        ROOT / "infra/nginx/nginx.conf",
+        ROOT / "infra/prometheus/alerts.yml",
+        ROOT / RUNBOOK,
+    )
+    missing = [str(path.relative_to(ROOT)) for path in paths if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"missing operational artifacts: {', '.join(missing)}")
+    return "\n".join(path.read_text(encoding="utf-8") for path in paths)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compose-file", default="compose.yaml")
+    args = parser.parse_args()
+    compose_file = (ROOT / args.compose_file).resolve()
+    try:
+        compose_file.relative_to(ROOT)
+    except ValueError:
+        parser.error("compose file must be inside the repository")
+    try:
+        combined = _combined_text(compose_file)
+    except RuntimeError as error:
+        print(json.dumps({"status": "FAIL", "error": str(error)}, sort_keys=True))
+        return 1
+
+    reports = []
+    failed = False
+    folded = combined.casefold()
+    for subsystem, required_tokens in SUBSYSTEMS.items():
+        missing = [token for token in required_tokens if token.casefold() not in folded]
+        status = "PASS" if not missing else "FAIL"
+        failed = failed or bool(missing)
+        reports.append(
+            {
+                "subsystem": subsystem,
+                "status": status,
+                "health": "/health/ready",
+                "metrics": "/metrics",
+                "failure_visibility": "Prometheus alerts and centralized JSON logs",
+                "runbook": RUNBOOK,
+                "missing": missing,
+            }
+        )
+    print(json.dumps({"status": "FAIL" if failed else "PASS", "systems": reports}, indent=2))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

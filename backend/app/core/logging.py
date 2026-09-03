@@ -13,16 +13,49 @@ _SECRET_FIELD_PARTS = (
     "secret",
     "token",
 )
+_CONTENT_FIELDS = frozenset(
+    {
+        "answer",
+        "body",
+        "chat_body",
+        "completion",
+        "content",
+        "document_content",
+        "document_text",
+        "email_body",
+        "message_body",
+        "prompt",
+        "query",
+        "raw_body",
+        "response_body",
+    }
+)
 _REDACTED = "[REDACTED]"
 
 
+class _AccessLogQueryFilter(logging.Filter):
+    """Keep access metadata while removing credentials commonly carried in query strings."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and len(record.args) >= 3:
+            arguments = list(record.args)
+            arguments[2] = str(arguments[2]).partition("?")[0]
+            record.args = tuple(arguments)
+        return True
+
+
 def _redact(key: str, value: object) -> object:
-    if any(part in key.casefold() for part in _SECRET_FIELD_PARTS):
+    normalized_key = key.casefold()
+    if any(part in normalized_key for part in _SECRET_FIELD_PARTS) or (
+        normalized_key in _CONTENT_FIELDS
+        or normalized_key.endswith("_body")
+        or normalized_key.endswith("_content")
+        or normalized_key.endswith("_text")
+    ):
         return _REDACTED
     if isinstance(value, Mapping):
         return {
-            str(child_key): _redact(str(child_key), child)
-            for child_key, child in value.items()
+            str(child_key): _redact(str(child_key), child) for child_key, child in value.items()
         }
     if isinstance(value, (list, tuple)):
         return [_redact(key, item) for item in value]
@@ -35,6 +68,12 @@ def redact_secret_fields(
     event_dict: EventDict,
 ) -> EventDict:
     return {key: _redact(key, value) for key, value in event_dict.items()}
+
+
+def log_event(event: str, **fields: object) -> None:
+    """Emit an allowlisted-by-redaction structured event without interpolated content."""
+
+    structlog.get_logger("platform").info(event, **fields)
 
 
 def configure_logging(stream: TextIO | None = None) -> None:
@@ -72,3 +111,8 @@ def configure_logging(stream: TextIO | None = None) -> None:
         logger.handlers.clear()
         logger.setLevel(logging.INFO)
         logger.propagate = True
+
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.disabled = False
+    access_logger.filters.clear()
+    access_logger.addFilter(_AccessLogQueryFilter())

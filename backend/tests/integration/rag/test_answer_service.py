@@ -113,6 +113,30 @@ async def test_provider_failures_return_configured_refusal_without_leaking_detai
 
 
 @pytest.mark.asyncio
+async def test_provider_failure_records_model_latency(monkeypatch: pytest.MonkeyPatch) -> None:
+    principal = _principal()
+    chunk = _chunk(principal)
+    observed: list[int] = []
+    monkeypatch.setattr(
+        "app.modules.rag.answer_service.record_model_latency",
+        observed.append,
+    )
+    service = GroundedAnswerService(
+        FakeRetriever([chunk]),
+        RaisingLLM(ProviderResponseError("private provider detail")),
+        CitationValidator(),
+        ProviderCircuitBreaker(InMemoryRedisCircuitStore()),
+    )
+
+    answer = await service.answer(
+        principal, chunk.knowledge_base_id, "How long do refunds take?", AnswerAudience.CUSTOMER
+    )
+
+    assert answer.refused is True
+    assert len(observed) == 1
+
+
+@pytest.mark.asyncio
 async def test_unsupported_claim_is_not_returned_to_customer() -> None:
     principal = _principal()
     chunk = _chunk(principal)

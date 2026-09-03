@@ -5,7 +5,11 @@ from dataclasses import dataclass, field
 from uuid import UUID
 
 from app.core.config import Settings
-from app.core.telemetry import record_grounded_answer
+from app.core.telemetry import (
+    record_grounded_answer,
+    record_model_latency,
+    record_retrieval_latency,
+)
 from app.modules.identity.dependencies import Principal
 from app.modules.rag.citations import citation_from_chunk, project_citations
 from app.modules.rag.groundedness import CitationValidator, GroundednessError
@@ -128,6 +132,7 @@ class GroundedAnswerService:
             principal, knowledge_base_id, query, self._retrieval_limit
         )
         retrieval_latency_ms = _latency_ms(retrieval_started)
+        record_retrieval_latency(retrieval_latency_ms)
         prompt = build_grounded_prompt(query, chunks)
         provider_name = "claude"
         if not chunks or not await self._circuit_breaker.allow(provider_name):
@@ -142,20 +147,25 @@ class GroundedAnswerService:
             generation = await self._provider.generate(prompt)
         except ProviderTransientError:
             await self._circuit_breaker.record_transient_failure(provider_name)
+            model_latency_ms = _latency_ms(model_started)
+            record_model_latency(model_latency_ms)
             return AnswerExecution(
                 self._refusal(audience, started, provider_name, "provider_error", len(chunks)),
                 chunks,
                 retrieval_latency_ms,
-                _latency_ms(model_started),
+                model_latency_ms,
             )
         except Exception:
+            model_latency_ms = _latency_ms(model_started)
+            record_model_latency(model_latency_ms)
             return AnswerExecution(
                 self._refusal(audience, started, provider_name, "provider_error", len(chunks)),
                 chunks,
                 retrieval_latency_ms,
-                _latency_ms(model_started),
+                model_latency_ms,
             )
         model_latency_ms = _latency_ms(model_started)
+        record_model_latency(model_latency_ms)
         if not isinstance(generation, GeneratedAnswer):
             return AnswerExecution(
                 self._refusal(audience, started, provider_name, "provider_error", len(chunks)),

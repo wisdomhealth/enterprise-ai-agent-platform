@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck test-integration test-e2e
+.PHONY: install test lint typecheck test-integration test-e2e check-prometheus check-operability
 
 PYTHON ?= $(shell \
 	for candidate in python3.13 python3.12 python3; do \
@@ -39,3 +39,12 @@ test-integration:
 
 test-e2e:
 	cd frontend && npm run test:e2e
+
+check-prometheus:
+	docker run --rm --entrypoint /bin/promtool \
+		-v "$(CURDIR)/infra/prometheus:/etc/prometheus:ro" \
+		prom/prometheus:v3.5.0 \
+		check config /etc/prometheus/prometheus.yml
+
+check-operability:
+	scripts/check-operability --compose-file compose.yaml
