@@ -5,9 +5,35 @@ import { ConnectorStatus } from "../components/admin/ConnectorStatus";
 import { JobFailures } from "../components/admin/JobFailures";
 import { KnowledgeStatus } from "../components/admin/KnowledgeStatus";
 import { QualitySummary } from "../components/admin/QualitySummary";
+import { RetentionPolicyControl } from "../components/admin/RetentionPolicyControl";
 import { UserManagement } from "../components/admin/UserManagement";
 
 afterEach(cleanup);
+
+it("edits versioned retention defaults without making a compliance claim", async () => {
+  const update = vi.fn().mockResolvedValue(undefined);
+  render(
+    <RetentionPolicyControl
+      policy={{
+        id: "policy-1",
+        chat_days: 90,
+        email_days: 90,
+        audit_days: 365,
+        version: 4,
+        legal_compliance_guarantee: false,
+      }}
+      onUpdate={update}
+    />,
+  );
+
+  expect(screen.getByText(/defaults are configurable/i)).toBeVisible();
+  expect(screen.getByText(/not a legal or compliance guarantee/i)).toBeVisible();
+  fireEvent.change(screen.getByLabelText("Chat content days"), {
+    target: { value: "45" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save retention policy" }));
+  await waitFor(() => expect(update).toHaveBeenCalledWith(4, 45, 90, 365));
+});
 
 function expectDialogKeyboardBoundary(triggerName: string, dialogName: string) {
   const trigger = screen.getByRole("button", { name: triggerName });

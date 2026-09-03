@@ -12,6 +12,7 @@ def create_celery(settings: Settings | None = None) -> Celery:
             "app.modules.knowledge.tasks",
             "app.modules.chat.tasks",
             "app.modules.email.tasks",
+            "app.modules.retention.tasks",
         ),
         result_backend=None,
         task_ignore_result=True,
@@ -44,6 +45,14 @@ def create_celery(settings: Settings | None = None) -> Celery:
                     "app.modules.email.tasks."
                     "dispatch_pending_email_delivery_outbox_events"
                 ),
+                "schedule": 60,
+            },
+            "retention-daily-schedule": {
+                "task": "app.modules.retention.tasks.schedule_daily_retention",
+                "schedule": 24 * 60 * 60,
+            },
+            "retention-job-recovery": {
+                "task": "app.modules.retention.tasks.dispatch_pending_retention_jobs",
                 "schedule": 60,
             },
         },

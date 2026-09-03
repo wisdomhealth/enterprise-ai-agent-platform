@@ -19,6 +19,7 @@ from app.modules.jobs import models as job_models  # noqa: F401
 from app.modules.knowledge import models as knowledge_models  # noqa: F401
 from app.modules.outbox import models as outbox_models  # noqa: F401
 from app.modules.rag import evaluation_models  # noqa: F401
+from app.modules.retention import models as retention_models  # noqa: F401
 from app.modules.support import models as support_models  # noqa: F401
 
 config = context.config

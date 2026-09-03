@@ -6,38 +6,45 @@ import { ConnectorStatus } from "../../../components/admin/ConnectorStatus";
 import { JobFailures } from "../../../components/admin/JobFailures";
 import { KnowledgeStatus } from "../../../components/admin/KnowledgeStatus";
 import { QualitySummary } from "../../../components/admin/QualitySummary";
+import { RetentionPolicyControl } from "../../../components/admin/RetentionPolicyControl";
 import { UserManagement } from "../../../components/admin/UserManagement";
 import {
   AdminFailedJob,
   AdminOperationsSummary,
+  AdminRetentionPolicy,
   AdminUser,
   beginConnectorReauthorization,
   configureAdminDriveScope,
   getAdminOperationsSummary,
+  getAdminRetentionPolicy,
   inviteAdminUser,
   listAdminFailedJobs,
   listAdminUsers,
   requestAdminDriveSync,
   retryAdminJob,
   updateAdminUser,
+  updateAdminRetentionPolicy,
 } from "../../../lib/staff-api";
 
 export default function AdminOperationsPage() {
   const [summary, setSummary] = useState<AdminOperationsSummary | null>(null);
   const [jobs, setJobs] = useState<AdminFailedJob[]>([]);
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [retentionPolicy, setRetentionPolicy] = useState<AdminRetentionPolicy | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [nextSummary, nextJobs, nextUsers] = await Promise.all([
+      const [nextSummary, nextJobs, nextUsers, nextRetentionPolicy] = await Promise.all([
         getAdminOperationsSummary(),
         listAdminFailedJobs(),
         listAdminUsers(),
+        getAdminRetentionPolicy(),
       ]);
       setSummary(nextSummary);
       setJobs(nextJobs);
       setUsers(nextUsers);
+      setRetentionPolicy(nextRetentionPolicy);
       setNotice(null);
     } catch {
       setNotice("Administrator operations are unavailable or not authorized.");
@@ -66,6 +73,15 @@ export default function AdminOperationsPage() {
       />
       <JobFailures jobs={jobs} onRetry={async (id) => { await retryAdminJob(id); await refresh(); }} onReconcile={(id) => window.location.assign(`/staff/email/${id}`)} />
       <QualitySummary rag={summary.rag_quality} email={summary.email_quality} />
+      {retentionPolicy ? (
+        <RetentionPolicyControl
+          policy={retentionPolicy}
+          onUpdate={async (version, chatDays, emailDays, auditDays) => {
+            await updateAdminRetentionPolicy(version, chatDays, emailDays, auditDays);
+            await refresh();
+          }}
+        />
+      ) : null}
       <UserManagement users={users} onInvite={async (email, role) => { await inviteAdminUser(email, role); await refresh(); }} onUpdate={async (id, version, change) => { await updateAdminUser(id, version, change); await refresh(); }} />
     </section>
   );

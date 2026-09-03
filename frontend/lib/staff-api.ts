@@ -404,6 +404,15 @@ export type AdminUser = {
   version: number;
 };
 
+export type AdminRetentionPolicy = {
+  id: string;
+  chat_days: number;
+  email_days: number;
+  audit_days: number;
+  version: number;
+  legal_compliance_guarantee: false;
+};
+
 export function getAdminOperationsSummary(): Promise<AdminOperationsSummary> {
   return adminRequest<AdminOperationsSummary>("/operations/summary");
 }
@@ -447,6 +456,30 @@ export function configureAdminDriveScope(
 
 export function listAdminUsers(): Promise<AdminUser[]> {
   return adminRequest<AdminUser[]>("/users");
+}
+
+export function getAdminRetentionPolicy(): Promise<AdminRetentionPolicy> {
+  return adminRequest<AdminRetentionPolicy>("/retention-policy");
+}
+
+export function updateAdminRetentionPolicy(
+  expectedVersion: number,
+  chatDays: number,
+  emailDays: number,
+  auditDays: number,
+): Promise<AdminRetentionPolicy> {
+  return adminRequest<AdminRetentionPolicy>("/retention-policy", {
+    method: "PATCH",
+    headers: {
+      "Idempotency-Key": idempotencyKey("retention-policy-update", String(expectedVersion)),
+    },
+    body: JSON.stringify({
+      expected_version: expectedVersion,
+      chat_days: chatDays,
+      email_days: emailDays,
+      audit_days: auditDays,
+    }),
+  });
 }
 
 export function inviteAdminUser(

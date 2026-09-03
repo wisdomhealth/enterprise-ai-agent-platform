@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Replay the minimal erasure ledger before post-restore readiness is opened."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+BACKEND_ROOT = SCRIPT_ROOT / "backend"
+PROJECT_PYTHON = BACKEND_ROOT / ".venv" / "bin" / "python"
+if PROJECT_PYTHON.is_file() and Path(sys.prefix).resolve() != (BACKEND_ROOT / ".venv").resolve():
+    os.execv(
+        str(PROJECT_PYTHON),
+        [str(PROJECT_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+
+async def _run(database_url: str, restore_generation: int, *, check: bool) -> int:
+    os.environ["DATABASE_URL"] = database_url
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.modules.retention.service import ErasureService
+
+    engine = create_async_engine(database_url)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with maker() as session:
+            service = ErasureService(session, hash_key=b"replay-does-not-use-key")
+            if not check:
+                await service.replay_pending_and_applied(
+                    restore_generation=restore_generation
+                )
+                await session.commit()
+            complete = await service.replay_is_complete(
+                restore_generation=restore_generation
+            )
+            return 0 if complete else 1
+    finally:
+        await engine.dispose()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--database-url", required=True)
+    parser.add_argument("--restore-generation", required=True, type=int)
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    if args.restore_generation <= 0:
+        parser.error("--restore-generation must be positive")
+    return asyncio.run(
+        _run(args.database_url, args.restore_generation, check=args.check)
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

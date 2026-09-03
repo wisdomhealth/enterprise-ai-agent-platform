@@ -19,6 +19,7 @@ from app.modules.knowledge.router import router as knowledge_router
 from app.modules.operations.router import router as operations_router
 from app.modules.rag.answer_service import GroundedAnswerService
 from app.modules.rag.router import router as rag_router
+from app.modules.retention.router import router as retention_router
 from app.modules.support.router import public_router as support_public_router
 from app.modules.support.router import staff_router as support_staff_router
 
@@ -81,6 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(support_staff_router)
     app.include_router(email_router)
     app.include_router(operations_router)
+    app.include_router(retention_router)
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

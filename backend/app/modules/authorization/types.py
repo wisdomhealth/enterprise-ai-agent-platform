@@ -11,8 +11,11 @@ type Action = Literal[
     "knowledge.write",
     "knowledge.review",
     "knowledge.publish",
+    "retention.read",
+    "retention.write",
+    "retention.erase",
 ]
-type ResourceType = Literal["connector", "knowledge"]
+type ResourceType = Literal["connector", "knowledge", "retention"]
 
 
 class ResourceState(StrEnum):

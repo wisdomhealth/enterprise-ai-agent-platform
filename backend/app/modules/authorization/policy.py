@@ -26,6 +26,9 @@ ROLE_ACTIONS: Final = MappingProxyType(
                 "knowledge.write",
                 "knowledge.review",
                 "knowledge.publish",
+                "retention.read",
+                "retention.write",
+                "retention.erase",
             }
         ),
         UserRole.REVIEWER: frozenset({"knowledge.read", "knowledge.review"}),
@@ -44,6 +47,9 @@ ACTION_STATES: Final = MappingProxyType(
         "knowledge.write": frozenset({ResourceState.DRAFT, ResourceState.ACTIVE}),
         "knowledge.review": frozenset({ResourceState.DRAFT, ResourceState.ACTIVE}),
         "knowledge.publish": frozenset({ResourceState.DRAFT}),
+        "retention.read": frozenset({ResourceState.ACTIVE}),
+        "retention.write": frozenset({ResourceState.ACTIVE}),
+        "retention.erase": frozenset({ResourceState.ACTIVE}),
     }
 )
 
