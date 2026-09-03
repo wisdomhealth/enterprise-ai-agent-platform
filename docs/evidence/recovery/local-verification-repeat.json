@@ -1,0 +1,55 @@
+{
+  "actual_restore_point": "2026-09-03 06:59:42.846151+00",
+  "backup_label": "20260903-065937F",
+  "checks": [
+    "backup",
+    "restore_point",
+    "migration",
+    "erasure_replay",
+    "redis_loss_recovery",
+    "readiness"
+  ],
+  "completed_at": "2026-09-03T07:01:26.724601Z",
+  "measured_rpo_seconds": 0.321,
+  "measured_rto_seconds": 27.336,
+  "recovery_authority": "postgresql",
+  "requested_restore_point": "2026-09-03 06:59:43.167647+00",
+  "rpo_target_met": true,
+  "rto_target_met": true,
+  "sla_claimed": false,
+  "started_at": "2026-09-03T06:59:13.037443Z",
+  "status": "completed",
+  "steps": [
+    {
+      "name": "start_disposable_stack"
+    },
+    {
+      "name": "commit_pending_job"
+    },
+    {
+      "name": "backup"
+    },
+    {
+      "name": "restore"
+    },
+    {
+      "name": "replay_erasure"
+    },
+    {
+      "name": "flush_redis"
+    },
+    {
+      "name": "restart_workers"
+    },
+    {
+      "name": "verify_job_from_postgres"
+    },
+    {
+      "name": "verify_readiness"
+    }
+  ],
+  "targets": {
+    "rpo_seconds": 900,
+    "rto_seconds": 14400
+  }
+}

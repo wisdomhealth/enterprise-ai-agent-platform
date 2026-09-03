@@ -1,13 +1,78 @@
+x-task25-backend-environment: &task25-backend-environment
+  DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://platform_app@postgres:5432/platform_test}
+  MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  APP_ENV: test
+  SELF_HOSTED_FILE_KEY_ALLOWED: "true"
+  CONNECTOR_FILE_KEY_PATH: /run/task25/connector.key
+  RESTORE_GENERATION: ${RESTORE_GENERATION:-0}
+
+x-task25-backend: &task25-backend
+  build:
+    context: ./backend
+    target: runtime
+  environment: *task25-backend-environment
+  command:
+    - sh
+    - -ec
+    - >-
+      umask 077; mkdir -p /run/task25;
+      printf '0123456789abcdef0123456789abcdef' > /run/task25/connector.key;
+      exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
 services:
+  backup-store-cert-init:
+    image: ${TASK25_POSTGRES_IMAGE:-pgvector/pgvector:pg17}
+    user: root
+    entrypoint: ["sh", "-ec"]
+    command:
+      - >-
+        if [ ! -s /certs/public.crt ] || [ ! -s /certs/private.key ]; then
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout /certs/private.key -out /certs/public.crt -subj /CN=backup-store -addext subjectAltName=DNS:backup-store;
+          chmod 0600 /certs/private.key; chmod 0644 /certs/public.crt;
+        fi
+    labels:
+      com.enterprise-ai-agent-platform.disposable-recovery: "true"
+    volumes:
+      - backup-store-certs:/certs
+
   postgres:
-    image: postgres:17-alpine
+    image: ${TASK25_POSTGRES_IMAGE:-pgvector/pgvector:pg17}
     environment:
       POSTGRES_DB: platform_test
       POSTGRES_HOST_AUTH_METHOD: trust
+      PGBACKREST_STANZA: platform
+      PGBACKREST_REPO1_S3_BUCKET: task25-recovery
+      PGBACKREST_REPO1_S3_ENDPOINT: backup-store:9000
+      PGBACKREST_REPO1_S3_REGION: us-east-1
+      PGBACKREST_REPO1_S3_URI_STYLE: path
+      PGBACKREST_REPO1_S3_VERIFY_TLS: "n"
+      PGBACKREST_REPO1_S3_KEY: task25-local
+      PGBACKREST_REPO1_S3_KEY_SECRET: task25-local-only
+      PGBACKREST_REPO1_CIPHER_PASS: task25-local-encryption-only
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    labels:
+      com.enterprise-ai-agent-platform.disposable-recovery: "true"
+    volumes:
+      - ${POSTGRES_DATA_SOURCE:-postgres-source-data}:/var/lib/postgresql/data
+      - ./infra/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./infra/postgres/entrypoint-initdb.d:/docker-entrypoint-initdb.d:ro
+      - ./infra/pgbackrest/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      - pgbackrest-spool:/var/spool/pgbackrest
+      - postgres-socket:/var/run/postgresql
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${TASK25_POSTGRES_PORT:-55435}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d platform_test"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -U postgres -d platform_test && pgbackrest version",
+        ]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -15,12 +80,78 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${TASK25_REDIS_PORT:-56385}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 15
+
+  backup-store:
+    image: ${TASK25_MINIO_IMAGE:-minio/minio:RELEASE.2025-07-23T15-54-02Z}
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: task25-local
+      MINIO_ROOT_PASSWORD: task25-local-only
+    labels:
+      com.enterprise-ai-agent-platform.disposable-recovery: "true"
+    volumes:
+      - backup-store-data:/data
+      - backup-store-certs:/root/.minio/certs:ro
+    depends_on:
+      backup-store-cert-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fk", "https://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  backup-store-init:
+    image: ${TASK25_MINIO_CLIENT_IMAGE:-minio/mc:RELEASE.2025-07-21T05-28-08Z}
+    environment:
+      MC_HOST_task25: https://task25-local:task25-local-only@backup-store:9000
+    command: ["--insecure", "mb", "--ignore-existing", "task25/task25-recovery"]
+    depends_on:
+      backup-store:
+        condition: service_healthy
+
+  pgbackrest:
+    image: ${TASK25_POSTGRES_IMAGE:-pgvector/pgvector:pg17}
+    user: postgres
+    entrypoint: ["pgbackrest"]
+    environment:
+      PGBACKREST_STANZA: platform
+      PGBACKREST_REPO1_S3_BUCKET: task25-recovery
+      PGBACKREST_REPO1_S3_ENDPOINT: backup-store:9000
+      PGBACKREST_REPO1_S3_REGION: us-east-1
+      PGBACKREST_REPO1_S3_URI_STYLE: path
+      PGBACKREST_REPO1_S3_VERIFY_TLS: "n"
+      PGBACKREST_REPO1_S3_KEY: task25-local
+      PGBACKREST_REPO1_S3_KEY_SECRET: task25-local-only
+      PGBACKREST_REPO1_CIPHER_PASS: task25-local-encryption-only
+    volumes:
+      - ${POSTGRES_DATA_SOURCE:-postgres-source-data}:/var/lib/postgresql/data
+      - ./infra/pgbackrest/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      - pgbackrest-spool:/var/spool/pgbackrest
+      - postgres-socket:/var/run/postgresql
+    depends_on:
+      backup-store-init:
+        condition: service_completed_successfully
+
+  migrate:
+    build:
+      context: ./backend
+      target: runtime
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
+    volumes:
+      - ./backend/alembic.ini:/app/alembic.ini:ro
+      - ./backend/alembic:/app/alembic:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   backend-test:
     build:
@@ -30,13 +161,62 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://platform_app@postgres:5432/platform_test}
       MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    volumes:
+      - ./backend/tests:/app/tests:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
 
+  backend:
+    <<: *task25-backend
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    <<: *task25-backend
+    command:
+      [
+        "celery",
+        "-A",
+        "app.core.celery:celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--without-gossip",
+        "--without-mingle",
+      ]
+
+  scheduler:
+    <<: *task25-backend
+    command:
+      [
+        "celery",
+        "-A",
+        "app.core.celery:celery_app",
+        "beat",
+        "--loglevel=INFO",
+        "--pidfile=/tmp/celerybeat.pid",
+      ]
+
   frontend-test:
     build:
       context: ./frontend
       target: test
+
+volumes:
+  postgres-source-data:
+  postgres-recovery-data:
+  pgbackrest-spool:
+  postgres-socket:
+  backup-store-data:
+  backup-store-certs:

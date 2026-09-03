@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""Run a guarded disposable recovery drill and record measured evidence."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import tempfile
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+ROOT = Path(__file__).resolve().parents[1]
+RPO_TARGET_SECONDS = 15 * 60
+RTO_TARGET_SECONDS = 4 * 60 * 60
+DISPOSABLE_PROJECT = "task25-recovery"
+DISPOSABLE_LABEL = "com.docker.compose.project"
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        json.dump(payload, temporary, indent=2, sort_keys=True)
+        temporary.write("\n")
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, path)
+
+
+def _plan() -> dict[str, object]:
+    checks = [
+        "backup",
+        "restore_point",
+        "migration",
+        "erasure_replay",
+        "redis_loss_recovery",
+        "readiness",
+    ]
+    names = [
+        "start_disposable_stack",
+        "commit_pending_job",
+        "backup",
+        "restore",
+        "replay_erasure",
+        "flush_redis",
+        "restart_workers",
+        "verify_job_from_postgres",
+        "verify_readiness",
+    ]
+    return {
+        "checks": checks,
+        "recovery_authority": "postgresql",
+        "sla_claimed": False,
+        "status": "planned",
+        "steps": [{"name": name} for name in names],
+        "targets": {
+            "rpo_seconds": RPO_TARGET_SECONDS,
+            "rto_seconds": RTO_TARGET_SECONDS,
+        },
+    }
+
+
+def _run(command: list[str], *, env: dict[str, str], capture: bool = False) -> str:
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=capture,
+        text=True,
+    )
+    return result.stdout.strip() if capture else ""
+
+
+def _inspect_json(arguments: list[str]) -> object | None:
+    result = subprocess.run(
+        ["docker", *arguments], check=False, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+    return json.loads(result.stdout)
+
+
+def _assert_database_url(value: str, *, host: str, port: int) -> None:
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "postgresql+asyncpg"
+        or parsed.hostname != host
+        or parsed.port != port
+        or parsed.path != "/platform_test"
+    ):
+        raise RuntimeError(
+            "recovery database URL is outside the disposable Task 25 scope"
+        )
+
+
+def _assert_isolated(
+    *,
+    compose_file: Path,
+    project_name: str,
+    target: Path,
+    internal_database_url: str,
+    migration_database_url: str,
+    host_database_url: str,
+    port: int,
+    pre_restore: bool,
+) -> None:
+    if project_name != DISPOSABLE_PROJECT:
+        raise RuntimeError("recovery project must be exactly task25-recovery")
+    if compose_file != (ROOT / "compose.test.yaml").resolve():
+        raise RuntimeError("recovery drill requires the repository compose.test.yaml")
+    _assert_database_url(internal_database_url, host="postgres", port=5432)
+    _assert_database_url(migration_database_url, host="postgres", port=5432)
+    _assert_database_url(host_database_url, host="127.0.0.1", port=port)
+    if not target.is_dir() or (pre_restore and any(target.iterdir())):
+        raise RuntimeError("recovery target is not an empty dedicated directory")
+
+    compose = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            project_name,
+            "-f",
+            str(compose_file),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config = json.loads(compose.stdout)
+    services = config.get("services") if isinstance(config, dict) else None
+    if not isinstance(services, dict):
+        raise TypeError("disposable compose services cannot be verified")
+    backup_store = services.get("backup-store")
+    if not isinstance(backup_store, dict):
+        raise TypeError("local backup store is missing")
+    pgbackrest = services.get("pgbackrest")
+    if not isinstance(pgbackrest, dict):
+        raise TypeError("pgBackRest service is missing")
+    pgbackrest_environment = pgbackrest.get("environment")
+    if not isinstance(pgbackrest_environment, dict):
+        raise TypeError("pgBackRest environment cannot be verified")
+    if (
+        pgbackrest_environment.get("PGBACKREST_REPO1_S3_ENDPOINT")
+        != "backup-store:9000"
+    ):
+        raise RuntimeError(
+            "pgBackRest endpoint is not the local disposable MinIO service"
+        )
+
+    # `docker ps -q` is not JSON. Inspect the exact IDs separately and never
+    # print their environment because it contains test-only repository keys.
+    container_query = ["docker", "ps", "-aq"]
+    if not pre_restore:
+        container_query.extend(["--filter", f"label={DISPOSABLE_LABEL}={project_name}"])
+    container_ids_result = subprocess.run(
+        container_query,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    container_ids = [
+        value for value in container_ids_result.stdout.splitlines() if value
+    ]
+    for container_id in container_ids:
+        inspected = _inspect_json(["inspect", container_id])
+        if not isinstance(inspected, list) or len(inspected) != 1:
+            raise RuntimeError("recovery container ownership cannot be verified")
+        record = inspected[0]
+        if not isinstance(record, dict):
+            raise TypeError("recovery container metadata is invalid")
+        config_record = record.get("Config")
+        if not isinstance(config_record, dict):
+            raise TypeError("recovery container config is invalid")
+        labels = config_record.get("Labels")
+        owned = (
+            isinstance(labels, dict) and labels.get(DISPOSABLE_LABEL) == project_name
+        )
+        if not owned and not pre_restore:
+            raise RuntimeError("unowned container is present in the recovery project")
+        service = (
+            labels.get("com.docker.compose.service")
+            if isinstance(labels, dict)
+            else None
+        )
+        environment = config_record.get("Env")
+        if owned and service in {"backend", "worker", "scheduler", "backend-test"}:
+            if not isinstance(environment, list):
+                raise RuntimeError("recovery worker environment cannot be verified")
+            values = {
+                entry.partition("=")[0]: entry.partition("=")[2]
+                for entry in environment
+                if isinstance(entry, str) and "=" in entry
+            }
+            if values.get("APP_ENV") != "test":
+                raise RuntimeError("recovery worker is not in test mode")
+            _assert_database_url(
+                values.get("DATABASE_URL", ""), host="postgres", port=5432
+            )
+            for secret_name in (
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GOOGLE_DRIVE_CLIENT_SECRET",
+                "GOOGLE_GMAIL_CLIENT_SECRET",
+            ):
+                if values.get(secret_name):
+                    raise RuntimeError(
+                        "external provider secret is present in recovery worker"
+                    )
+        mounts = record.get("Mounts")
+        if isinstance(mounts, list):
+            for mount in mounts:
+                target_is_mounted = (
+                    isinstance(mount, dict)
+                    and Path(str(mount.get("Source", ""))).resolve() == target
+                )
+                if target_is_mounted and (pre_restore or not owned):
+                    raise RuntimeError(
+                        "recovery target is already mounted by a container"
+                    )
+
+    for kind, names in (
+        (
+            "volume",
+            (
+                "postgres-source-data",
+                "postgres-recovery-data",
+                "pgbackrest-spool",
+                "postgres-socket",
+                "backup-store-data",
+                "backup-store-certs",
+            ),
+        ),
+        ("network", ("default",)),
+    ):
+        for logical_name in names:
+            resource_name = f"{project_name}_{logical_name}"
+            inspected = _inspect_json([kind, "inspect", resource_name])
+            if inspected is None:
+                continue
+            if not isinstance(inspected, list) or len(inspected) != 1:
+                raise RuntimeError(f"{kind} ownership cannot be verified")
+            labels = inspected[0].get("Labels")
+            if (
+                not isinstance(labels, dict)
+                or labels.get(DISPOSABLE_LABEL) != project_name
+            ):
+                raise RuntimeError(f"{kind} is not owned by the recovery project")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Verify PITR and Redis-loss recovery only in an explicitly disposable stack."
+    )
+    parser.add_argument("--compose-file", required=True, type=Path)
+    parser.add_argument("--evidence", required=True, type=Path)
+    parser.add_argument("--project-name", default="task25-recovery")
+    parser.add_argument("--target-volume", type=Path)
+    parser.add_argument("--restore-generation", type=int, default=1)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--confirm-disposable-project")
+    args = parser.parse_args()
+
+    if args.dry_run == args.execute:
+        parser.error("choose exactly one of --dry-run or --execute")
+    compose_file = (ROOT / args.compose_file).resolve()
+    try:
+        compose_file.relative_to(ROOT)
+    except ValueError:
+        parser.error("compose file must be inside the repository")
+    if not compose_file.is_file():
+        parser.error("compose file does not exist")
+
+    plan = _plan()
+    if args.dry_run:
+        _write_json(args.evidence, plan)
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+
+    if args.project_name != DISPOSABLE_PROJECT:
+        parser.error("disposable project name must be exactly task25-recovery")
+    if args.confirm_disposable_project != args.project_name:
+        parser.error("--confirm-disposable-project must exactly match --project-name")
+    if args.target_volume is None:
+        parser.error("--target-volume is required with --execute")
+    target = args.target_volume.expanduser().resolve()
+    if not target.is_dir() or any(target.iterdir()):
+        parser.error("--target-volume must name an existing empty directory")
+
+    started = datetime.now(UTC)
+    compose = [
+        "docker",
+        "compose",
+        "-p",
+        args.project_name,
+        "-f",
+        str(compose_file),
+    ]
+    env = os.environ.copy()
+    port = os.getenv("TASK25_POSTGRES_PORT", "55435")
+    internal_database_url = (
+        "postgresql+asyncpg://platform_app@postgres:5432/platform_test"
+    )
+    migration_database_url = "postgresql+asyncpg://postgres@postgres:5432/platform_test"
+    host_database_url = (
+        f"postgresql+asyncpg://platform_app@127.0.0.1:{port}/platform_test"
+    )
+    env.update(
+        {
+            "DATABASE_URL": internal_database_url,
+            "MIGRATION_DATABASE_URL": migration_database_url,
+            "PGBACKREST_REPO1_CIPHER_PASS": "task25-local-encryption-only",
+            "POSTGRES_DATA_SOURCE": "postgres-source-data",
+            "RESTORE_GENERATION": str(args.restore_generation),
+            "TASK25_DISPOSABLE": "1",
+        }
+    )
+    test_node = "tests/integration/recovery/test_restore_and_erasure.py::test_live_recovery_phase"
+    stage = "start_disposable_stack"
+    backup_evidence_path = args.evidence.parent / ".task25-backup-evidence.json"
+    try:
+        isolation = {
+            "compose_file": compose_file,
+            "project_name": args.project_name,
+            "target": target,
+            "internal_database_url": internal_database_url,
+            "migration_database_url": migration_database_url,
+            "host_database_url": host_database_url,
+            "port": int(port),
+        }
+        _assert_isolated(**isolation, pre_restore=True)
+        _run([*compose, "up", "-d", "postgres", "redis", "backup-store"], env=env)
+        _assert_isolated(**isolation, pre_restore=True)
+        stage = "migration"
+        _run([*compose, "run", "--rm", "migrate"], env=env)
+        stage = "seed"
+        _run(
+            [
+                *compose,
+                "run",
+                "--rm",
+                "-e",
+                "TASK25_RECOVERY_PHASE=seed",
+                "-e",
+                f"DATABASE_URL={migration_database_url}",
+                "backend-test",
+                "python",
+                "-m",
+                "pytest",
+                test_node,
+                "-q",
+            ],
+            env=env,
+        )
+        stage = "backup"
+        _run(
+            [
+                str(ROOT / "scripts/backup-postgres"),
+                "--type",
+                "full",
+                "--compose-file",
+                str(compose_file),
+                "--project-name",
+                args.project_name,
+                "--evidence",
+                str(backup_evidence_path),
+            ],
+            env=env,
+        )
+        actual_restore_point = _run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-qAt",
+                "-U",
+                "postgres",
+                "-d",
+                "platform_test",
+                "-c",
+                (
+                    "INSERT INTO audit_events "
+                    "(id, organization_id, actor_id, action, object_type, object_id, "
+                    "outcome, details) VALUES "
+                    "('25000000-0000-0000-0000-000000000009', "
+                    "'25000000-0000-0000-0000-000000000001', "
+                    "'25000000-0000-0000-0000-000000000002', "
+                    "'recovery.checkpoint', 'recovery_drill', "
+                    "'25000000-0000-0000-0000-000000000009', 'SUCCESS', '{}'::jsonb) "
+                    "RETURNING occurred_at"
+                ),
+            ],
+            env=env,
+            capture=True,
+        )
+        requested_restore_point = _run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-qAt",
+                "-U",
+                "postgres",
+                "-d",
+                "platform_test",
+                "-c",
+                "SELECT clock_timestamp()",
+            ],
+            env=env,
+            capture=True,
+        )
+        _run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "platform_test",
+                "-c",
+                "SELECT pg_switch_wal()",
+            ],
+            env=env,
+        )
+        _run(
+            [*compose, "run", "--rm", "pgbackrest", "--stanza=platform", "check"],
+            env=env,
+        )
+        stage = "apply_erasure_after_restore_point"
+        _run(
+            [
+                *compose,
+                "run",
+                "--rm",
+                "-e",
+                "TASK25_RECOVERY_PHASE=apply-erasure",
+                "backend-test",
+                "python",
+                "-m",
+                "pytest",
+                test_node,
+                "-q",
+            ],
+            env=env,
+        )
+        _run(
+            [*compose, "run", "--rm", "pgbackrest", "--stanza=platform", "check"],
+            env=env,
+        )
+        _run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "platform_test",
+                "-c",
+                "SELECT pg_switch_wal()",
+            ],
+            env=env,
+        )
+        stage = "restore"
+        _assert_isolated(**isolation, pre_restore=True)
+        _run([*compose, "stop", "postgres", "backend", "worker", "scheduler"], env=env)
+        restore_started = time.monotonic()
+        _run(
+            [
+                str(ROOT / "scripts/restore-postgres"),
+                "--target-volume",
+                str(target),
+                "--confirm-empty-target",
+                str(target),
+                "--target-timestamp",
+                requested_restore_point,
+                "--restore-generation",
+                str(args.restore_generation),
+                "--compose-file",
+                str(compose_file),
+                "--project-name",
+                args.project_name,
+                "--database-url",
+                internal_database_url,
+                "--replay-database-url",
+                host_database_url,
+                "--migration-database-url",
+                migration_database_url,
+                "--execute",
+            ],
+            env=env,
+        )
+        # All post-restore commands must remain attached to the restored data
+        # directory.  Without this explicit switch a later Compose invocation
+        # would recreate PostgreSQL on the original source volume.
+        env["POSTGRES_DATA_SOURCE"] = str(target)
+        measured_rto = time.monotonic() - restore_started
+        stage = "verify_erasure"
+        verify_env = env | {"TASK25_TEST_KEY_PATH": "/tmp/task25-connector.key"}
+        _run(
+            [
+                *compose,
+                "run",
+                "--rm",
+                "-e",
+                "TASK25_RECOVERY_PHASE=verify-restored",
+                "-e",
+                "TASK25_TEST_KEY_PATH=/tmp/task25-connector.key",
+                "backend-test",
+                "sh",
+                "-ec",
+                (
+                    "umask 077; printf '0123456789abcdef0123456789abcdef' "
+                    "> /tmp/task25-connector.key; python -m pytest "
+                    f"{test_node} -q"
+                ),
+            ],
+            env=verify_env,
+        )
+        stage = "redis_loss_recovery"
+        _assert_isolated(**isolation, pre_restore=False)
+        _run([*compose, "exec", "-T", "redis", "redis-cli", "FLUSHALL"], env=env)
+        _assert_isolated(**isolation, pre_restore=False)
+        _run([*compose, "restart", "worker", "scheduler"], env=env)
+        _run(
+            [
+                *compose,
+                "run",
+                "--rm",
+                "-e",
+                "TASK25_RECOVERY_PHASE=verify-redis-loss",
+                "backend-test",
+                "python",
+                "-m",
+                "pytest",
+                (
+                    "tests/integration/recovery/"
+                    "test_redis_loss.py::test_live_redis_loss_phase"
+                ),
+                "-q",
+            ],
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        failed = {**plan, "failed_stage": stage, "status": "failed"}
+        _write_json(args.evidence, failed)
+        print(json.dumps(failed, sort_keys=True))
+        return 1
+
+    completed = datetime.now(UTC)
+    requested = datetime.fromisoformat(requested_restore_point.replace("Z", "+00:00"))
+    actual = datetime.fromisoformat(actual_restore_point.replace("Z", "+00:00"))
+    backup_evidence = json.loads(backup_evidence_path.read_text(encoding="utf-8"))
+    measured_rpo = max(0.0, (requested - actual).total_seconds())
+    evidence = {
+        **plan,
+        "actual_restore_point": actual_restore_point,
+        "backup_label": backup_evidence["backup_label"],
+        "completed_at": completed.isoformat().replace("+00:00", "Z"),
+        "measured_rpo_seconds": round(measured_rpo, 3),
+        "measured_rto_seconds": round(measured_rto, 3),
+        "requested_restore_point": requested_restore_point,
+        "rpo_target_met": measured_rpo <= RPO_TARGET_SECONDS,
+        "rto_target_met": measured_rto <= RTO_TARGET_SECONDS,
+        "started_at": started.isoformat().replace("+00:00", "Z"),
+        "status": "completed",
+    }
+    _write_json(args.evidence, evidence)
+    backup_evidence_path.unlink(missing_ok=True)
+    print(json.dumps(evidence, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

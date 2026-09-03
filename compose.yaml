@@ -27,6 +27,17 @@ x-backend-environment: &backend-environment
   PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
   INTERNAL_BASE_URL: ${INTERNAL_BASE_URL:-}
 
+x-pgbackrest-environment: &pgbackrest-environment
+  PGBACKREST_STANZA: ${PGBACKREST_STANZA:-platform}
+  PGBACKREST_REPO1_S3_BUCKET: ${PGBACKREST_REPO1_S3_BUCKET:-}
+  PGBACKREST_REPO1_S3_ENDPOINT: ${PGBACKREST_REPO1_S3_ENDPOINT:-}
+  PGBACKREST_REPO1_S3_REGION: ${PGBACKREST_REPO1_S3_REGION:-}
+  PGBACKREST_REPO1_S3_URI_STYLE: ${PGBACKREST_REPO1_S3_URI_STYLE:-host}
+  PGBACKREST_REPO1_S3_VERIFY_TLS: ${PGBACKREST_REPO1_S3_VERIFY_TLS:-y}
+  PGBACKREST_REPO1_S3_KEY: ${PGBACKREST_REPO1_S3_KEY:-}
+  PGBACKREST_REPO1_S3_KEY_SECRET: ${PGBACKREST_REPO1_S3_KEY_SECRET:-}
+  PGBACKREST_REPO1_CIPHER_PASS: ${PGBACKREST_REPO1_CIPHER_PASS:-}
+
 x-backend: &backend
   build:
     context: ./backend
@@ -41,19 +52,52 @@ x-backend: &backend
 
 services:
   postgres:
-    image: pgvector/pgvector:pg17
+    # Production must pin an approved image containing PostgreSQL 17,
+    # pgvector, and pgBackRest. The development fallback keeps compose renderable.
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg17}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-platform}
       POSTGRES_USER: ${POSTGRES_USER:-platform}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      <<: *pgbackrest-environment
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - ${POSTGRES_DATA_SOURCE:-postgres-data}:/var/lib/postgresql/data
+      - ./infra/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./infra/postgres/entrypoint-initdb.d:/docker-entrypoint-initdb.d:ro
+      - ./infra/pgbackrest/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      - pgbackrest-spool:/var/spool/pgbackrest
+      - postgres-socket:/var/run/postgresql
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} && pgbackrest version",
+        ]
       interval: 10s
       timeout: 5s
       retries: 10
+
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    profiles: ["operations"]
+    volumes:
+      - ./backend/alembic.ini:/app/alembic.ini:ro
+      - ./backend/alembic:/app/alembic:ro
+
+  pgbackrest:
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg17}
+    user: postgres
+    entrypoint: ["pgbackrest"]
+    environment: *pgbackrest-environment
+    profiles: ["operations"]
+    volumes:
+      - ${POSTGRES_DATA_SOURCE:-postgres-data}:/var/lib/postgresql/data
+      - ./infra/pgbackrest/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      - pgbackrest-spool:/var/spool/pgbackrest
+      - postgres-socket:/var/run/postgresql
 
   redis:
     image: redis:7-alpine
@@ -279,6 +323,8 @@ services:
 
 volumes:
   postgres-data:
+  pgbackrest-spool:
+  postgres-socket:
   redis-data:
   prometheus-data:
   alertmanager-data:

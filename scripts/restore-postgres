@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Perform a fail-closed pgBackRest point-in-time restore."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = ROOT / "infra/pgbackrest/pgbackrest.conf"
+
+
+def _timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("timestamp must be ISO-8601") from None
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("timestamp must include a timezone")
+    return parsed.strftime("%Y-%m-%d %H:%M:%S.%f%z")
+
+
+def _validated_target(
+    parser: argparse.ArgumentParser, target: Path, confirmation: Path
+) -> Path:
+    resolved = target.expanduser().resolve()
+    if confirmation.expanduser().resolve() != resolved:
+        parser.error("--confirm-empty-target must exactly match --target-volume")
+    if not resolved.is_dir():
+        parser.error("target volume must be an existing directory")
+    if any(resolved.iterdir()):
+        parser.error("target volume must be empty")
+    return resolved
+
+
+def _database_identity(database_url: str) -> tuple[str, str]:
+    parsed = urlparse(database_url)
+    username = unquote(parsed.username or "")
+    database = unquote(parsed.path.removeprefix("/"))
+    if not username or not database:
+        raise ValueError("migration database URL must include a user and database")
+    return username, database
+
+
+def _quoted_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _safe_plan(generation: int) -> dict[str, object]:
+    names = (
+        "restore",
+        "start_database",
+        "migrate",
+        "replay_erasure",
+        "verify_erasure",
+        "rebuild_retrieval",
+        "restart_workers",
+        "verify_readiness",
+    )
+    return {
+        "restore_generation": generation,
+        "status": "planned",
+        "steps": [
+            {
+                "name": name,
+                "readiness": "eligible" if name == "verify_readiness" else "blocked",
+            }
+            for name in names
+        ],
+    }
+
+
+def _write_marker(path: Path, *, generation: int, state: str) -> None:
+    payload = {"restore_generation": generation, "readiness": state}
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        json.dump(payload, temporary, sort_keys=True)
+        temporary.write("\n")
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, path)
+
+
+def _run(command: list[str], *, env: dict[str, str]) -> None:
+    subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Restore only into an explicitly confirmed empty target. Readiness stays blocked "
+            "until migrations and erasure replay complete."
+        )
+    )
+    parser.add_argument("--target-volume", required=True, type=Path)
+    parser.add_argument("--target-timestamp", required=True, type=_timestamp)
+    parser.add_argument("--restore-generation", required=True, type=int)
+    parser.add_argument("--confirm-empty-target", required=True, type=Path)
+    parser.add_argument("--compose-file", type=Path, default=ROOT / "compose.yaml")
+    parser.add_argument("--project-name", default="enterprise-ai-agent-platform")
+    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
+    parser.add_argument(
+        "--replay-database-url",
+        default=os.getenv("REPLAY_DATABASE_URL"),
+        help="host-reachable restored database URL; defaults to --database-url",
+    )
+    parser.add_argument(
+        "--migration-database-url", default=os.getenv("MIGRATION_DATABASE_URL")
+    )
+    parser.add_argument("--stanza", default=os.getenv("PGBACKREST_STANZA", "platform"))
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--execute", action="store_true")
+    args = parser.parse_args()
+
+    if args.restore_generation <= 0:
+        parser.error("--restore-generation must be positive")
+    target = _validated_target(parser, args.target_volume, args.confirm_empty_target)
+    if not args.compose_file.is_file() or not args.config.is_file():
+        parser.error("compose and pgBackRest config files must exist")
+    plan = _safe_plan(args.restore_generation)
+    plan["target_timestamp"] = args.target_timestamp
+    if args.dry_run:
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+    if not args.database_url or not args.migration_database_url:
+        parser.error("DATABASE_URL and MIGRATION_DATABASE_URL are required")
+    if not os.getenv("PGBACKREST_REPO1_CIPHER_PASS"):
+        parser.error(
+            "PGBACKREST_REPO1_CIPHER_PASS must be injected by the secret manager"
+        )
+
+    marker = target.parent / f".{target.name}.task25-restore-generation.json"
+    env = os.environ.copy()
+    env.update(
+        {
+            "DATABASE_URL": args.database_url,
+            "MIGRATION_DATABASE_URL": args.migration_database_url,
+            "POSTGRES_DATA_SOURCE": str(target),
+            "RESTORE_GENERATION": str(args.restore_generation),
+        }
+    )
+    migration_user, migration_database = _database_identity(args.migration_database_url)
+    application_user, _ = _database_identity(args.database_url)
+    compose = [
+        "docker",
+        "compose",
+        "-p",
+        args.project_name,
+        "-f",
+        str(args.compose_file),
+    ]
+    base = [
+        *compose,
+        "run",
+        "--rm",
+        "pgbackrest",
+        "--config=/etc/pgbackrest/pgbackrest.conf",
+        f"--stanza={args.stanza}",
+    ]
+    _write_marker(marker, generation=args.restore_generation, state="blocked")
+    try:
+        _run(
+            [
+                *base,
+                "--pg1-path=/var/lib/postgresql/data",
+                "--type=time",
+                f"--target={args.target_timestamp}",
+                "--target-action=promote",
+                "restore",
+            ],
+            env=env,
+        )
+        _run([*compose, "up", "-d", "postgres"], env=env)
+        _run([*compose, "run", "--rm", "migrate"], env=env)
+        _run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-U",
+                migration_user,
+                "-d",
+                migration_database,
+                "-c",
+                (
+                    "GRANT SELECT ON TABLE alembic_version TO "
+                    f"{_quoted_identifier(application_user)}"
+                ),
+            ],
+            env=env,
+        )
+        replay_database_url = args.replay_database_url or args.database_url
+        replay = [
+            str(ROOT / "scripts/replay-erasure-ledger"),
+            "--database-url",
+            replay_database_url,
+            "--restore-generation",
+            str(args.restore_generation),
+        ]
+        blocked = subprocess.run([*replay, "--check"], cwd=ROOT, env=env, check=False)
+        if blocked.returncode not in (0, 1):
+            raise subprocess.CalledProcessError(blocked.returncode, replay)
+        _run(replay, env=env)
+        _run([*replay, "--check"], env=env)
+        _run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-U",
+                migration_user,
+                "-d",
+                migration_database,
+                "-c",
+                (
+                    "REINDEX INDEX ix_document_chunks_embedding_hnsw; "
+                    "REINDEX INDEX ix_document_chunks_search_vector_gin;"
+                ),
+            ],
+            env=env,
+        )
+        _run(
+            [
+                *compose,
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "90",
+                "backend",
+                "worker",
+                "scheduler",
+            ],
+            env=env,
+        )
+        _run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "backend",
+                "python",
+                "-c",
+                (
+                    "import json,urllib.request; "
+                    "r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health/ready')); "
+                    "assert r['ready'] is True"
+                ),
+            ],
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        print(
+            json.dumps(
+                {"restore_generation": args.restore_generation, "status": "blocked"}
+            )
+        )
+        return 1
+    _write_marker(marker, generation=args.restore_generation, state="eligible")
+    print(
+        json.dumps(
+            {"restore_generation": args.restore_generation, "status": "completed"},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print(json.dumps({"status": "blocked"}), file=sys.stderr)
+        raise SystemExit(130) from None

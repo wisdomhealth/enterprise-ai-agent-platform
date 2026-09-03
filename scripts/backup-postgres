@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Create a checked pgBackRest backup and safe local evidence."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = ROOT / "infra/pgbackrest/pgbackrest.conf"
+DEFAULT_ARCHIVE_READY_MARKER = Path(
+    os.getenv(
+        "PGBACKREST_ARCHIVE_READY_MARKER",
+        "/var/lib/postgresql/data/.pgbackrest-archive-ready",
+    )
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        json.dump(payload, temporary, indent=2, sort_keys=True)
+        temporary.write("\n")
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, path)
+
+
+def _latest_backup(info: Any) -> dict[str, object]:
+    if not isinstance(info, list) or not info or not isinstance(info[0], dict):
+        raise RuntimeError("pgBackRest returned invalid info JSON")
+    backups = info[0].get("backup")
+    if (
+        not isinstance(backups, list)
+        or not backups
+        or not isinstance(backups[-1], dict)
+    ):
+        raise RuntimeError("pgBackRest did not report a completed backup")
+    latest = backups[-1]
+    label = latest.get("label")
+    if not isinstance(label, str) or not label:
+        raise RuntimeError("pgBackRest backup label is missing")
+    return latest
+
+
+def _command_base(
+    *, config: Path, stanza: str, compose_file: Path | None, project_name: str
+) -> list[str]:
+    if compose_file is None:
+        return ["pgbackrest", f"--config={config}", f"--stanza={stanza}"]
+    return [
+        "docker",
+        "compose",
+        "-p",
+        project_name,
+        "-f",
+        str(compose_file),
+        "run",
+        "--rm",
+        "pgbackrest",
+        "--config=/etc/pgbackrest/pgbackrest.conf",
+        f"--stanza={stanza}",
+    ]
+
+
+def _enable_archiving(
+    *,
+    marker: Path,
+    compose_file: Path | None,
+    project_name: str,
+) -> None:
+    if compose_file is None:
+        marker.touch(mode=0o600, exist_ok=True)
+        return
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            project_name,
+            "-f",
+            str(compose_file),
+            "exec",
+            "-T",
+            "--user",
+            "postgres",
+            "postgres",
+            "touch",
+            str(marker),
+        ],
+        check=True,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate a pgBackRest stanza, create a backup, and record safe evidence."
+    )
+    parser.add_argument("--stanza", default=os.getenv("PGBACKREST_STANZA", "platform"))
+    parser.add_argument("--type", choices=("full", "diff"), default="diff")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--compose-file", type=Path)
+    parser.add_argument("--project-name", default="enterprise-ai-agent-platform")
+    parser.add_argument(
+        "--archive-ready-marker",
+        type=Path,
+        default=DEFAULT_ARCHIVE_READY_MARKER,
+    )
+    parser.add_argument("--evidence", required=True, type=Path)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if not args.config.is_file():
+        parser.error("pgBackRest config does not exist")
+    if args.compose_file is not None and not args.compose_file.is_file():
+        parser.error("compose file does not exist")
+
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "backup_type": args.type,
+                    "commands": [
+                        "stanza-create",
+                        "enable-archive",
+                        "check",
+                        "backup",
+                        "info",
+                    ],
+                    "repository_encryption": "required",
+                    "stanza": args.stanza,
+                    "status": "planned",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if not os.getenv("PGBACKREST_REPO1_CIPHER_PASS"):
+        parser.error(
+            "PGBACKREST_REPO1_CIPHER_PASS must be injected by the secret manager"
+        )
+
+    base = _command_base(
+        config=args.config,
+        stanza=args.stanza,
+        compose_file=args.compose_file,
+        project_name=args.project_name,
+    )
+    started_at = _utc_now()
+    monotonic_start = time.monotonic()
+    subprocess.run([*base, "stanza-create"], check=True)
+    _enable_archiving(
+        marker=args.archive_ready_marker,
+        compose_file=args.compose_file,
+        project_name=args.project_name,
+    )
+    subprocess.run([*base, "check"], check=True)
+    subprocess.run([*base, f"--type={args.type}", "backup"], check=True)
+    completed = subprocess.run(
+        [*base, "--output=json", "info"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    latest = _latest_backup(json.loads(completed.stdout))
+    evidence = {
+        "backup_label": latest["label"],
+        "backup_type": args.type,
+        "completed_at": _utc_now(),
+        "duration_seconds": round(time.monotonic() - monotonic_start, 3),
+        "repository_encrypted": True,
+        "stanza": args.stanza,
+        "started_at": started_at,
+        "status": "completed",
+    }
+    _write_json(args.evidence, evidence)
+    print(json.dumps(evidence, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as error:
+        print(
+            json.dumps(
+                {"command": Path(str(error.cmd[0])).name, "status": "failed"},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
