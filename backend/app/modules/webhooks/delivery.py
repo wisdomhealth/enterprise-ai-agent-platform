@@ -13,6 +13,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
+import httpcore
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
@@ -205,8 +206,11 @@ class HttpxWebhookTransport:
         body: bytes,
         headers: dict[str, str],
     ) -> WebhookTransportResponse:
-        await _validate_delivery_endpoint(url)
+        addresses = await _validate_delivery_endpoint(url)
+        parsed = urlsplit(url)
+        assert parsed.hostname is not None
         async with httpx.AsyncClient(
+            transport=_pinned_http_transport(parsed.hostname, addresses[0]),
             follow_redirects=False,
             timeout=httpx.Timeout(15.0),
         ) as client:
@@ -258,17 +262,79 @@ async def _resolve_endpoint_addresses(hostname: str, port: int) -> tuple[str, ..
     return addresses
 
 
-async def _validate_delivery_endpoint(value: str) -> None:
+async def _validate_delivery_endpoint(value: str) -> tuple[str, ...]:
     """Re-resolve hostnames immediately before every external HTTP request."""
 
     _validated_endpoint_url(value)
     parsed = urlsplit(value)
     assert parsed.hostname is not None
     if _ip_address_or_none(parsed.hostname) is not None:
-        return
+        return (parsed.hostname,)
     addresses = await _resolve_endpoint_addresses(parsed.hostname, parsed.port or 443)
     for address in addresses:
         _require_global_ip_address(address)
+    return addresses
+
+
+class _PinnedAddressNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Connect only to a public address checked for this request's hostname.
+
+    httpcore still owns the URL origin, so TLS uses the original hostname for SNI
+    and certificate verification while the TCP connection cannot re-resolve it.
+    """
+
+    def __init__(
+        self,
+        hostname: str,
+        address: str,
+        *,
+        delegate: httpcore.AsyncNetworkBackend | None = None,
+    ) -> None:
+        self._hostname = hostname.casefold()
+        self._address = address
+        self._delegate = delegate or httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: object | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if host.casefold() != self._hostname:
+            raise ValueError("webhook delivery host does not match its validated endpoint")
+        return await self._delegate.connect_tcp(
+            host=self._address,
+            port=port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,  # type: ignore[arg-type]
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: object | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        return await self._delegate.connect_unix_socket(
+            path=path,
+            timeout=timeout,
+            socket_options=socket_options,  # type: ignore[arg-type]
+        )
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
+
+
+def _pinned_http_transport(hostname: str, address: str) -> httpx.AsyncHTTPTransport:
+    transport = httpx.AsyncHTTPTransport(trust_env=False)
+    transport._pool._network_backend = _PinnedAddressNetworkBackend(
+        hostname,
+        address,
+    )
+    return transport
 
 
 def _ip_address_or_none(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -469,12 +535,14 @@ class WebhookSubscriptionService:
         )
 
     async def schedule(self, event: OutboxEvent) -> list[WebhookDelivery]:
-        if (event.event_type, event.event_version) not in SUPPORTED_EVENT_SCHEMAS:
+        try:
+            data = _validated_event_data(event)
+        except ValueError:
             return []
         try:
-            organization_id = UUID(str(event.payload["organization_id"]))
-        except (KeyError, TypeError, ValueError):
-            return []
+            organization_id = UUID(str(data["organization_id"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("webhook event has invalid data") from exc
         subscriptions = list(
             (
                 await self._db_session.scalars(

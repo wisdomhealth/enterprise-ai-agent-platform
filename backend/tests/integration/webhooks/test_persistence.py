@@ -43,6 +43,7 @@ async def test_subscription_secret_is_encrypted_and_event_intent_is_idempotent(
             "organization_id": str(admin.organization_id),
             "handoff_id": str(subscription.id),
             "trigger": "CUSTOMER_REQUEST",
+            "last_customer_sequence": 0,
         },
         occurred_at=datetime.now(UTC),
     )
@@ -108,6 +109,63 @@ async def test_unknown_event_version_creates_no_durable_delivery_intent(
     assert (
         await db_session.scalar(
             select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload_update",
+    [
+        {"organization_id": "not-a-uuid"},
+        {"trigger": "UNKNOWN_TRIGGER"},
+        {"last_customer_sequence": -1},
+        {"last_customer_sequence": True},
+        {"last_customer_sequence": None},
+    ],
+)
+async def test_malformed_published_event_creates_no_durable_delivery_or_job(
+    db_session,
+    webhook_context,
+    payload_update: dict[str, object],
+) -> None:  # type: ignore[no-untyped-def]
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    admin = webhook_context["principal"](webhook_context["admin"])
+    subscription = await service.create(
+        admin,
+        endpoint_url="https://hooks.example.test/malformed-event",
+        event_types=["support.handoff.queued"],
+        signing_secret="malformed-event-secret-with-at-least-32-bytes",
+    )
+    payload: dict[str, object] = {
+        "organization_id": str(admin.organization_id),
+        "handoff_id": str(subscription.id),
+        "trigger": "CUSTOMER_REQUEST",
+        "last_customer_sequence": 1,
+    }
+    payload.update(payload_update)
+    event = OutboxEvent(
+        event_type="support.handoff.queued",
+        event_version=1,
+        aggregate_type="support_handoff",
+        aggregate_id=subscription.id,
+        payload=payload,
+        occurred_at=datetime.now(UTC),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    assert await service.schedule(event) == []
+    assert (
+        await db_session.scalar(
+            select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)
+        )
+        == 0
+    )
+    assert (
+        await db_session.scalar(
+            select(func.count(JobIntent.id)).where(JobIntent.kind == "webhook.deliver")
         )
         == 0
     )

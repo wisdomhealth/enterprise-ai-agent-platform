@@ -143,3 +143,44 @@ async def test_request_time_resolution_blocks_hostname_rebinding_to_private_addr
             headers={},
         )
     assert not called
+
+
+@pytest.mark.asyncio
+async def test_checked_public_address_is_pinned_for_the_outbound_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connected_hosts: list[str] = []
+    resolution_calls = 0
+
+    async def changing_resolution(*_args: object) -> tuple[str, ...]:
+        nonlocal resolution_calls
+        resolution_calls += 1
+        return ("93.184.216.34",) if resolution_calls == 1 else ("10.0.0.1",)
+
+    class RecordingBackend:
+        async def connect_tcp(self, *, host: str, **_kwargs: object) -> object:
+            connected_hosts.append(host)
+            return object()
+
+        async def connect_unix_socket(self, **_kwargs: object) -> object:
+            raise AssertionError("webhook delivery must not use a Unix socket")
+
+        async def sleep(self, _seconds: float) -> None:
+            return None
+
+    monkeypatch.setattr(webhook_delivery, "_resolve_endpoint_addresses", changing_resolution)
+    checked_addresses = await webhook_delivery._validate_delivery_endpoint(
+        "https://delivery.example.test/webhook"
+    )
+    backend = webhook_delivery._PinnedAddressNetworkBackend(
+        "delivery.example.test",
+        checked_addresses[0],
+        delegate=RecordingBackend(),  # type: ignore[arg-type]
+    )
+
+    await backend.connect_tcp("delivery.example.test", 443)
+
+    assert connected_hosts == ["93.184.216.34"]
+    assert resolution_calls == 1
+    with pytest.raises(ValueError, match="does not match"):
+        await backend.connect_tcp("169.254.169.254", 443)
