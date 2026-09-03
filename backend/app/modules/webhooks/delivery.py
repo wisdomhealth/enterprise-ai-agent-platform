@@ -674,40 +674,46 @@ class WebhookDeliveryService:
         claim_version = claimed.version
         await self._db_session.commit()
 
-        delivery, subscription, event = await self._context(job_id)
-        if subscription.status is not WebhookSubscriptionStatus.ACTIVE:
-            await JobLeaseService(self._db_session).retry(
-                job_id,
-                self._worker_id,
-                error_code="WEBHOOK_SUBSCRIPTION_DISABLED",
-                error_class=ErrorClass.NON_RETRYABLE,
-                expected_version=claim_version,
-            )
-            delivery.state = WebhookDeliveryState.FAILED
-            delivery.last_error_code = "WEBHOOK_SUBSCRIPTION_DISABLED"
-            await self._db_session.commit()
-            return delivery
-
-        delivery.delivery_attempt += 1
-        delivery.state = WebhookDeliveryState.DELIVERING
-        delivery.last_http_status = None
-        delivery.response_summary = None
-        delivery.last_error_code = None
-        await self._db_session.commit()
-
-        signing_secret = (
-            await self._cipher.decrypt(
-                EncryptedSecret(
-                    ciphertext=subscription.secret_ciphertext,
-                    encrypted_data_key=subscription.secret_encrypted_data_key,
-                    nonce=subscription.secret_nonce,
-                    algorithm=subscription.secret_algorithm,
-                    key_version=subscription.secret_key_version,
-                )
-            )
-        ).encode("utf-8")
+        # The initial recovery validation above prevents an invalid source from
+        # being claimed.  It is not enough: this long-lived session deliberately
+        # uses expire_on_commit=False, and another transaction can modify the
+        # Outbox row after the durable claim.  Fence the current lease first,
+        # then lock and repopulate the exact linked rows.  The lock is retained
+        # until the attempt is durably published so validation, signing and I/O
+        # cannot be separated by a concurrent producer mutation.
         try:
             await self._lock_active_job(job_id, claim_version)
+            delivery, subscription, event = await self._locked_context(job_id)
+            validate_webhook_event(event)
+            if subscription.status is not WebhookSubscriptionStatus.ACTIVE:
+                await JobLeaseService(self._db_session).retry(
+                    job_id,
+                    self._worker_id,
+                    error_code="WEBHOOK_SUBSCRIPTION_DISABLED",
+                    error_class=ErrorClass.NON_RETRYABLE,
+                    expected_version=claim_version,
+                )
+                delivery.state = WebhookDeliveryState.FAILED
+                delivery.last_error_code = "WEBHOOK_SUBSCRIPTION_DISABLED"
+                await self._db_session.commit()
+                return delivery
+
+            delivery.delivery_attempt += 1
+            delivery.state = WebhookDeliveryState.DELIVERING
+            delivery.last_http_status = None
+            delivery.response_summary = None
+            delivery.last_error_code = None
+            signing_secret = (
+                await self._cipher.decrypt(
+                    EncryptedSecret(
+                        ciphertext=subscription.secret_ciphertext,
+                        encrypted_data_key=subscription.secret_encrypted_data_key,
+                        nonce=subscription.secret_nonce,
+                        algorithm=subscription.secret_algorithm,
+                        key_version=subscription.secret_key_version,
+                    )
+                )
+            ).encode("utf-8")
             timestamp = await self._db_session.scalar(
                 select(func.floor(func.extract("epoch", func.clock_timestamp())))
             )
@@ -719,12 +725,20 @@ class WebhookDeliveryService:
                 signing_secret=signing_secret,
                 timestamp=int(timestamp),
             )
+            # Keep the lease and exact linked Outbox row locked through the
+            # external boundary.  If this worker loses the lease, completion
+            # remains fenced by the same generation below.
             response = await self._transport.post(
                 url=subscription.endpoint_url,
                 body=request.body_bytes,
                 headers=request.headers,
             )
         except JobLeaseLost:
+            await self._db_session.rollback()
+            raise
+        except ValueError:
+            # A malformed, replaced or otherwise unverifiable persisted event
+            # must never become a DELIVERING/RETRY_WAIT side effect.
             await self._db_session.rollback()
             raise
         except Exception:
@@ -734,6 +748,7 @@ class WebhookDeliveryService:
                 claim_version,
                 error_code="WEBHOOK_DELIVERY_TRANSPORT_FAILED",
                 retryable=True,
+                attempted_delivery=True,
             )
 
         if 200 <= response.status_code < 300:
@@ -744,6 +759,11 @@ class WebhookDeliveryService:
                 response_body=response.body,
             )
         retryable = response.status_code in {408, 425, 429} or response.status_code >= 500
+        # The delivery attempt and source locks above are intentionally
+        # provisional until terminal publication.  Discard that provisional
+        # write before recording this one durable failed attempt, otherwise the
+        # current identity map would count the same HTTP call twice.
+        await self._db_session.rollback()
         return await self._record_failure(
             job_id,
             claim_version,
@@ -754,6 +774,7 @@ class WebhookDeliveryService:
             status_code=response.status_code,
             response_body=response.body,
             retry_after_seconds=_retry_after(response.headers),
+            attempted_delivery=True,
         )
 
     async def _record_success(
@@ -792,12 +813,15 @@ class WebhookDeliveryService:
         status_code: int | None = None,
         response_body: bytes = b"",
         retry_after_seconds: int | None = None,
+        attempted_delivery: bool = False,
     ) -> WebhookDelivery:
         attempt = await self._db_session.scalar(
             select(WebhookDelivery.delivery_attempt).where(WebhookDelivery.job_id == job_id)
         )
         if attempt is None:
             raise LookupError("webhook delivery not found")
+        if attempted_delivery:
+            attempt += 1
         retryable = retryable_for_attempt(requested=retryable, attempt=attempt)
         if not retryable and error_code == "WEBHOOK_DELIVERY_RETRYABLE_RESPONSE":
             error_code = "WEBHOOK_DELIVERY_ATTEMPTS_EXHAUSTED"
@@ -813,6 +837,8 @@ class WebhookDeliveryService:
                 retry_after_seconds=retry_after_seconds,
             )
             delivery = await self._locked_delivery(job_id)
+            if attempted_delivery:
+                delivery.delivery_attempt = attempt
             delivery.state = (
                 WebhookDeliveryState.RETRY_WAIT if retryable else WebhookDeliveryState.FAILED
             )
@@ -861,6 +887,36 @@ class WebhookDeliveryService:
                     WebhookDelivery.job_id == job_id,
                     WebhookDelivery.organization_id == WebhookSubscription.organization_id,
                 )
+            )
+        ).one_or_none()
+        if row is None:
+            raise LookupError("webhook delivery context not found")
+        return row._tuple()
+
+    async def _locked_context(
+        self, job_id: UUID
+    ) -> tuple[WebhookDelivery, WebhookSubscription, OutboxEvent]:
+        """Return the authoritative linked delivery source under row locks.
+
+        `populate_existing` is necessary because recovery workers keep identity
+        maps across the durable claim commit.  Without it, a later SELECT could
+        validate a stale OutboxEvent instance despite a concurrent committed
+        producer update.
+        """
+        row = (
+            await self._db_session.execute(
+                select(WebhookDelivery, WebhookSubscription, OutboxEvent)
+                .join(
+                    WebhookSubscription,
+                    WebhookSubscription.id == WebhookDelivery.subscription_id,
+                )
+                .join(OutboxEvent, OutboxEvent.event_id == WebhookDelivery.event_id)
+                .where(
+                    WebhookDelivery.job_id == job_id,
+                    WebhookDelivery.organization_id == WebhookSubscription.organization_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).one_or_none()
         if row is None:

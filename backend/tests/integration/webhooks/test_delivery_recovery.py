@@ -387,6 +387,87 @@ async def test_recovery_rejects_corrupt_persisted_event_before_claim_or_delivery
 
 
 @pytest.mark.asyncio
+async def test_recovery_refetches_and_fences_event_after_claim_before_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale recovered worker must not sign or deliver a post-claim corruption.
+
+    This deliberately pauses worker A after its durable claim and recovered context
+    load.  Worker B then commits malformed producer data in an independent session.
+    A must reload and lock the exact linked Outbox row before its attempt/sign/HTTP
+    boundary, rather than trusting its expire_on_commit=False identity cache.
+    """
+    context = await _seed_committed_webhook(tmp_path, schedule=True)
+    assert context.job_id is not None
+    transport = RecordingTransport([WebhookTransportResponse(204, b"must-not-send")])
+    lease_fenced_after_claim = asyncio.Event()
+    allow_worker_a = asyncio.Event()
+    original_lock_active_job = WebhookDeliveryService._lock_active_job
+
+    async def pause_after_claim_lease_fence(
+        service: WebhookDeliveryService, job_id: UUID, expected_version: int
+    ) -> JobIntent:
+        result = await original_lock_active_job(service, job_id, expected_version)
+        lease_fenced_after_claim.set()
+        await allow_worker_a.wait()
+        return result
+
+    monkeypatch.setattr(WebhookDeliveryService, "_lock_active_job", pause_after_claim_lease_fence)
+    try:
+        async with async_sessionmaker() as worker_a:
+            delivery_task = asyncio.create_task(
+                WebhookDeliveryService(
+                    worker_a,
+                    context.cipher,
+                    transport,
+                    worker_id="webhook-stale-recovery-worker",
+                ).deliver(context.job_id)
+            )
+            await asyncio.wait_for(lease_fenced_after_claim.wait(), timeout=5)
+
+            async with async_sessionmaker() as worker_b:
+                await worker_b.execute(
+                    update(OutboxEvent)
+                    .where(OutboxEvent.event_id == context.event_id)
+                    .values(
+                        payload={
+                            "organization_id": str(context.organization_id),
+                            "handoff_id": str(context.subscription_id),
+                            "trigger": "NOT_A_TRIGGER",
+                            "last_customer_sequence": 1,
+                        }
+                    )
+                )
+                await worker_b.commit()
+
+            allow_worker_a.set()
+            with pytest.raises(ValueError, match="invalid data"):
+                await delivery_task
+
+        async with async_sessionmaker() as verify:
+            delivery = await verify.scalar(
+                select(WebhookDelivery).where(WebhookDelivery.job_id == context.job_id)
+            )
+            job = await verify.get(JobIntent, context.job_id)
+            assert delivery is not None
+            assert delivery.state is WebhookDeliveryState.PENDING
+            assert delivery.delivery_attempt == 0
+            assert delivery.last_http_status is None
+            assert delivery.response_summary is None
+            assert delivery.last_error_code is None
+            assert job is not None
+            # The valid claim remains durable; invalid source data is not misclassified
+            # as a retryable delivery failure and cannot publish an attempt.
+            assert job.state is JobState.RUNNING
+            assert job.lease_owner == "webhook-stale-recovery-worker"
+            assert job.last_error_code is None
+        assert transport.calls == []
+    finally:
+        await _cleanup_committed_webhook(context)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_scheduling_persists_one_delivery_and_job(tmp_path: Path) -> None:
     context = await _seed_committed_webhook(tmp_path, schedule=False)
 
