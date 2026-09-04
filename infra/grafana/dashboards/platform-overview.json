@@ -1,0 +1,44 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate",
+      "type": "timeseries",
+      "targets": [{"expr": "sum(rate(platform_http_requests_total[5m]))", "refId": "A"}]
+    },
+    {
+      "id": 2,
+      "title": "Job and support backlog",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "platform_job_backlog", "refId": "A"},
+        {"expr": "platform_support_handoff_backlog", "refId": "B"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Connector staleness",
+      "type": "stat",
+      "targets": [{"expr": "platform_connector_staleness_seconds", "refId": "A"}]
+    },
+    {
+      "id": 4,
+      "title": "Delivery unknown and erasure backlog",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "platform_email_delivery_unknown", "refId": "A"},
+        {"expr": "platform_erasure_backlog", "refId": "B"}
+      ]
+    }
+  ],
+  "schemaVersion": 41,
+  "tags": ["platform", "operations"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "Enterprise AI Agent Platform",
+  "uid": "platform-overview",
+  "version": 1
+}

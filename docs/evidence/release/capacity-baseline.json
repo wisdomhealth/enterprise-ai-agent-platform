@@ -1,0 +1,69 @@
+{
+  "baseline": "local-deterministic-v1",
+  "fixture_digest": "a65f8ae2f14c899c7b83efb7dee30aa0484baca7c0dc4559a1fb9526683c11d7",
+  "interpretation": "capacity evidence only; no production SLA is inferred",
+  "measurements": {
+    "end_to_end": {
+      "duration_seconds": 0.002968,
+      "name": "end_to_end",
+      "operations": 10000,
+      "operations_per_second": 3369525.183,
+      "result_digest": "6d8e17b3405e10643f0a59189a8921845f14fb47bf20bacb585d5c7de16cfa9a"
+    },
+    "estimated_cost": {
+      "basis": "deterministic local fake providers",
+      "currency": "USD",
+      "name": "estimated_cost",
+      "value": 0.0
+    },
+    "fusion": {
+      "duration_seconds": 0.003928,
+      "name": "fusion",
+      "operations": 10000,
+      "operations_per_second": 2545664.227,
+      "result_digest": "58efb809b19bd1e671d1271d12ec1b5435cc74074b9eaaa7bae415942ace55de"
+    },
+    "ingestion": {
+      "duration_seconds": 0.002721,
+      "name": "ingestion",
+      "operations": 10000,
+      "operations_per_second": 3675344.622,
+      "result_digest": "faa12a049f3e81fe6285c150f51e2e61279cee81d342a4287741feee0c61e3a1"
+    },
+    "model_fake": {
+      "duration_seconds": 0.000238,
+      "name": "model_fake",
+      "operations": 1000,
+      "operations_per_second": 4196533.408,
+      "result_digest": "78236868c0d071f633774540509ce04953123c4b73aedf39b6cb7bab0b701c78"
+    },
+    "queue": {
+      "duration_seconds": 0.000245,
+      "name": "queue",
+      "operations": 1000,
+      "operations_per_second": 4085853.323,
+      "result_digest": "96e4d408a14eab187edbb1d2d262078f2de3a040ff53521070b48917ee637094"
+    },
+    "text_retrieval": {
+      "duration_seconds": 0.002694,
+      "name": "text_retrieval",
+      "operations": 10000,
+      "operations_per_second": 3711407.16,
+      "result_digest": "feec3fbb6190141032e992279da7b7a5b16a9a2dbe0f8c9d8eb73275b8d4ec84"
+    },
+    "vector_retrieval": {
+      "duration_seconds": 0.016838,
+      "name": "vector_retrieval",
+      "operations": 10000,
+      "operations_per_second": 593894.362,
+      "result_digest": "96d9c3f0eb3441788cc60e818fbf44e4a9e22b6841e00e92affd11749e536655"
+    }
+  },
+  "schema_version": 1,
+  "sla_asserted": false,
+  "workload": {
+    "daily_emails": 1000,
+    "documents": 10000,
+    "staff": 25
+  }
+}

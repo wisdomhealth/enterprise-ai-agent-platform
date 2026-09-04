@@ -1,0 +1,52 @@
+groups:
+  - name: platform-hard-gates
+    rules:
+      - alert: PlatformDatabaseUnavailable
+        expr: platform_dependency_up{dependency="database"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: PostgreSQL is unavailable to the platform
+          runbook: docs/runbooks/observability.md#database-or-required-readiness-failure
+      - alert: PlatformDriveSyncStale
+        expr: platform_connector_staleness_seconds > 1800
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Drive synchronization is more than 30 minutes stale
+          runbook: docs/runbooks/observability.md#connector-staleness
+      - alert: PlatformModelErrorsSustained
+        expr: sum(rate(platform_rag_answer_generations_total{outcome=~"provider_error|validation_refusal"}[10m])) > 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Grounded answer failures are sustained
+          runbook: docs/runbooks/observability.md#model-errors
+      - alert: PlatformExpiredJobLease
+        expr: platform_expired_job_leases > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: One or more durable job leases have expired
+          runbook: docs/runbooks/observability.md#expired-job-leases
+      - alert: PlatformSupportBacklog
+        expr: platform_support_handoff_backlog > 20
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Human support handoff backlog is elevated
+          runbook: docs/runbooks/observability.md#support-backlog
+      - alert: PlatformDeliveryUnknownOld
+        expr: platform_email_delivery_unknown > 0 and platform_email_delivery_unknown_oldest_age_seconds > 900
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: An ambiguous email delivery has awaited reconciliation for 15 minutes
+          runbook: docs/runbooks/observability.md#delivery-unknown
+      - alert: PlatformErasureBacklog
+        expr: platform_erasure_backlog > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: Retention or post-restore erasure work remains unapplied
+          runbook: docs/runbooks/observability.md#erasure-replay

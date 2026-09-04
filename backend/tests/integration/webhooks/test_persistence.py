@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from uuid import UUID
+
+import httpx
+import pytest
+from sqlalchemy import func, select
+
+from app.core.config import Settings
+from app.main import create_app
+from app.modules.identity.dependencies import (
+    get_db_session,
+    require_staff_csrf,
+    require_staff_session,
+)
+from app.modules.jobs.models import JobIntent
+from app.modules.outbox.models import OutboxEvent, ProcessedEvent
+from app.modules.webhooks import delivery as webhook_delivery
+from app.modules.webhooks.delivery import WebhookSubscriptionService
+from app.modules.webhooks.models import WebhookDelivery, WebhookSubscription
+from app.modules.webhooks.tasks import (
+    WEBHOOK_SCHEDULER_CONSUMER,
+    _dispatch_pending_webhook_events,
+)
+
+
+@pytest.mark.asyncio
+async def test_subscription_secret_is_encrypted_and_event_intent_is_idempotent(
+    db_session,
+    webhook_context,
+) -> None:  # type: ignore[no-untyped-def]
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    admin = webhook_context["principal"](webhook_context["admin"])
+    secret = "test-webhook-secret-with-at-least-32-bytes"
+    subscription = await service.create(
+        admin,
+        endpoint_url="https://hooks.example.test/n8n",
+        event_types=["support.handoff.queued"],
+        signing_secret=secret,
+    )
+    event = OutboxEvent(
+        event_type="support.handoff.queued",
+        event_version=1,
+        aggregate_type="support_handoff",
+        aggregate_id=subscription.id,
+        payload={
+            "organization_id": str(admin.organization_id),
+            "handoff_id": str(subscription.id),
+            "trigger": "CUSTOMER_REQUEST",
+            "last_customer_sequence": 0,
+        },
+        occurred_at=datetime.now(UTC),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    first = await service.schedule(event)
+    second = await service.schedule(event)
+    await db_session.commit()
+
+    assert len(first) == 1
+    assert [delivery.id for delivery in second] == [first[0].id]
+    stored = await db_session.get(WebhookSubscription, subscription.id)
+    assert stored is not None
+    assert secret.encode() not in stored.secret_ciphertext
+    assert await service.load_signing_secret(stored) == secret
+    deliveries = list(
+        (
+            await db_session.scalars(
+                select(WebhookDelivery).where(WebhookDelivery.event_id == event.event_id)
+            )
+        ).all()
+    )
+    assert len(deliveries) == 1
+    assert (
+        await db_session.scalar(
+            select(func.count(JobIntent.id)).where(JobIntent.id == deliveries[0].job_id)
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_event_version_creates_no_durable_delivery_intent(
+    db_session,
+    webhook_context,
+) -> None:  # type: ignore[no-untyped-def]
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    admin = webhook_context["principal"](webhook_context["admin"])
+    subscription = await service.create(
+        admin,
+        endpoint_url="https://hooks.example.test/unknown-version",
+        event_types=["support.handoff.queued"],
+        signing_secret="unknown-version-secret-with-at-least-32-bytes",
+    )
+    event = OutboxEvent(
+        event_type="support.handoff.queued",
+        event_version=999,
+        aggregate_type="support_handoff",
+        aggregate_id=subscription.id,
+        payload={
+            "organization_id": str(admin.organization_id),
+            "handoff_id": str(subscription.id),
+            "trigger": "CUSTOMER_REQUEST",
+            "last_customer_sequence": 1,
+        },
+        occurred_at=datetime.now(UTC),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    assert await service.schedule(event) == []
+    assert (
+        await db_session.scalar(
+            select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload_update",
+    [
+        {"organization_id": "not-a-uuid"},
+        {"trigger": "UNKNOWN_TRIGGER"},
+        {"last_customer_sequence": -1},
+        {"last_customer_sequence": True},
+        {"last_customer_sequence": None},
+    ],
+)
+async def test_malformed_published_event_creates_no_durable_delivery_or_job(
+    db_session,
+    webhook_context,
+    payload_update: dict[str, object],
+) -> None:  # type: ignore[no-untyped-def]
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    admin = webhook_context["principal"](webhook_context["admin"])
+    subscription = await service.create(
+        admin,
+        endpoint_url="https://hooks.example.test/malformed-event",
+        event_types=["support.handoff.queued"],
+        signing_secret="malformed-event-secret-with-at-least-32-bytes",
+    )
+    payload: dict[str, object] = {
+        "organization_id": str(admin.organization_id),
+        "handoff_id": str(subscription.id),
+        "trigger": "CUSTOMER_REQUEST",
+        "last_customer_sequence": 1,
+    }
+    payload.update(payload_update)
+    event = OutboxEvent(
+        event_type="support.handoff.queued",
+        event_version=1,
+        aggregate_type="support_handoff",
+        aggregate_id=subscription.id,
+        payload=payload,
+        occurred_at=datetime.now(UTC),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    assert await service.schedule(event) == []
+    assert (
+        await db_session.scalar(
+            select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)
+        )
+        == 0
+    )
+    assert (
+        await db_session.scalar(
+            select(func.count(JobIntent.id)).where(JobIntent.kind == "webhook.deliver")
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_version", "payload"),
+    [
+        (
+            999,
+            {
+                "organization_id": "00000000-0000-0000-0000-000000000002",
+                "handoff_id": "00000000-0000-0000-0000-000000000001",
+                "trigger": "CUSTOMER_REQUEST",
+                "last_customer_sequence": 1,
+            },
+        ),
+        (
+            1,
+            {
+                "organization_id": "not-a-uuid",
+                "handoff_id": "00000000-0000-0000-0000-000000000001",
+                "trigger": "CUSTOMER_REQUEST",
+                "last_customer_sequence": 1,
+            },
+        ),
+    ],
+)
+async def test_dispatcher_leaves_invalid_event_unprocessed_without_durable_delivery_intent(
+    db_session,
+    event_version: int,
+    payload: dict[str, object],
+) -> None:  # type: ignore[no-untyped-def]
+    event = OutboxEvent(
+        event_type="support.handoff.queued",
+        event_version=event_version,
+        aggregate_type="support_handoff",
+        aggregate_id=UUID("00000000-0000-0000-0000-000000000001"),
+        payload=payload,
+        occurred_at=datetime.now(UTC),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    await _dispatch_pending_webhook_events(db_session=db_session)
+
+    assert (
+        await db_session.scalar(
+            select(func.count(ProcessedEvent.event_id)).where(
+                ProcessedEvent.consumer_name == WEBHOOK_SCHEDULER_CONSUMER,
+                ProcessedEvent.event_id == event.event_id,
+            )
+        )
+        == 0
+    )
+    assert (
+        await db_session.scalar(
+            select(func.count(WebhookDelivery.id)).where(WebhookDelivery.event_id == event.event_id)
+        )
+        == 0
+    )
+    assert (
+        await db_session.scalar(
+            select(func.count(JobIntent.id)).where(JobIntent.kind == "webhook.deliver")
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_subscription_creation_rejects_hostname_resolving_to_private_address(
+    db_session,
+    webhook_context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    async def private_resolution(*_args: object) -> tuple[str, ...]:
+        return ("10.0.0.1",)
+
+    monkeypatch.setattr(
+        webhook_delivery,
+        "_resolve_endpoint_addresses",
+        private_resolution,
+        raising=False,
+    )
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    admin = webhook_context["principal"](webhook_context["admin"])
+
+    with pytest.raises(ValueError, match="public"):
+        await service.create(
+            admin,
+            endpoint_url="https://private-resolution.example.test/webhook",
+            event_types=["support.handoff.queued"],
+            signing_secret="private-resolution-secret-with-at-least-32-bytes",
+        )
+    assert (
+        await db_session.scalar(
+            select(func.count(JobIntent.id)).where(JobIntent.kind == "webhook.deliver")
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_admin_and_foreign_admin_cannot_manage_subscription(
+    db_session,
+    webhook_context,
+) -> None:  # type: ignore[no-untyped-def]
+    service = WebhookSubscriptionService(db_session, webhook_context["cipher"])
+    member = webhook_context["principal"](webhook_context["member"])
+    foreign = webhook_context["principal"](webhook_context["foreign_admin"])
+
+    with pytest.raises(LookupError):
+        await service.create(
+            member,
+            endpoint_url="https://hooks.example.test/member",
+            event_types=["support.handoff.queued"],
+            signing_secret="member-test-secret-with-at-least-32-bytes",
+        )
+
+    admin = webhook_context["principal"](webhook_context["admin"])
+    subscription = await service.create(
+        admin,
+        endpoint_url="https://hooks.example.test/admin",
+        event_types=["support.handoff.queued"],
+        signing_secret="admin-test-secret-with-at-least-32-bytes",
+    )
+    assert await service.list_authorized(foreign) == []
+    with pytest.raises(LookupError):
+        await service.disable(foreign, subscription.id, expected_version=1)
+
+
+@pytest.mark.asyncio
+async def test_admin_api_is_idempotent_and_never_returns_the_signing_secret(
+    db_session,
+    webhook_context,
+) -> None:  # type: ignore[no-untyped-def]
+    app = create_app(Settings.model_validate({"SESSION_SECRET": "webhook-test-session"}))
+    principal = webhook_context["principal"](webhook_context["admin"])
+
+    async def override_db():  # type: ignore[no-untyped-def]
+        yield db_session
+
+    async def override_principal():  # type: ignore[no-untyped-def]
+        return principal
+
+    app.state.webhook_cipher = webhook_context["cipher"]
+    app.dependency_overrides[get_db_session] = override_db
+    app.dependency_overrides[require_staff_session] = override_principal
+    app.dependency_overrides[require_staff_csrf] = override_principal
+    secret = "api-test-signing-secret-with-at-least-32-bytes"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://testserver",
+        headers={"X-CSRF-Token": "csrf"},
+    ) as client:
+        first = await client.post(
+            "/api/v1/admin/webhooks/subscriptions",
+            headers={"Idempotency-Key": "create-webhook"},
+            json={
+                "endpoint_url": "https://hooks.example.test/api",
+                "event_types": ["support.handoff.queued"],
+                "signing_secret": secret,
+            },
+        )
+        replay = await client.post(
+            "/api/v1/admin/webhooks/subscriptions",
+            headers={"Idempotency-Key": "create-webhook"},
+            json={
+                "endpoint_url": "https://hooks.example.test/api",
+                "event_types": ["support.handoff.queued"],
+                "signing_secret": secret,
+            },
+        )
+        listed = await client.get("/api/v1/admin/webhooks/subscriptions")
+
+    assert first.status_code == replay.status_code == 201
+    assert first.json() == replay.json()
+    assert listed.status_code == 200
+    assert listed.json() == [first.json()]
+    assert secret not in f"{first.text}{replay.text}{listed.text}"

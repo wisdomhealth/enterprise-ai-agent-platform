@@ -1,0 +1,97 @@
+#!/bin/sh
+""":"
+exec "$(dirname "$0")/../backend/.venv/bin/python" "$0" "$@"
+":"""
+"""Export the implemented FastAPI schema with handoff security classifications."""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "backend"))
+# Schema generation imports the application's database assembly but never opens a
+# connection.  Keep the required DSN a local placeholder rather than accepting a
+# customer or production value for a documentation export.
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://platform:placeholder@127.0.0.1:5432/platform")
+
+from app.main import create_app  # noqa: E402
+
+
+def _classification(path: str) -> tuple[str, list[dict[str, list[str]]] | None]:
+    if path.startswith("/api/v1/admin/"):
+        return "administrator", [{"StaffSession": []}]
+    if path.startswith("/api/v1/staff/"):
+        return "staff", [{"StaffSession": []}]
+    if path.startswith("/api/v1/public/"):
+        if path == "/api/v1/public/chat/sessions":
+            return "public", None
+        return "public", [{"PublicChatCredential": []}]
+    if path in {"/api/v1/auth/login", "/api/v1/auth/callback"}:
+        return "public", None
+    if path in {"/api/v1/auth/me", "/api/v1/auth/logout"}:
+        return "staff", [{"StaffSession": []}]
+    if path == "/metrics":
+        return "internal", None
+    if path.startswith("/health/"):
+        return "public", None
+    raise ValueError(f"unclassified implemented route: {path}")
+
+
+def _annotate(schema: dict[str, Any]) -> dict[str, Any]:
+    components = schema.setdefault("components", {})
+    if not isinstance(components, dict):
+        raise ValueError("OpenAPI components must be an object")
+    components["securitySchemes"] = {
+        "StaffSession": {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": "staff_session",
+            "description": "Issued after approved staff OIDC admission; state-changing routes also require CSRF.",
+        },
+        "PublicChatCredential": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "session credential",
+            "description": "Opaque credential issued for one public chat session.",
+        },
+    }
+    paths = schema.get("paths")
+    if not isinstance(paths, dict):
+        raise ValueError("OpenAPI paths must be an object")
+    for path, operations in paths.items():
+        if not isinstance(path, str) or not isinstance(operations, dict):
+            raise ValueError("OpenAPI path entry must be an object")
+        classification, security = _classification(path)
+        for method, operation in operations.items():
+            if method not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            if not isinstance(operation, dict):
+                raise ValueError(f"OpenAPI operation must be an object: {method.upper()} {path}")
+            operation["x-security-classification"] = classification
+            if security is not None:
+                operation["security"] = security
+    return schema
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default="docs/api/openapi.json")
+    args = parser.parse_args()
+    output = (ROOT / args.output).resolve()
+    try:
+        output.relative_to(ROOT)
+    except ValueError:
+        parser.error("output must be inside the repository")
+    schema = _annotate(create_app().openapi())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(schema, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
