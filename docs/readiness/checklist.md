@@ -13,3 +13,15 @@
 | 客服升级规则、在线时间、邮件分类和人工审批规则确认 | 客户客服运营负责人 | 待提供：已批准运营与人工审批规则 | 未就绪 |
 
 准备门未通过时只允许低风险设计验证，不开始承诺的 10 周交付时钟。
+
+## 发布与交接证据
+
+在本地可重复验证环境中，发布门的最新产物应记录为
+`docs/evidence/release/final-local-verification.json`，恢复演练证据位于
+`docs/evidence/recovery/local-verification.json`。这些记录不替代客户凭证、
+生产网络、Google/AI 账户或 DNS/TLS 的验收；缺少任何客户依赖时必须保持未就绪。
+
+交接负责人还必须审阅 [客户验收记录](../handoff/acceptance.md)（交接路径为
+`docs/handoff/acceptance.md`）、资产登记、凭证轮换
+与开发者生产访问移除情况。只有所有准备门、恢复证据与客户签收均完成后，才能进入
+生产 cut line。
