@@ -257,7 +257,12 @@ async def test_sse_endpoint_replays_postgres_after_sequence(db_session: AsyncSes
         )
     )
     await db_session.commit()
-    application: FastAPI = create_app(Settings(SESSION_SECRET="task-fourteen-session-secret"))
+    application: FastAPI = create_app(
+        Settings(
+            SESSION_SECRET="task-fourteen-session-secret",
+            REDIS_URL=None,
+        )
+    )
 
     async def override_db_session() -> AsyncIterator[AsyncSession]:
         yield db_session

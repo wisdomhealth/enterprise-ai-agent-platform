@@ -72,6 +72,16 @@ def test_email_e2e_accepts_only_its_explicit_local_disposable_database() -> None
     ).endswith("/platform_task20_fix")
 
 
+def test_release_gate_e2e_accepts_only_its_explicit_local_disposable_database() -> None:
+    task26_url = (
+        "postgresql+asyncpg://postgres@127.0.0.1:55436/platform_task26_fix"
+    )
+
+    assert validate_task16_e2e_environment(
+        _environment(DATABASE_URL=task26_url)
+    ).endswith("/platform_task26_fix")
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [

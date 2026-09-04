@@ -57,7 +57,7 @@ async def test_audit_service_records_safe_actor_and_scope_data(db_session, princ
 
 
 @pytest.mark.asyncio
-async def test_application_role_can_insert_but_cannot_update_or_delete_audit_events():
+async def test_application_role_can_insert_and_retention_delete_but_cannot_update_audit_events():
     connection = await asyncpg.connect(application_database_dsn())
     event_id = uuid4()
     organization_id = uuid4()
@@ -81,8 +81,10 @@ async def test_application_role_can_insert_but_cannot_update_or_delete_audit_eve
             await connection.execute(
                 "UPDATE audit_events SET outcome = 'ALLOWED' WHERE id = $1", event_id
             )
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await connection.execute("DELETE FROM audit_events WHERE id = $1", event_id)
+        # Task 22 deliberately added DELETE for the authorized retention service;
+        # UPDATE remains forbidden so existing audit records cannot be rewritten.
+        result = await connection.execute("DELETE FROM audit_events WHERE id = $1", event_id)
+        assert result == "DELETE 1"
     finally:
         await connection.close()
 

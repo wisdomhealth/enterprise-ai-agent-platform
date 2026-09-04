@@ -6,6 +6,8 @@ const databaseUrl =
 
 export default defineConfig({
   testDir: "./e2e",
+  // The browser harness intentionally mutates one durable fixture lifecycle.
+  workers: 1,
   webServer: [
     {
       command:

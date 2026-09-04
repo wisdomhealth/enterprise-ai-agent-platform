@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -116,7 +117,7 @@ async def test_atomic_script_never_partially_admits_a_multi_window_request() -> 
 
 @pytest.mark.asyncio
 async def test_live_redis_script_enforces_limit_and_returns_retry_after() -> None:
-    redis = Redis.from_url("redis://localhost:6379/0", decode_responses=True)
+    redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
     marker = uuid4().hex
     ip_address = f"task13-{marker}"
     organization_id = f"org-{marker}"

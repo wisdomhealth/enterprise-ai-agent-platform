@@ -140,7 +140,12 @@ async def _case(
 async def _client(
     db_session: AsyncSession, principal: Principal
 ) -> AsyncIterator[httpx.AsyncClient]:
-    app: FastAPI = create_app(Settings(SESSION_SECRET="staff-detail-secret"))
+    app: FastAPI = create_app(
+        Settings(
+            SESSION_SECRET="staff-detail-secret",
+            REDIS_URL=None,
+        )
+    )
 
     async def override_db() -> AsyncIterator[AsyncSession]:
         yield db_session

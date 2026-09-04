@@ -6,6 +6,8 @@ RUN npm ci
 
 FROM deps AS test
 COPY app ./app
+COPY components ./components
+COPY lib ./lib
 COPY tests ./tests
 COPY *.config.* next-env.d.ts test-setup.ts tsconfig.json ./
 CMD ["npm", "test", "--", "--run"]

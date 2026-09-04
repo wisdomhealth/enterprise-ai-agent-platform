@@ -38,6 +38,7 @@ def validate_task16_e2e_environment(environ: Mapping[str, str]) -> str:
     disposable_name = database_name.startswith(("test_", "task16_")) or database_name in {
         "platform_task15_fix",
         "platform_task20_fix",
+        "platform_task26_fix",
     }
     if not disposable_name or "/" in database_name or parsed.query or parsed.fragment:
         raise RuntimeError("Task 16 test harness requires a disposable database name")

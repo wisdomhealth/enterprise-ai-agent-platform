@@ -30,7 +30,12 @@ class AlwaysAdmitRedis:
 
 @pytest.fixture
 def app(db_session: AsyncSession) -> FastAPI:
-    application = create_app(Settings(SESSION_SECRET="task-thirteen-test-session-secret"))
+    application = create_app(
+        Settings(
+            SESSION_SECRET="task-thirteen-test-session-secret",
+            REDIS_URL=None,
+        )
+    )
 
     async def override_db_session() -> AsyncIterator[AsyncSession]:
         yield db_session

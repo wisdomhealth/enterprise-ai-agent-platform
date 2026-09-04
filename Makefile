@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck test-integration test-e2e check-prometheus check-operability
+.PHONY: install test test-backend test-frontend lint lint-backend lint-frontend typecheck typecheck-backend typecheck-frontend test-integration test-e2e check-prometheus check-operability verify-release-gates benchmark-baseline
 
 PYTHON ?= $(shell \
 	for candidate in python3.13 python3.12 python3; do \
@@ -23,21 +23,40 @@ install:
 	cd frontend && npm install
 
 test:
-	cd backend && "$(BACKEND_PYTHON)" -m pytest tests/unit -q
+	$(MAKE) test-backend
+	$(MAKE) test-frontend
+
+test-backend:
+	cd backend && "$(BACKEND_PYTHON)" -m pytest --import-mode=importlib tests/unit -q
+
+test-frontend:
 	cd frontend && npm test -- --run
 
 lint:
+	$(MAKE) lint-backend
+	$(MAKE) lint-frontend
+
+lint-backend:
 	cd backend && "$(BACKEND_PYTHON)" -m ruff check app tests
+
+lint-frontend:
 	cd frontend && npm run lint
 
 typecheck:
+	$(MAKE) typecheck-backend
+	$(MAKE) typecheck-frontend
+
+typecheck-backend:
 	cd backend && "$(BACKEND_PYTHON)" -m mypy app
+
+typecheck-frontend:
 	cd frontend && npm run typecheck
 
 test-integration:
-	cd backend && "$(BACKEND_PYTHON)" -m pytest tests/integration -q
+	cd backend && "$(BACKEND_PYTHON)" -m pytest --import-mode=importlib tests/integration -q
 
 test-e2e:
+	cd backend && "$(BACKEND_PYTHON)" -m pytest --import-mode=importlib tests/e2e -q
 	cd frontend && npm run test:e2e
 
 check-prometheus:
@@ -48,3 +67,9 @@ check-prometheus:
 
 check-operability:
 	scripts/check-operability --compose-file compose.yaml
+
+verify-release-gates:
+	scripts/verify-release-gates --compose-file compose.test.yaml --evidence docs/evidence/release/local-verification.json
+
+benchmark-baseline:
+	scripts/benchmark-baseline --compose-file compose.test.yaml --documents 10000 --staff 25 --daily-emails 1000 --evidence docs/evidence/release/capacity-baseline.json

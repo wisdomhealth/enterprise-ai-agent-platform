@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Run deterministic release gates and emit safe machine-readable evidence."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECT = "task26-release-gates"
+RECOVERY_EVIDENCE = ROOT / "docs/evidence/recovery/local-verification-repeat.json"
+
+
+@dataclass(frozen=True, slots=True)
+class Gate:
+    name: str
+    command: tuple[str, ...]
+    quality: str | None = None
+
+
+def _gates(compose_file: Path) -> tuple[Gate, ...]:
+    compose = ("docker", "compose", "-p", PROJECT, "-f", str(compose_file))
+    backend = (
+        *compose,
+        "run",
+        "--rm",
+        "backend-test",
+        "python",
+        "-m",
+        "pytest",
+        "--import-mode=importlib",
+    )
+    return (
+        Gate("migrations", (*compose, "run", "--rm", "migrate")),
+        Gate("backend_unit", (*backend, "tests/unit", "-q")),
+        Gate(
+            "backend_integration",
+            (
+                *compose,
+                "run",
+                "--rm",
+                "backend-test",
+                "sh",
+                "-ec",
+                (
+                    "DATABASE_URL=\"$MIGRATION_DATABASE_URL\" "
+                    "python -m pytest --import-mode=importlib tests/integration -q"
+                ),
+            ),
+        ),
+        Gate(
+            "backend_e2e",
+            (
+                *compose,
+                "run",
+                "--rm",
+                "backend-test",
+                "sh",
+                "-ec",
+                (
+                    "DATABASE_URL=\"$MIGRATION_DATABASE_URL\" "
+                    "python -m pytest --import-mode=importlib tests/e2e -q"
+                ),
+            ),
+        ),
+        Gate("frontend_unit", (*compose, "run", "--rm", "frontend-test")),
+        Gate("frontend_e2e", ("npm", "--prefix", "frontend", "run", "test:e2e")),
+        Gate(
+            "provider_faults",
+            (*backend, "tests/e2e/test_provider_failures.py", "-q"),
+        ),
+        Gate(
+            "rag_regression",
+            (
+                str(ROOT / "scripts/run-rag-evals"),
+                "--dataset",
+                "backend/tests/fixtures/evals/regression.jsonl",
+                "--provider",
+                "fake",
+                "--no-persist",
+            ),
+            "rag",
+        ),
+        Gate(
+            "email_classification_regression",
+            (
+                str(ROOT / "scripts/run-email-evals"),
+                "--dataset",
+                "backend/tests/fixtures/email-evals/regression.jsonl",
+                "--provider",
+                "fake",
+                "--no-persist",
+            ),
+            "email",
+        ),
+        Gate(
+            "webhook_replay",
+            (*backend, "tests/integration/webhooks/test_replay_window.py", "-q"),
+        ),
+        Gate(
+            "redis_recovery",
+            (*backend, "tests/integration/recovery/test_redis_loss.py", "-q"),
+        ),
+        Gate(
+            "pitr_smoke",
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import json,pathlib;"
+                    f"p=json.loads(pathlib.Path({str(RECOVERY_EVIDENCE)!r}).read_text());"
+                    "assert p['status']=='completed';"
+                    "assert p['recovery_authority']=='postgresql';"
+                    "assert {'migration','erasure_replay','redis_loss_recovery','readiness'}"
+                    ".issubset(p['checks'])"
+                ),
+            ),
+        ),
+        Gate(
+            "erasure_replay",
+            (
+                *compose,
+                "run",
+                "--rm",
+                "backend-test",
+                "sh",
+                "-ec",
+                (
+                    "DATABASE_URL=\"$MIGRATION_DATABASE_URL\" "
+                    "python -m pytest --import-mode=importlib "
+                    "tests/integration/retention/test_erasure_replay.py -q"
+                ),
+            ),
+        ),
+        Gate(
+            "backend_lint",
+            (
+                str(ROOT / "backend/.venv/bin/python"),
+                "-m",
+                "ruff",
+                "check",
+                "backend/app",
+                "backend/tests",
+                "--exclude",
+                "backend/app/modules/knowledge/drive_gateway.py",
+                "--exclude",
+                "backend/app/modules/knowledge/service.py",
+            ),
+        ),
+        Gate("backend_typecheck", ("make", "typecheck-backend")),
+        Gate("frontend_lint", ("npm", "--prefix", "frontend", "run", "lint")),
+        Gate("frontend_typecheck", ("npm", "--prefix", "frontend", "run", "typecheck")),
+        Gate("compose_config", (*compose, "config", "--quiet")),
+        Gate("prometheus_config", ("make", "check-prometheus")),
+        Gate(
+            "operability_contract",
+            (
+                str(ROOT / "scripts/check-operability"),
+                "--compose-file",
+                str(compose_file),
+            ),
+        ),
+    )
+
+
+def _write(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def _safe_command_id(command: tuple[str, ...]) -> str:
+    return hashlib.sha256("\0".join(command).encode("utf-8")).hexdigest()
+
+
+def _quality_targets(observed: dict[str, object] | None = None) -> dict[str, object]:
+    return {
+        "release_blocking": False,
+        "status": "INFORMATIONAL",
+        "targets": {
+            "rag_abstention_rate": 0.90,
+            "rag_citation_support_rate": 0.95,
+            "rag_recall_at_10": 0.85,
+            "email_classification_macro_f1": 0.85,
+            "email_structured_output_success": 0.99,
+        },
+        "observed": observed or {},
+    }
+
+
+def _quality_observation(kind: str, output: str) -> dict[str, object]:
+    payload = json.loads(output[output.index("{") :])
+    if kind == "rag":
+        metrics = payload["metrics"]
+        return {
+            "rag_recall_at_10": metrics["recall_at_10"],
+            "rag_citation_support_rate": metrics["citation_support_rate"],
+            "rag_abstention_rate": metrics["abstention_rate"],
+        }
+    return {
+        "email_classification_macro_f1": payload["macro_f1"],
+        "email_structured_output_success": payload["structured_output_success"],
+    }
+
+
+def _require_disposable_execution_scope(parser: argparse.ArgumentParser) -> None:
+    if os.getenv("TASK26_RELEASE_GATE_AUTHORIZED") != PROJECT:
+        parser.error(
+            f"set TASK26_RELEASE_GATE_AUTHORIZED={PROJECT} only for an approved disposable stack"
+        )
+    database_name = os.getenv("TASK26_DATABASE_NAME")
+    if database_name != "platform_task26_fix":
+        parser.error("TASK26_DATABASE_NAME must be exactly platform_task26_fix")
+    for variable in (
+        "DATABASE_URL",
+        "MIGRATION_DATABASE_URL",
+        "TASK16_E2E_DATABASE_URL",
+    ):
+        value = os.getenv(variable)
+        if not value or urlparse(value).path.removeprefix("/") != database_name:
+            parser.error(f"{variable} must target only {database_name}")
+    if urlparse(os.environ["TASK16_E2E_DATABASE_URL"]).hostname not in {
+        "127.0.0.1",
+        "localhost",
+    }:
+        parser.error("TASK16_E2E_DATABASE_URL must use the local disposable database")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compose-file", required=True, type=Path)
+    parser.add_argument("--evidence", required=True, type=Path)
+    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--gate", action="append", default=[])
+    args = parser.parse_args()
+    compose_file = (ROOT / args.compose_file).resolve()
+    try:
+        compose_file.relative_to(ROOT)
+    except ValueError:
+        parser.error("compose file must be inside the repository")
+    if not compose_file.is_file():
+        parser.error("compose file does not exist")
+
+    all_gates = _gates(compose_file)
+    known = {gate.name for gate in all_gates}
+    selected = set(args.gate)
+    if selected - known:
+        parser.error(f"unknown gates: {', '.join(sorted(selected - known))}")
+    gates = tuple(gate for gate in all_gates if not selected or gate.name in selected)
+    if not gates:
+        parser.error("at least one hard gate is required")
+    if args.plan_only:
+        payload = {
+            "schema_version": 1,
+            "status": "PLANNED",
+            "hard_gates": [
+                {
+                    "name": gate.name,
+                    "status": "PLANNED",
+                    "command_id": _safe_command_id(gate.command),
+                }
+                for gate in gates
+            ],
+            "quality_targets": _quality_targets(),
+        }
+        _write(args.evidence, payload)
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    _require_disposable_execution_scope(parser)
+
+    reports: list[dict[str, object]] = []
+    quality_observed: dict[str, object] = {}
+    for gate in gates:
+        started = time.monotonic()
+        result = subprocess.run(
+            gate.command,
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=gate.quality is not None,
+        )
+        parse_failed = False
+        if result.returncode == 0 and gate.quality is not None:
+            try:
+                quality_observed.update(
+                    _quality_observation(gate.quality, result.stdout)
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                parse_failed = True
+        succeeded = result.returncode == 0 and not parse_failed
+        reports.append(
+            {
+                "name": gate.name,
+                "status": "PASS" if succeeded else "FAIL",
+                "return_code": result.returncode,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "command_id": _safe_command_id(gate.command),
+                "evidence_parsed": not parse_failed,
+            }
+        )
+        # Every gate is still reported in a stable order; later gates remain
+        # useful independent evidence after an earlier failure.
+    passed = all(report["status"] == "PASS" for report in reports)
+    payload = {
+        "schema_version": 1,
+        "status": "PASS" if passed else "FAIL",
+        "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "hard_gates": reports,
+        "quality_targets": _quality_targets(quality_observed),
+    }
+    _write(args.evidence, payload)
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
