@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
+import runpy
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -63,3 +66,30 @@ def test_all_operator_visible_error_codes_are_documented() -> None:
     documented = documented_error_codes(ROOT / "docs/operations/incident-response.md")
 
     assert OPERATOR_VISIBLE_ERROR_CODES <= documented
+
+
+CHECK_DOCUMENTATION: dict[str, Any] = runpy.run_path(str(ROOT / "scripts/check-documentation"))
+
+
+def test_documentation_check_rejects_missing_current_openapi_route() -> None:
+    """The checked-in artifact cannot silently omit a route from create_app()."""
+    current_schema = json.loads((ROOT / "docs/api/openapi.json").read_text(encoding="utf-8"))
+    checked_schema = json.loads(json.dumps(current_schema))
+    del checked_schema["paths"]["/api/v1/admin/users/{user_id}"]
+    failures: list[str] = []
+
+    CHECK_DOCUMENTATION["_check_openapi_artifact"](checked_schema, current_schema, failures)
+
+    assert "OpenAPI artifact drift: run scripts/export-openapi" in failures
+
+
+def test_documentation_check_requires_settings_alias_ownership() -> None:
+    """Ownership coverage follows Settings aliases, including non-example values."""
+    path = ROOT / "docs/deployment/credential-ownership.md"
+    rows = CHECK_DOCUMENTATION["_environment_rows"](path.read_text(encoding="utf-8"))
+    del rows["ANTHROPIC_BASE_URL"]
+    failures: list[str] = []
+
+    CHECK_DOCUMENTATION["_check_environment_rows"](rows, failures)
+
+    assert any("ANTHROPIC_BASE_URL" in failure for failure in failures)

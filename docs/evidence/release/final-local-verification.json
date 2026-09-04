@@ -1,9 +1,9 @@
 {
-  "completed_at": "2026-09-04T15:48:32.037151Z",
+  "completed_at": "2026-09-04T16:11:09.397346Z",
   "hard_gates": [
     {
       "command_id": "e83ebcb0c70fe563fd2333c79b9559e753755dc87ef7acca412a8ffa6091c9dd",
-      "duration_seconds": 3.958,
+      "duration_seconds": 4.628,
       "evidence_parsed": true,
       "name": "migrations",
       "return_code": 0,
@@ -11,7 +11,7 @@
     },
     {
       "command_id": "5c1b4113f3a6c6e550d000f836496427c14ee4761d1e48d8c22d80b4f4057e58",
-      "duration_seconds": 12.253,
+      "duration_seconds": 23.193,
       "evidence_parsed": true,
       "name": "backend_unit",
       "return_code": 0,
@@ -19,7 +19,7 @@
     },
     {
       "command_id": "487233fd9033ad52eacacb16e28862c0ac52cbb55dc3b905454d437d693f855f",
-      "duration_seconds": 132.687,
+      "duration_seconds": 138.16,
       "evidence_parsed": true,
       "name": "backend_integration",
       "return_code": 0,
@@ -27,7 +27,7 @@
     },
     {
       "command_id": "fef3150c8faa3a7b4d58af3e04d93523d86d7f87eb2acf0c5d3cce6d4ee3be9b",
-      "duration_seconds": 11.037,
+      "duration_seconds": 10.947,
       "evidence_parsed": true,
       "name": "backend_e2e",
       "return_code": 0,
@@ -35,7 +35,7 @@
     },
     {
       "command_id": "30c3460c6ba18e2747f7b2880ad572c01a7168538967952541a74b4467cfcb6a",
-      "duration_seconds": 9.216,
+      "duration_seconds": 7.398,
       "evidence_parsed": true,
       "name": "frontend_unit",
       "return_code": 0,
@@ -43,7 +43,7 @@
     },
     {
       "command_id": "3b6515815a2c18a1acac19612f942267e748b043f28153ed2c15e6ac4aa1df1e",
-      "duration_seconds": 36.748,
+      "duration_seconds": 36.835,
       "evidence_parsed": true,
       "name": "frontend_e2e",
       "return_code": 0,
@@ -51,7 +51,7 @@
     },
     {
       "command_id": "8fbd7156cee70d1ca857968d7120d8ecc2207b38559fd66ac0464ed54e826777",
-      "duration_seconds": 6.573,
+      "duration_seconds": 6.069,
       "evidence_parsed": true,
       "name": "provider_faults",
       "return_code": 0,
@@ -59,7 +59,7 @@
     },
     {
       "command_id": "31e74d8ba65d11cb8a4a4b6957b4662052be83a93c8045d151a0bf37e051a2e1",
-      "duration_seconds": 2.983,
+      "duration_seconds": 2.804,
       "evidence_parsed": true,
       "name": "rag_regression",
       "return_code": 0,
@@ -67,7 +67,7 @@
     },
     {
       "command_id": "c352599bfee387f13dd95fb5a0af3211d3cd0c1b1f4fd6bb0282a7c12d8f4657",
-      "duration_seconds": 1.956,
+      "duration_seconds": 2.681,
       "evidence_parsed": true,
       "name": "email_classification_regression",
       "return_code": 0,
@@ -75,7 +75,7 @@
     },
     {
       "command_id": "52efef382cf49e09c6467af30f15e0845183ecdfd630a53766bf210683c89923",
-      "duration_seconds": 6.307,
+      "duration_seconds": 5.56,
       "evidence_parsed": true,
       "name": "webhook_replay",
       "return_code": 0,
@@ -83,7 +83,7 @@
     },
     {
       "command_id": "1e2202a2bf40df796c4ede6eb518710b93d0fb4a3592cd007a18e5846aafe7ff",
-      "duration_seconds": 4.751,
+      "duration_seconds": 5.721,
       "evidence_parsed": true,
       "name": "redis_recovery",
       "return_code": 0,
@@ -91,7 +91,7 @@
     },
     {
       "command_id": "32619d719eed5a1ba3a2e4560b3e1f931bd5ff3053033e321d37f1f5bd36ffc5",
-      "duration_seconds": 0.098,
+      "duration_seconds": 0.09,
       "evidence_parsed": true,
       "name": "pitr_smoke",
       "return_code": 0,
@@ -99,7 +99,7 @@
     },
     {
       "command_id": "960b79bd62559e5f65e1a5d226bff840df74547aa9f2db822e84a604dbc998ae",
-      "duration_seconds": 8.738,
+      "duration_seconds": 8.989,
       "evidence_parsed": true,
       "name": "erasure_replay",
       "return_code": 0,
@@ -107,7 +107,7 @@
     },
     {
       "command_id": "faad58a4e41d5566a061702056fb08a1b5e4489c40beb25d1ebf5b59152c713c",
-      "duration_seconds": 0.143,
+      "duration_seconds": 0.164,
       "evidence_parsed": true,
       "name": "backend_lint",
       "return_code": 0,
@@ -115,7 +115,7 @@
     },
     {
       "command_id": "9ce0cdfbb27187f8e70ff49cc24a56fc4f71eb910ff45adb8994fdcf5ba86044",
-      "duration_seconds": 1.962,
+      "duration_seconds": 2.027,
       "evidence_parsed": true,
       "name": "backend_typecheck",
       "return_code": 0,
@@ -123,7 +123,7 @@
     },
     {
       "command_id": "4f2871e997a45ea51c53716cbad352d67644b8ac2081863a438598733a138b5f",
-      "duration_seconds": 4.384,
+      "duration_seconds": 4.469,
       "evidence_parsed": true,
       "name": "frontend_lint",
       "return_code": 0,
@@ -131,7 +131,7 @@
     },
     {
       "command_id": "661c9119581d3c3e967640ed5f0740ea695e97de308cfcec824edc1e49fd491a",
-      "duration_seconds": 2.37,
+      "duration_seconds": 2.225,
       "evidence_parsed": true,
       "name": "frontend_typecheck",
       "return_code": 0,
@@ -139,7 +139,7 @@
     },
     {
       "command_id": "531167d11d5ff1a88abd5d59b52ef1bea38ed473ab99059517335cbe929ab767",
-      "duration_seconds": 0.163,
+      "duration_seconds": 0.137,
       "evidence_parsed": true,
       "name": "compose_config",
       "return_code": 0,
@@ -147,7 +147,7 @@
     },
     {
       "command_id": "c99b0306a68b7f8236074f8e8245fec05f03430a27a3ce920b397e85f0e3aafb",
-      "duration_seconds": 1.106,
+      "duration_seconds": 0.789,
       "evidence_parsed": true,
       "name": "prometheus_config",
       "return_code": 0,
@@ -155,7 +155,7 @@
     },
     {
       "command_id": "c4211813be30f724306c9eaf810d55e43eab1ee8bfa837551df8374945b0c608",
-      "duration_seconds": 0.177,
+      "duration_seconds": 0.217,
       "evidence_parsed": true,
       "name": "operability_contract",
       "return_code": 0,

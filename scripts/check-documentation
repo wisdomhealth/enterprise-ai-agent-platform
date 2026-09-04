@@ -1,16 +1,20 @@
-#!/usr/bin/env python3
+#!/bin/sh
+""":"
+exec "$(dirname "$0")/../backend/.venv/bin/python" "$0" "$@"
+":"""
 """Fail closed when the production handoff package drifts from the application."""
 
-from __future__ import annotations
-
 import json
+import os
 import re
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "backend"))
 
 REQUIRED_DOCUMENTS = (
     "README.md",
@@ -68,12 +72,19 @@ def _read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
-def _environment_names() -> set[str]:
-    return {
-        line.partition("=")[0]
-        for line in _read(".env.example").splitlines()
-        if line and not line.startswith("#") and "=" in line
-    }
+def _settings_environment_names() -> set[str]:
+    """Read the configured Settings aliases, never a sample deployment file."""
+    from app.core.config import Settings
+
+    aliases: set[str] = set()
+    for field in Settings.model_fields.values():
+        validation_alias = field.validation_alias
+        if isinstance(validation_alias, str):
+            aliases.add(validation_alias)
+            continue
+        choices = getattr(validation_alias, "choices", ())
+        aliases.update(choice for choice in choices if isinstance(choice, str))
+    return aliases
 
 
 def _check_documents(failures: list[str]) -> None:
@@ -82,18 +93,41 @@ def _check_documents(failures: list[str]) -> None:
         failures.append(f"missing documents: {', '.join(missing)}")
 
 
-def _check_openapi(failures: list[str]) -> None:
-    path = ROOT / "docs/api/openapi.json"
-    if not path.is_file():
-        return
+def _load_current_openapi(failures: list[str]) -> dict[str, Any] | None:
+    """Generate the schema from create_app() through the canonical exporter."""
+    api_directory = ROOT / "docs/api"
+    descriptor, generated_path = tempfile.mkstemp(
+        prefix=".check-documentation-",
+        suffix=".json",
+        dir=api_directory,
+    )
+    os.close(descriptor)
+    output = Path(generated_path)
     try:
-        schema = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        failures.append(f"invalid OpenAPI JSON: {error.msg}")
-        return
+        result = subprocess.run(
+            [str(ROOT / "scripts/export-openapi"), "--output", str(output)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            failures.append(f"current OpenAPI export failed: {detail or 'unknown error'}")
+            return None
+        schema = json.loads(output.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        failures.append(f"current OpenAPI export failed: {error}")
+        return None
+    finally:
+        output.unlink(missing_ok=True)
     if not isinstance(schema, dict):
-        failures.append("invalid OpenAPI root")
-        return
+        failures.append("current OpenAPI root invalid")
+        return None
+    return schema
+
+
+def _check_openapi_schema(schema: dict[str, Any], failures: list[str]) -> None:
     paths = schema.get("paths")
     components = schema.get("components")
     security_schemes = components.get("securitySchemes") if isinstance(components, dict) else None
@@ -133,6 +167,33 @@ def _check_openapi(failures: list[str]) -> None:
                 failures.append(f"OpenAPI security classification missing: {method.upper()} {route}")
 
 
+def _check_openapi_artifact(
+    schema: dict[str, Any], current_schema: dict[str, Any] | None, failures: list[str]
+) -> None:
+    _check_openapi_schema(schema, failures)
+    if current_schema is None:
+        return
+    _check_openapi_schema(current_schema, failures)
+    if schema != current_schema:
+        failures.append("OpenAPI artifact drift: run scripts/export-openapi")
+
+
+def _check_openapi(failures: list[str]) -> None:
+    current_schema = _load_current_openapi(failures)
+    path = ROOT / "docs/api/openapi.json"
+    if not path.is_file():
+        return
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        failures.append(f"invalid OpenAPI JSON: {error.msg}")
+        return
+    if not isinstance(schema, dict):
+        failures.append("invalid OpenAPI root")
+        return
+    _check_openapi_artifact(schema, current_schema, failures)
+
+
 def _check_state_machines(failures: list[str]) -> None:
     path = ROOT / "docs/architecture/state-machines.md"
     if not path.is_file():
@@ -146,24 +207,31 @@ def _check_state_machines(failures: list[str]) -> None:
         failures.append(f"email states missing: {', '.join(missing_email)}")
 
 
-def _check_environment_registry(failures: list[str]) -> None:
-    path = ROOT / "docs/deployment/credential-ownership.md"
-    if not path.is_file():
-        return
-    rows = {
+def _environment_rows(document: str) -> dict[str, tuple[str, str]]:
+    return {
         match.group("name"): (match.group("owner").strip(), match.group("description").strip())
         for match in re.finditer(
             r"^\|\s*`(?P<name>[A-Z][A-Z0-9_]+)`\s*\|\s*(?P<owner>[^|]*)\|\s*(?P<description>[^|]*)\|\s*$",
-            path.read_text(encoding="utf-8"),
+            document,
             flags=re.MULTILINE,
         )
     }
-    missing = sorted(name for name in _environment_names() if name not in rows)
+
+
+def _check_environment_rows(rows: dict[str, tuple[str, str]], failures: list[str]) -> None:
+    missing = sorted(name for name in _settings_environment_names() if name not in rows)
     incomplete = sorted(name for name, fields in rows.items() if not all(fields))
     if missing:
         failures.append(f"environment ownership missing: {', '.join(missing)}")
     if incomplete:
         failures.append(f"environment ownership incomplete: {', '.join(incomplete)}")
+
+
+def _check_environment_registry(failures: list[str]) -> None:
+    path = ROOT / "docs/deployment/credential-ownership.md"
+    if not path.is_file():
+        return
+    _check_environment_rows(_environment_rows(path.read_text(encoding="utf-8")), failures)
 
 
 def _operability_runbooks(failures: list[str]) -> set[str]:
