@@ -18,6 +18,21 @@ from app.modules.rag.types import AnswerAudience, RetrievedChunk
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def _release_environment(**overrides: str) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TASK26_RELEASE_GATE_AUTHORIZED": "task26-release-gates",
+            "TASK26_DATABASE_NAME": "platform_task26_fix",
+            "DATABASE_URL": "postgresql+asyncpg://platform_app@127.0.0.1:55436/platform_task26_fix",
+            "MIGRATION_DATABASE_URL": "postgresql+asyncpg://postgres@127.0.0.1:55436/platform_task26_fix",
+            "TASK16_E2E_DATABASE_URL": "postgresql+asyncpg://postgres@127.0.0.1:55436/platform_task26_fix",
+        }
+    )
+    environment.update(overrides)
+    return environment
+
+
 class FixedRetriever:
     def __init__(self, chunk: RetrievedChunk) -> None:
         self._chunk = chunk
@@ -113,6 +128,7 @@ def test_release_gate_plan_separates_hard_gates_from_quality_targets(tmp_path: P
             "--plan-only",
         ],
         cwd=ROOT,
+        env=_release_environment(),
         text=True,
         capture_output=True,
         check=False,
@@ -160,6 +176,24 @@ def test_durable_fixture_gates_use_the_migration_principal() -> None:
         assert "MIGRATION_DATABASE_URL" in command
 
 
+def test_compose_gate_uses_only_the_internal_disposable_database_endpoint() -> None:
+    verifier = runpy.run_path(str(ROOT / "scripts" / "verify-release-gates"))
+    migrations = next(
+        gate
+        for gate in verifier["_gates"](ROOT / "compose.test.yaml")
+        if gate.name == "migrations"
+    )
+
+    environment = verifier["_command_environment"](migrations.command, _release_environment())
+
+    assert environment["DATABASE_URL"] == (
+        "postgresql+asyncpg://platform_app@postgres:5432/platform_task26_fix"
+    )
+    assert environment["MIGRATION_DATABASE_URL"] == (
+        "postgresql+asyncpg://postgres@postgres:5432/platform_task26_fix"
+    )
+
+
 def test_benchmark_records_baseline_without_asserting_an_sla(tmp_path: Path) -> None:
     evidence = tmp_path / "capacity.json"
     result = subprocess.run(
@@ -199,17 +233,10 @@ def test_benchmark_records_baseline_without_asserting_an_sla(tmp_path: Path) -> 
 
 def test_release_gate_execution_rejects_an_unscoped_database(tmp_path: Path) -> None:
     evidence = tmp_path / "unsafe.json"
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "TASK26_RELEASE_GATE_AUTHORIZED": "task26-release-gates",
-            "TASK26_DATABASE_NAME": "platform_task26_fix",
-            "DATABASE_URL": "postgresql+asyncpg://platform_app@postgres/shared_database",
-            "MIGRATION_DATABASE_URL": "postgresql+asyncpg://postgres@postgres/shared_database",
-            "TASK16_E2E_DATABASE_URL": (
-                "postgresql+asyncpg://postgres@127.0.0.1:55436/shared_database"
-            ),
-        }
+    environment = _release_environment(
+        DATABASE_URL="postgresql+asyncpg://platform_app@127.0.0.1:55436/shared_database",
+        MIGRATION_DATABASE_URL="postgresql+asyncpg://postgres@127.0.0.1:55436/shared_database",
+        TASK16_E2E_DATABASE_URL="postgresql+asyncpg://postgres@127.0.0.1:55436/shared_database",
     )
     result = subprocess.run(
         [
@@ -229,4 +256,39 @@ def test_release_gate_execution_rejects_an_unscoped_database(tmp_path: Path) -> 
     )
     assert result.returncode != 0
     assert "platform_task26_fix" in result.stderr
+    assert not evidence.exists()
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("DATABASE_URL", "postgresql://platform_app@127.0.0.1:55436/platform_task26_fix"),
+        ("MIGRATION_DATABASE_URL", "postgresql+asyncpg://postgres@localhost:55436/platform_task26_fix"),
+        ("TASK16_E2E_DATABASE_URL", "postgresql+asyncpg://postgres@127.0.0.1:55435/platform_task26_fix"),
+        ("DATABASE_URL", "postgresql+asyncpg://platform_app@example.test:55436/platform_task26_fix"),
+        ("DATABASE_URL", "postgresql+asyncpg://platform_app@127.0.0.1:55436/platform_task26_fix?ssl=1"),
+    ],
+)
+def test_release_gate_rejects_non_exact_local_database_urls_before_evidence_write(
+    tmp_path: Path, variable: str, value: str
+) -> None:
+    evidence = tmp_path / "unsafe.json"
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts/verify-release-gates"),
+            "--compose-file",
+            "compose.test.yaml",
+            "--evidence",
+            str(evidence),
+            "--plan-only",
+        ],
+        cwd=ROOT,
+        env=_release_environment(**{variable: value}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert variable in result.stderr
     assert not evidence.exists()

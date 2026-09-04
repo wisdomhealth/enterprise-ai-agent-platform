@@ -149,9 +149,29 @@ class PostgresSSEService:
         try:
             await pubsub.subscribe(_channel(session_id))
             while True:
-                hint = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15)
+                try:
+                    # Bound the notification wait independently from the
+                    # Redis client implementation.  A stalled pubsub socket
+                    # must not suppress the PostgreSQL recovery poll below.
+                    hint = await asyncio.wait_for(
+                        pubsub.get_message(ignore_subscribe_messages=True, timeout=5),
+                        timeout=5,
+                    )
+                except TimeoutError:
+                    hint = None
                 if hint is None:
-                    yield ": keepalive\n\n"
+                    # Redis is a latency hint, never the recovery authority.
+                    # A publisher can commit before this subscriber is ready,
+                    # or a transient Redis loss can discard the hint.  Poll
+                    # the durable cursor before sending a keepalive so an
+                    # already-committed answer still reaches this open stream.
+                    events = await self.events_after(session_id, after_cursor=highest)
+                    if not events:
+                        yield ": keepalive\n\n"
+                        continue
+                    for event in events:
+                        highest = event.cursor
+                        yield _encode(event)
                     continue
                 for event in await self.events_after(session_id, after_cursor=highest):
                     highest = event.cursor

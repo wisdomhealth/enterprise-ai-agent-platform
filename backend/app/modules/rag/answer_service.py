@@ -92,6 +92,11 @@ class GroundedAnswerService:
         provider = AnthropicGenerationProvider(
             settings.anthropic_api_key.get_secret_value(),
             model=settings.anthropic_model,
+            base_url=(
+                settings.anthropic_base_url.unicode_string()
+                if settings.anthropic_base_url is not None
+                else None
+            ),
         )
         circuit_breaker = ProviderCircuitBreaker(
             RedisCircuitStore(

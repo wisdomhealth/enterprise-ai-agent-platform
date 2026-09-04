@@ -223,19 +223,53 @@ def _require_disposable_execution_scope(parser: argparse.ArgumentParser) -> None
     database_name = os.getenv("TASK26_DATABASE_NAME")
     if database_name != "platform_task26_fix":
         parser.error("TASK26_DATABASE_NAME must be exactly platform_task26_fix")
-    for variable in (
-        "DATABASE_URL",
-        "MIGRATION_DATABASE_URL",
-        "TASK16_E2E_DATABASE_URL",
-    ):
+    expected_users = {
+        "DATABASE_URL": "platform_app",
+        "MIGRATION_DATABASE_URL": "postgres",
+        "TASK16_E2E_DATABASE_URL": "postgres",
+    }
+    for variable, expected_user in expected_users.items():
         value = os.getenv(variable)
-        if not value or urlparse(value).path.removeprefix("/") != database_name:
-            parser.error(f"{variable} must target only {database_name}")
-    if urlparse(os.environ["TASK16_E2E_DATABASE_URL"]).hostname not in {
-        "127.0.0.1",
-        "localhost",
-    }:
-        parser.error("TASK16_E2E_DATABASE_URL must use the local disposable database")
+        parsed = urlparse(value or "")
+        if (
+            parsed.scheme != "postgresql+asyncpg"
+            or parsed.hostname != "127.0.0.1"
+            or parsed.port != 55436
+            or parsed.username != expected_user
+            or parsed.password is not None
+            or parsed.path != f"/{database_name}"
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            parser.error(
+                f"{variable} must be postgresql+asyncpg://{expected_user}"
+                f"@127.0.0.1:55436/{database_name} without URL extras"
+            )
+
+
+def _command_environment(
+    command: tuple[str, ...], environment: dict[str, str]
+) -> dict[str, str]:
+    """Keep host-only validation URLs out of the disposable Compose network.
+
+    The release process is authorized only after validating the three host
+    loopback URLs above.  Containers cannot use a host loopback address to
+    reach the Compose PostgreSQL service, so Compose commands get exact
+    service-DNS URLs for the same validated disposable database.  Host-run
+    browser and CLI gates retain the validated host URLs.
+    """
+    if command[:2] != ("docker", "compose"):
+        return environment
+    database_name = environment["TASK26_DATABASE_NAME"]
+    scoped = environment.copy()
+    scoped.update(
+        {
+            "DATABASE_URL": f"postgresql+asyncpg://platform_app@postgres:5432/{database_name}",
+            "MIGRATION_DATABASE_URL": f"postgresql+asyncpg://postgres@postgres:5432/{database_name}",
+        }
+    )
+    return scoped
 
 
 def main() -> int:
@@ -261,6 +295,7 @@ def main() -> int:
     gates = tuple(gate for gate in all_gates if not selected or gate.name in selected)
     if not gates:
         parser.error("at least one hard gate is required")
+    _require_disposable_execution_scope(parser)
     if args.plan_only:
         payload = {
             "schema_version": 1,
@@ -278,8 +313,6 @@ def main() -> int:
         _write(args.evidence, payload)
         print(json.dumps(payload, sort_keys=True))
         return 0
-    _require_disposable_execution_scope(parser)
-
     reports: list[dict[str, object]] = []
     quality_observed: dict[str, object] = {}
     for gate in gates:
@@ -287,6 +320,7 @@ def main() -> int:
         result = subprocess.run(
             gate.command,
             cwd=ROOT,
+            env=_command_environment(gate.command, os.environ.copy()),
             check=False,
             text=True,
             capture_output=gate.quality is not None,

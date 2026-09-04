@@ -57,13 +57,21 @@ class AnthropicGenerationProvider:
         api_key: str,
         *,
         model: str = "claude-3-5-sonnet-latest",
+        base_url: str | None = None,
         client: _AnthropicClient | None = None,
     ) -> None:
         self._model = model
         self._client: _AnthropicClient = (
             client
             if client is not None
-            else cast(_AnthropicClient, AsyncAnthropic(api_key=api_key))
+            else cast(
+                _AnthropicClient,
+                (
+                    AsyncAnthropic(api_key=api_key, base_url=base_url)
+                    if base_url
+                    else AsyncAnthropic(api_key=api_key)
+                ),
+            )
         )
 
     async def generate(self, prompt: GroundedPrompt) -> GeneratedAnswer:

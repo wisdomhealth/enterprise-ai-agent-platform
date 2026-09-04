@@ -18,6 +18,36 @@ _EXTERNAL_PROVIDER_ENV = (
     "CONNECTOR_FILE_KEY_PATH",
     "REDIS_URL",
 )
+_TASK26_LOCAL_RUNTIME_KEYS = frozenset({"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "REDIS_URL"})
+
+
+def _is_task26_local_provider_url(value: str, *, expected_path: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.port == 3201
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.rstrip("/") == expected_path.rstrip("/")
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _has_only_task26_local_provider(environ: Mapping[str, str]) -> bool:
+    return (
+        environ.get("TASK26_LOCAL_PROVIDER") == "1"
+        and environ.get("ANTHROPIC_API_KEY") == "task26-local"
+        and environ.get("OPENAI_API_KEY") == "task26-local"
+        and _is_task26_local_provider_url(
+            environ.get("ANTHROPIC_BASE_URL", ""), expected_path=""
+        )
+        and _is_task26_local_provider_url(
+            environ.get("OPENAI_BASE_URL", ""), expected_path="/v1"
+        )
+        and environ.get("REDIS_URL") == "redis://127.0.0.1:56385/0"
+    )
 
 
 def validate_task16_e2e_environment(environ: Mapping[str, str]) -> str:
@@ -43,7 +73,21 @@ def validate_task16_e2e_environment(environ: Mapping[str, str]) -> str:
     if not disposable_name or "/" in database_name or parsed.query or parsed.fragment:
         raise RuntimeError("Task 16 test harness requires a disposable database name")
 
+    local_provider = _has_only_task26_local_provider(environ)
+    provider_fields = (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_BASE_URL",
+        "TASK26_LOCAL_PROVIDER",
+    )
+    if any(environ.get(name, "").strip() for name in provider_fields) and not local_provider:
+        raise RuntimeError(
+            "Task 16 test harness requires the explicit loopback fake provider configuration"
+        )
     for name in _EXTERNAL_PROVIDER_ENV:
+        if local_provider and name in _TASK26_LOCAL_RUNTIME_KEYS:
+            continue
         if environ.get(name, "").strip():
             raise RuntimeError(f"Task 16 test harness requires {name} to be unset")
     return database_url

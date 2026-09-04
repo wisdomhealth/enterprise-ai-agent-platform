@@ -295,6 +295,71 @@ async def test_sse_stream_reads_durable_session_state(db_session: AsyncSession) 
 
 
 @pytest.mark.asyncio
+async def test_open_sse_stream_polls_postgres_when_redis_hint_is_lost(
+    db_session: AsyncSession,
+) -> None:
+    """A missed ephemeral hint cannot strand a live durable SSE connection."""
+    session = await _session(db_session)
+    await db_session.commit()
+    stream = PostgresSSEService(db_session, redis_client=_SilentRedis()).stream(
+        session.id, after_cursor="0"
+    )
+    assert "event: session.state" in await anext(stream)
+    # Exhaust the initial empty durable snapshot and one silent Redis poll
+    # before committing the answer.  This models a notification lost after
+    # the connection is already subscribed.
+    assert (await anext(stream)).startswith(": keepalive")
+
+    answer = ChatMessage(
+        session_id=session.id,
+        sequence=1,
+        actor=ChatActor.AI,
+        body="Committed answer after the missed hint.",
+        status=ChatMessageStatus.PERSISTED,
+    )
+    db_session.add(answer)
+    await db_session.flush()
+    db_session.add(
+        OutboxEvent(
+            event_type="chat.answer.validated",
+            aggregate_type="chat_session",
+            aggregate_id=session.id,
+            payload={
+                "sequence": answer.sequence,
+                "message_id": str(answer.id),
+                "segments": [answer.body],
+                "citations": [],
+            },
+        )
+    )
+    await db_session.commit()
+
+    # The fake Redis transport deliberately yields no notification.  The next
+    # frame still has to be reconstructed from committed PostgreSQL state.
+    assert "event: message.validated" in await anext(stream)
+    await stream.aclose()
+
+
+class _SilentPubSub:
+    async def subscribe(self, *_channels: str) -> None:
+        return None
+
+    async def get_message(self, **_kwargs: object) -> None:
+        return None
+
+    async def unsubscribe(self, *_channels: str) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+class _SilentRedis:
+    def pubsub(self) -> _SilentPubSub:
+        return _SilentPubSub()
+
+
+@pytest.mark.asyncio
 async def test_persisted_refusal_is_exposed_as_a_safe_error(db_session: AsyncSession) -> None:
     session = await _session(db_session)
     message = ChatMessage(

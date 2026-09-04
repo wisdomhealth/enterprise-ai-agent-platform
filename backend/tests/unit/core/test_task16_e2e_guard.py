@@ -48,7 +48,7 @@ def _environment(**overrides: str) -> dict[str, str]:
             },
             "disposable",
         ),
-        ({"ANTHROPIC_API_KEY": "real-provider-secret"}, "ANTHROPIC_API_KEY"),
+        ({"ANTHROPIC_API_KEY": "real-provider-secret"}, "loopback fake provider"),
     ],
 )
 def test_e2e_environment_rejects_unsafe_configuration(
@@ -82,6 +82,100 @@ def test_release_gate_e2e_accepts_only_its_explicit_local_disposable_database() 
     ).endswith("/platform_task26_fix")
 
 
+def test_release_gate_e2e_allows_only_the_explicit_local_fake_provider() -> None:
+    environment = _environment(
+        DATABASE_URL="postgresql+asyncpg://postgres@127.0.0.1:55436/platform_task26_fix",
+        TASK26_LOCAL_PROVIDER="1",
+        ANTHROPIC_API_KEY="task26-local",
+        ANTHROPIC_BASE_URL="http://127.0.0.1:3201",
+        OPENAI_API_KEY="task26-local",
+        OPENAI_BASE_URL="http://127.0.0.1:3201/v1",
+        REDIS_URL="redis://127.0.0.1:56385/0",
+    )
+
+    assert validate_task16_e2e_environment(environment).endswith("/platform_task26_fix")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "TASK26_LOCAL_PROVIDER": "1",
+                "ANTHROPIC_API_KEY": "task26-local",
+                "ANTHROPIC_BASE_URL": "https://provider.example.test",
+                "OPENAI_API_KEY": "task26-local",
+                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+            },
+            "loopback fake provider",
+        ),
+        (
+            {
+                "TASK26_LOCAL_PROVIDER": "1",
+                "ANTHROPIC_API_KEY": "task26-local",
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201?token=unsafe",
+                "OPENAI_API_KEY": "task26-local",
+                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+            },
+            "loopback fake provider",
+        ),
+        (
+            {
+                "TASK26_LOCAL_PROVIDER": "1",
+                "ANTHROPIC_API_KEY": "task26-local",
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
+                "OPENAI_API_KEY": "task26-local",
+                "OPENAI_BASE_URL": "http://127.0.0.1:3202/v1",
+            },
+            "loopback fake provider",
+        ),
+        (
+            {
+                "TASK26_LOCAL_PROVIDER": "1",
+                "ANTHROPIC_API_KEY": "real-provider-secret",
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
+                "OPENAI_API_KEY": "task26-local",
+                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+                "REDIS_URL": "redis://127.0.0.1:56385/0",
+            },
+            "loopback fake provider",
+        ),
+        (
+            {
+                "TASK26_LOCAL_PROVIDER": "1",
+                "ANTHROPIC_API_KEY": "task26-local",
+                "ANTHROPIC_BASE_URL": "http://192.0.2.10:3201",
+                "OPENAI_API_KEY": "task26-local",
+                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+                "REDIS_URL": "redis://127.0.0.1:56385/0",
+            },
+            "loopback fake provider",
+        ),
+        (
+            {
+                "TASK26_LOCAL_PROVIDER": "1",
+                "ANTHROPIC_API_KEY": "task26-local",
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
+                "OPENAI_API_KEY": "task26-local",
+                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+                "REDIS_URL": "redis://192.0.2.10:56385/0",
+            },
+            "loopback fake provider",
+        ),
+    ],
+)
+def test_release_gate_e2e_rejects_any_non_local_provider_configuration(
+    overrides: dict[str, str], message: str
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        validate_task16_e2e_environment(
+            _environment(
+                DATABASE_URL="postgresql+asyncpg://postgres@127.0.0.1:55436/platform_task26_fix",
+                **overrides,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -93,7 +187,7 @@ def test_release_gate_e2e_accepts_only_its_explicit_local_disposable_database() 
                 "APP_ENV": "test",
                 "ANTHROPIC_API_KEY": "provider-secret",
             },
-            "ANTHROPIC_API_KEY",
+            "loopback fake provider",
         ),
     ],
 )

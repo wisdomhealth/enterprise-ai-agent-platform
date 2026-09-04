@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     anthropic_model: str = Field(
         default="claude-3-5-sonnet-latest", validation_alias="ANTHROPIC_MODEL"
     )
+    anthropic_base_url: AnyUrl | None = Field(default=None, validation_alias="ANTHROPIC_BASE_URL")
     safety_classifier_model: str | None = Field(
         default=None,
         validation_alias="SAFETY_CLASSIFIER_MODEL",
@@ -41,6 +42,7 @@ class Settings(BaseSettings):
         default=30, ge=1, le=3600, validation_alias="PROVIDER_CIRCUIT_RESET_SECONDS"
     )
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
+    openai_base_url: AnyUrl | None = Field(default=None, validation_alias="OPENAI_BASE_URL")
     reranker_enabled: bool = Field(default=False, validation_alias="RERANKER_ENABLED")
     google_oidc_client_id: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_OIDC_CLIENT_ID"

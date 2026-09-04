@@ -50,7 +50,15 @@ class OpenAIEmbeddingProvider:
     def from_settings(cls, settings: Settings) -> "OpenAIEmbeddingProvider":
         if settings.openai_api_key is None:
             raise RuntimeError("OPENAI_API_KEY is required for embeddings")
-        return cls(AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value()))
+        api_key = settings.openai_api_key.get_secret_value()
+        if settings.openai_base_url is None:
+            return cls(AsyncOpenAI(api_key=api_key))
+        return cls(
+            AsyncOpenAI(
+                api_key=api_key,
+                base_url=settings.openai_base_url.unicode_string(),
+            )
+        )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:

@@ -27,8 +27,14 @@ test("real review lifecycle preserves history and fences unknown delivery", asyn
   const page = await context.newPage();
 
   await page.goto("/staff/email");
-  await page.getByRole("link", { name: "Review Browser review request" }).click();
-  await expect(page.getByText("Initial grounded reply.").first()).toBeVisible();
+  await Promise.all([
+    page.waitForURL(new RegExp(`/staff/email/${fixture.email_id}$`)),
+    page.getByRole("link", { name: "Review Browser review request" }).click(),
+  ]);
+  // A cold Next.js development route can take longer than Playwright's
+  // default assertion timeout to compile.  The data still comes from the
+  // production browser-to-backend path, so wait for the route's real detail.
+  await expect(page.getByText("Initial grounded reply.").first()).toBeVisible({ timeout: 20_000 });
 
   await page.getByLabel("Regeneration instruction").fill("Use a concise tone.");
   await page.getByRole("button", { name: "Regenerate draft" }).click();

@@ -17,6 +17,7 @@ from tests.task16_e2e_guard import validate_task16_e2e_environment
 validate_task16_e2e_environment(os.environ)
 
 from fastapi import Depends
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +27,7 @@ from app.main import create_app
 from app.modules.authorization.models import ResourceGrant
 from app.modules.chat.answering import ChatAnswerService
 from app.modules.chat.models import ChatActor, ChatMessage, ChatSession
+from app.modules.chat.tasks import _consume_chat_answer
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
 from app.modules.email.models import (
     DeliveryAttempt,
@@ -53,21 +55,42 @@ from app.modules.identity.models import (
     UserStatus,
 )
 from app.modules.jobs.models import JobIntent, JobState
-from app.modules.knowledge.models import KnowledgeBase
-from app.modules.outbox.models import OutboxEvent
-from app.modules.rag.answer_service import AnswerExecution
-from app.modules.rag.types import (
-    AnswerAudience,
-    ClaimSupport,
-    RetrievedChunk,
-    SourceCitation,
-    ValidatedAnswer,
+from app.modules.knowledge.models import (
+    Document,
+    DocumentChunk,
+    DocumentVersion,
+    DocumentVersionState,
+    DriveSource,
+    KnowledgeBase,
 )
+from app.modules.knowledge.service import KnowledgeSourceService
+from app.modules.outbox.models import OutboxEvent
+from app.modules.rag.types import AnswerAudience, ValidatedAnswer
 from app.modules.support.models import Handoff, HandoffTrigger
 from app.modules.support.service import SupportService
 
 CSRF_TOKEN = "task16-browser-csrf"
-app = create_app(Settings.model_validate({"SESSION_SECRET": "task16-browser-secret"}))
+app = create_app(
+    Settings.model_validate(
+        {
+            "SESSION_SECRET": "task16-browser-secret",
+            "ANTHROPIC_API_KEY": "task26-local",
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
+            "OPENAI_API_KEY": "task26-local",
+            "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+            "REDIS_URL": "redis://127.0.0.1:56385/0",
+        }
+    )
+)
+# The guarded browser harness calls the real local public API directly so the
+# release gate exercises the same unbuffered SSE transport shape as Nginx.
+# This middleware belongs only to the test ASGI application, never production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:3000"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "Accept"],
+)
 fixture: dict[str, UUID] = {}
 
 
@@ -87,66 +110,6 @@ class CountingAnswerService:
         raise AssertionError("a stale answer job must not reach the model boundary")
 
 
-class BrowserGroundedAnswerService:
-    """Deterministic provider-free grounded response for the email browser fixture."""
-
-    async def answer_with_evidence(
-        self,
-        principal: Principal,
-        knowledge_base_id: UUID,
-        query: str,
-        audience: AnswerAudience,
-    ) -> AnswerExecution:
-        del query
-        assert audience is AnswerAudience.STAFF
-        chunk_id = uuid4()
-        document_version_id = uuid4()
-        answer = "Regenerated grounded reply."
-        return AnswerExecution(
-            ValidatedAnswer(
-                text=answer,
-                claims=[ClaimSupport(text=answer, citation_ids=[chunk_id])],
-                citations=[
-                    SourceCitation(
-                        chunk_id=chunk_id,
-                        document_version_id=document_version_id,
-                        title="Support policy",
-                        section="Response times",
-                        page_number=2,
-                        internal_drive_link="https://drive.google.com/open?id=task20-reference",
-                    )
-                ],
-                segments=[answer],
-                refused=False,
-                model="claude-e2e",
-                prompt_version="email-e2e-v1",
-                latency_ms=3,
-                input_tokens=10,
-                output_tokens=4,
-                estimated_cost=0.0,
-            ),
-            [
-                RetrievedChunk(
-                    chunk_id=chunk_id,
-                    stable_id=str(chunk_id),
-                    document_version_id=document_version_id,
-                    document_id=uuid4(),
-                    organization_id=principal.organization_id,
-                    knowledge_base_id=knowledge_base_id,
-                    ordinal=0,
-                    text="Support responds within one business day.",
-                    page_number=2,
-                    section="Response times",
-                    resource_authorized=True,
-                    title="Support policy",
-                    internal_drive_link="https://drive.google.com/open?id=task20-reference",
-                )
-            ],
-            retrieval_latency_ms=1,
-            model_latency_ms=2,
-        )
-
-
 @app.on_event("startup")
 async def seed_task16_lifecycle() -> None:
     async with async_sessionmaker() as db_session:
@@ -154,7 +117,7 @@ async def seed_task16_lifecycle() -> None:
         db_session.add(organization)
         await db_session.flush()
         knowledge_base = KnowledgeBase(
-            organization_id=organization.id, public_key=f"task16-browser-{uuid4().hex}"
+            organization_id=organization.id, public_key="task26-public-key"
         )
         connector_secret = ConnectorSecret(
             organization_id=organization.id,
@@ -203,15 +166,89 @@ async def seed_task16_lifecycle() -> None:
             role=UserRole.REVIEWER,
             status=UserStatus.ACTIVE,
         )
-        db_session.add_all([stale_job, reviewer])
+        administrator = StaffUser(
+            organization_id=organization.id,
+            oidc_subject=f"task26-admin-{uuid4()}",
+            email="admin@example.test",
+            role=UserRole.ADMIN,
+            status=UserStatus.ACTIVE,
+        )
+        db_session.add_all([stale_job, reviewer, administrator])
         await db_session.flush()
         db_session.add(
             ResourceGrant(
                 organization_id=organization.id,
-                subject_id=reviewer.id,
-                resource_type="knowledge",
-                resource_id=knowledge_base.id,
-                actions=["knowledge.review"],
+                    subject_id=reviewer.id,
+                    resource_type="knowledge",
+                    resource_id=knowledge_base.id,
+                    # The real staff-draft regeneration path retrieves the
+                    # review evidence under the same durable grant, so this
+                    # fixture must authorize both review and read actions.
+                    actions=["knowledge.read", "knowledge.review"],
+            )
+        )
+        drive_source = DriveSource(
+            organization_id=organization.id,
+            knowledge_base_id=knowledge_base.id,
+            root_folder_id="task26-root",
+            connection_identity="task26@example.test",
+        )
+        db_session.add(drive_source)
+        await db_session.flush()
+        db_session.add_all(
+            [
+                ResourceGrant(
+                    organization_id=organization.id,
+                    subject_id=administrator.id,
+                    resource_type="connector",
+                    resource_id=gmail_connector.id,
+                    actions=["connector.read"],
+                ),
+                ResourceGrant(
+                    organization_id=organization.id,
+                    subject_id=administrator.id,
+                    resource_type="knowledge",
+                    resource_id=knowledge_base.id,
+                    actions=["knowledge.read", "knowledge.review"],
+                ),
+                ResourceGrant(
+                    organization_id=organization.id,
+                    subject_id=administrator.id,
+                    resource_type="knowledge",
+                    resource_id=KnowledgeSourceService.configuration_resource_id(organization.id),
+                    actions=["knowledge.write"],
+                ),
+            ]
+        )
+        document = Document(
+            organization_id=organization.id,
+            knowledge_base_id=knowledge_base.id,
+            source_id=drive_source.id,
+            external_id="task26-policy",
+            title="Support policy",
+            mime_type="application/pdf",
+        )
+        db_session.add(document)
+        await db_session.flush()
+        version = DocumentVersion(
+            document_id=document.id,
+            state=DocumentVersionState.RETRIEVABLE,
+            content_sha256="2" * 64,
+        )
+        db_session.add(version)
+        await db_session.flush()
+        document.current_version_id = version.id
+        db_session.add(
+            DocumentChunk(
+                id=uuid4(),
+                document_version_id=version.id,
+                ordinal=0,
+                text="Regenerated grounded reply.",
+                page_number=2,
+                section="Response times",
+                token_count=3,
+                metadata_={"task": 26},
+                embedding=[1.0] * 1536,
             )
         )
         staff_session = StaffSession(
@@ -219,7 +256,12 @@ async def seed_task16_lifecycle() -> None:
             csrf_hash=sha256(CSRF_TOKEN.encode()).hexdigest(),
             expires_at=datetime.now(UTC) + timedelta(hours=1),
         )
-        db_session.add(staff_session)
+        administrator_session = StaffSession(
+            user_id=administrator.id,
+            csrf_hash=sha256(CSRF_TOKEN.encode()).hexdigest(),
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        db_session.add_all((staff_session, administrator_session))
         await db_session.flush()
         email_item = EmailWorkItem(
             organization_id=organization.id,
@@ -332,25 +374,103 @@ async def seed_task16_lifecycle() -> None:
         fixture.update(
             {
                 "staff_session_id": staff_session.id,
+                "admin_session_id": administrator_session.id,
+                "knowledge_base_id": knowledge_base.id,
                 "handoff_id": handoff.id,
                 "job_id": stale_job.id,
                 "session_id": session.id,
                 "email_id": email_item.id,
                 "conflict_email_id": conflict_email_item.id,
+                "document_version_id": version.id,
             }
         )
-        app.state.grounded_answer_service = BrowserGroundedAnswerService()
 
 
 @app.get("/__e2e__/fixture")
 async def fixture_read() -> dict[str, object]:
     return {
         "staff_session_id": str(fixture["staff_session_id"]),
+        "admin_session_id": str(fixture["admin_session_id"]),
         "csrf_token": CSRF_TOKEN,
         "handoff_id": str(fixture["handoff_id"]),
+        "session_id": str(fixture["session_id"]),
         "email_id": str(fixture["email_id"]),
         "conflict_email_id": str(fixture["conflict_email_id"]),
     }
+
+
+@app.get("/__e2e__/latest-public-session")
+async def latest_public_session() -> dict[str, str]:
+    async with async_sessionmaker() as db_session:
+        session = await db_session.scalar(
+            select(ChatSession)
+            .where(ChatSession.knowledge_base_id == fixture["knowledge_base_id"])
+            .order_by(ChatSession.created_at.desc())
+            .limit(1)
+        )
+        if isinstance(session, ChatSession):
+            fixture_principal = await db_session.get(StaffUser, session.id)
+            if fixture_principal is None:
+                # The production retrieval predicate grants only durable,
+                # organization-bound subjects.  This test-only identity binds
+                # the opaque public-session principal to an explicit persisted
+                # fixture grant; it does not replace or bypass that predicate.
+                db_session.add(
+                    StaffUser(
+                        id=session.id,
+                        organization_id=session.organization_id,
+                        oidc_subject=f"task26-public-{session.id}",
+                        email=f"public-{session.id}@example.test",
+                        role=UserRole.MEMBER,
+                        status=UserStatus.ACTIVE,
+                    )
+                )
+                await db_session.flush()
+            db_session.add(
+                ResourceGrant(
+                    organization_id=session.organization_id,
+                    subject_id=session.id,
+                    resource_type="knowledge",
+                    resource_id=session.knowledge_base_id,
+                    actions=["knowledge.read"],
+                )
+            )
+            await db_session.commit()
+    if not isinstance(session, ChatSession):
+        raise RuntimeError("public session fixture was not created")
+    return {"session_id": str(session.id)}
+
+
+@app.post("/__e2e__/consume-public-answer/{session_id}")
+async def consume_public_answer(session_id: UUID) -> dict[str, str]:
+    """Invoke the registered consumer assembly against the local fake provider.
+
+    The route is only reachable in the fail-closed Task 16 harness.  It does
+    not synthesize an answer: it finds the durable production intent created
+    by the real public API and invokes the same consumer function Celery uses.
+    """
+    async with async_sessionmaker() as db_session:
+        jobs = list(
+            (
+                await db_session.scalars(
+                    select(JobIntent)
+                    .where(JobIntent.kind == "chat.answer")
+                    .order_by(JobIntent.created_at.desc())
+                )
+            ).all()
+        )
+        job = next(
+            (
+                candidate
+                for candidate in jobs
+                if candidate.payload.get("session_id") == str(session_id)
+            ),
+            None,
+        )
+    if job is None:
+        raise RuntimeError("public answer intent was not created")
+    await _consume_chat_answer(job.id)
+    return {"job_id": str(job.id)}
 
 
 @app.get("/__e2e__/state")

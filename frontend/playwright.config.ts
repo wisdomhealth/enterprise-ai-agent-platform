@@ -11,6 +11,16 @@ export default defineConfig({
   webServer: [
     {
       command:
+        "../backend/.venv/bin/python -m uvicorn tests.task26_provider_app:app --host 127.0.0.1 --port 3201",
+      port: 3201,
+      reuseExistingServer: false,
+      env: {
+        APP_ENV: "test",
+        PYTHONPATH: "../backend",
+      },
+    },
+    {
+      command:
         "../backend/.venv/bin/python -m uvicorn tests.task16_e2e_app:app --host 127.0.0.1 --port 3100",
       port: 3100,
       reuseExistingServer: false,
@@ -19,8 +29,11 @@ export default defineConfig({
         APP_ENV: "test",
         DATABASE_URL: databaseUrl,
         PYTHONPATH: "../backend",
-        ANTHROPIC_API_KEY: "",
-        OPENAI_API_KEY: "",
+        TASK26_LOCAL_PROVIDER: "1",
+        ANTHROPIC_API_KEY: "task26-local",
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:3201",
+        OPENAI_API_KEY: "task26-local",
+        OPENAI_BASE_URL: "http://127.0.0.1:3201/v1",
         GOOGLE_OIDC_CLIENT_ID: "",
         GOOGLE_OIDC_CLIENT_SECRET: "",
         GOOGLE_DRIVE_CLIENT_ID: "",
@@ -30,14 +43,20 @@ export default defineConfig({
         GOOGLE_CLOUD_PROJECT: "",
         GOOGLE_KMS_KEY_NAME: "",
         CONNECTOR_FILE_KEY_PATH: "",
-        REDIS_URL: "",
+        REDIS_URL: "redis://127.0.0.1:56385/0",
       },
     },
     {
       command: "./node_modules/.bin/next dev --hostname 127.0.0.1 --port 3000",
       port: 3000,
       reuseExistingServer: false,
-      env: { BACKEND_API_URL: "http://127.0.0.1:3100" },
+      env: {
+        BACKEND_API_URL: "http://127.0.0.1:3100",
+        // Exercise the real local backend SSE route directly.  Production
+        // Nginx likewise routes /api without buffering; Next dev rewrites do
+        // not provide that streaming guarantee.
+        NEXT_PUBLIC_API_BASE_URL: "http://127.0.0.1:3100",
+      },
     },
   ],
   use: {

@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
 
-type Fixture = { staff_session_id: string; csrf_token: string; handoff_id: string };
+type Fixture = {
+  staff_session_id: string;
+  csrf_token: string;
+  handoff_id: string;
+  session_id: string;
+};
 
 test("live PostgreSQL claim, reply, and explicit Resume AI fence stale output", async ({
   browser,
@@ -22,9 +27,12 @@ test("live PostgreSQL claim, reply, and explicit Resume AI fence stale output", 
   const staff = await context.newPage();
 
   await staff.goto("/staff/support");
-  await expect(staff.getByText("Queued")).toBeVisible();
-  const initialVersion = Number((await staff.getByText(/Version /).textContent())?.split(" ")[2]);
-  await staff.getByRole("button", { name: "Claim" }).click();
+  const handoff = staff.getByRole("listitem").filter({
+    hasText: `Conversation ${fixture.session_id}`,
+  });
+  await expect(handoff.getByText("Queued")).toBeVisible();
+  const initialVersion = Number((await handoff.getByText(/Version /).textContent())?.split(" ")[2]);
+  await handoff.getByRole("button", { name: "Claim" }).click();
   await expect(staff.getByText("Human active")).toBeVisible();
 
   const staleClaimStatus = await staff.evaluate(

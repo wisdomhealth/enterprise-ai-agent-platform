@@ -92,13 +92,19 @@ class AnthropicStructuredSafetyClassifier:
         api_key: str,
         *,
         model: str = "claude-3-5-sonnet-latest",
+        base_url: str | None = None,
         client: _AnthropicClient | None = None,
     ) -> None:
         self._model = model
         self._client: _AnthropicClient = (
             client
             if client is not None
-            else cast(_AnthropicClient, AsyncAnthropic(api_key=api_key))
+            else cast(
+                _AnthropicClient,
+                AsyncAnthropic(api_key=api_key, base_url=base_url)
+                if base_url
+                else AsyncAnthropic(api_key=api_key),
+            )
         )
 
     @classmethod
@@ -108,6 +114,11 @@ class AnthropicStructuredSafetyClassifier:
         return cls(
             settings.anthropic_api_key.get_secret_value(),
             model=settings.safety_classifier_model or settings.anthropic_model,
+            base_url=(
+                settings.anthropic_base_url.unicode_string()
+                if settings.anthropic_base_url is not None
+                else None
+            ),
         )
 
     async def classify(self, text: str) -> SensitiveTopicClassification:

@@ -5,6 +5,8 @@ export type ChatSSEEvent = {
   data: Record<string, unknown>;
 };
 
+const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "";
+
 export async function connectChatEvents(options: {
   sessionId: string;
   token: string;
@@ -15,7 +17,7 @@ export async function connectChatEvents(options: {
   let after = options.after ?? "0";
   while (!options.signal?.aborted) {
     const response = await fetch(
-      `/api/v1/public/chat/sessions/${options.sessionId}/events?after=${encodeURIComponent(after)}`,
+      `${apiBaseUrl}/api/v1/public/chat/sessions/${options.sessionId}/events?after=${encodeURIComponent(after)}`,
       {
         headers: { Accept: "text/event-stream", Authorization: `Bearer ${options.token}` },
         signal: options.signal,

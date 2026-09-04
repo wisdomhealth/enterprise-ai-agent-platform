@@ -1,7 +1,9 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
+from app.core.config import Settings
 from app.modules.support.models import HandoffTrigger, SensitiveTopic
 from app.modules.support.triggers import (
     AnthropicStructuredSafetyClassifier,
@@ -73,3 +75,19 @@ async def test_anthropic_structured_classifier_rejects_malformed_or_unknown_resu
 
     with pytest.raises(StructuredSafetyClassifierResponseError):
         await classifier.classify("customer text")
+
+
+def test_structured_classifier_uses_the_configured_provider_base_url() -> None:
+    client = object()
+    with patch("app.modules.support.triggers.AsyncAnthropic", return_value=client) as factory:
+        classifier = AnthropicStructuredSafetyClassifier.from_settings(
+            Settings.model_validate(
+                {
+                    "ANTHROPIC_API_KEY": "task26-local",
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
+                }
+            )
+        )
+
+    assert classifier._client is client
+    factory.assert_called_once_with(api_key="task26-local", base_url="http://127.0.0.1:3201/")

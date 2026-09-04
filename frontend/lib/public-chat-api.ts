@@ -26,8 +26,10 @@ export type PublicChatStart = {
   credential: { token: string; expires_at: string };
 };
 
+const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "";
+
 async function request<T>(path: string, init: RequestInit): Promise<T> {
-  const response = await fetch(`/api/v1/public/chat${path}`, {
+  const response = await fetch(`${apiBaseUrl}/api/v1/public/chat${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...init.headers },
   });
