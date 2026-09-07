@@ -14,6 +14,8 @@ CMD ["npm", "test", "--", "--run"]
 
 FROM deps AS builder
 COPY app ./app
+COPY components ./components
+COPY lib ./lib
 COPY eslint.config.mjs next-env.d.ts next.config.ts postcss.config.mjs tsconfig.json ./
 RUN npm run build
 

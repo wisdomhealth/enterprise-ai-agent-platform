@@ -60,6 +60,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-platform}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       <<: *pgbackrest-environment
+    ports:
+      - "127.0.0.1:5432:5432"
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
     volumes:
       - ${POSTGRES_DATA_SOURCE:-postgres-data}:/var/lib/postgresql/data
@@ -124,7 +126,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-
+    volumes:
+      - ./.enterprise-ai-agent-platform/connector.key:/run/local-secrets/connector.key
   worker:
     <<: *backend
     command:
@@ -146,9 +149,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-
+    volumes:
+      - ./.enterprise-ai-agent-platform/connector.key:/run/local-secrets/connector.key
   scheduler:
     <<: *backend
+    volumes:
+      - ./.enterprise-ai-agent-platform/connector.key:/run/local-secrets/connector.key
     command:
       [
         "celery",
@@ -169,6 +175,7 @@ services:
       context: ./frontend
       target: runner
     environment:
+      BACKEND_API_URL: ${BACKEND_API_URL:-http://backend:8000}
       INTERNAL_BASE_URL: ${INTERNAL_BASE_URL:-http://backend:8000}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
     restart: unless-stopped
