@@ -128,6 +128,51 @@ it("confirms connector reauthorization and displays exact minimum scopes", async
   await waitFor(() => expect(reauthorize).toHaveBeenCalledWith("connector-1"));
 });
 
+it("shows initial Drive and Gmail authorization when no connectors exist", () => {
+  render(<ConnectorStatus connectors={[]} onReauthorize={vi.fn().mockResolvedValue(undefined)} />);
+
+  expect(screen.getByText("Google Drive").closest("li")).toHaveTextContent(
+    "Google Drive · Not connected",
+  );
+  expect(screen.getByRole("button", { name: "Connect Google Drive" })).toBeVisible();
+  expect(screen.getByText("Gmail").closest("li")).toHaveTextContent("Gmail · Not connected");
+  expect(screen.getByRole("button", { name: "Connect Gmail" })).toBeVisible();
+});
+
+it("uses existing Drive status without a duplicate initial authorization button", () => {
+  render(
+    <ConnectorStatus
+      connectors={[
+        {
+          id: "drive-1",
+          kind: "DRIVE",
+          status: "ACTIVE",
+          updated_at: "2026-09-02T07:00:00Z",
+          requested_scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+        },
+      ]}
+      onReauthorize={vi.fn().mockResolvedValue(undefined)}
+    />,
+  );
+
+  expect(screen.queryByRole("button", { name: "Connect Google Drive" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Reauthorize Google Drive" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Connect Gmail" })).toBeVisible();
+});
+
+it("navigates initial authorization buttons to same-origin connector routes", () => {
+  const assign = vi.fn();
+  vi.stubGlobal("location", { assign });
+  render(<ConnectorStatus connectors={[]} onReauthorize={vi.fn().mockResolvedValue(undefined)} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Connect Google Drive" }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect Gmail" }));
+
+  expect(assign).toHaveBeenNthCalledWith(1, "/api/v1/admin/connectors/DRIVE/authorize");
+  expect(assign).toHaveBeenNthCalledWith(2, "/api/v1/admin/connectors/GMAIL/authorize");
+  vi.unstubAllGlobals();
+});
+
 it("keeps connector confirmation keyboard focus inside and restores its trigger", () => {
   render(
     <ConnectorStatus
