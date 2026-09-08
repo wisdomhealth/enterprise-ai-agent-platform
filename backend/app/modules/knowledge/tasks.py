@@ -216,6 +216,7 @@ async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -
                 JobIntent.kind == "knowledge.drive_source.sync",
                 JobIntent.state == JobState.SUCCEEDED,
                 JobIntent.payload["source_id"].as_string() == str(source_id),
+                JobIntent.updated_at >= event.occurred_at,
             )
         )
     ) is not None

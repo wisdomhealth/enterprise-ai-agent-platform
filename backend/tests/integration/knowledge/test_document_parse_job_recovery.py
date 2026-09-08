@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -333,6 +333,44 @@ async def test_document_parse_sweeper_waits_for_its_parent_sync_job_to_succeed(
     await db_session.refresh(event)
     assert delivered == [str(parse_job.id)]
     assert event.published_at is not None
+
+
+@pytest.mark.asyncio
+async def test_document_parse_event_rejects_an_older_successful_parent_sync(
+    db_session, monkeypatch, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    parse_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    document = await db_session.get(Document, UUID(str(parse_job.payload["document_id"])))
+    assert document is not None
+    old_parent = await _successful_parent_sync_job(db_session, source_id=document.source_id)
+    await db_session.commit()
+    event = OutboxEvent(
+        event_type="knowledge.document.parse.requested",
+        aggregate_type="job",
+        aggregate_id=parse_job.id,
+        payload={
+            "organization_id": str(document.organization_id),
+            "source_id": str(document.source_id),
+            "document_id": str(document.id),
+            "parent_sync_job_id": str(old_parent.id),
+        },
+    )
+    db_session.add(event)
+    await db_session.commit()
+    await db_session.refresh(event)
+    old_parent.updated_at = event.occurred_at - timedelta(seconds=1)
+    await db_session.commit()
+    delivered: list[str] = []
+    monkeypatch.setattr(document_parse, "delay", delivered.append)
+
+    await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
+
+    await db_session.refresh(event)
+    assert delivered == []
+    assert event.published_at is None
+    assert event.publish_attempts == 0
 
 
 @pytest.mark.asyncio
