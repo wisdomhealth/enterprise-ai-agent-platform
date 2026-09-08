@@ -153,6 +153,7 @@ async def _dispatch_document_parse_outbox_event(
     if (
         event is None
         or event.event_type != DOCUMENT_PARSE_REQUESTED_EVENT_TYPE
+        or event.aggregate_type != "job"
         or event.published_at is not None
         or not await _parent_sync_succeeded(event, db_session)
     ):

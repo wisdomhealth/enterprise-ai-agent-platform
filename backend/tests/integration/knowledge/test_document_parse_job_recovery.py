@@ -507,6 +507,49 @@ async def test_malformed_parse_event_does_not_block_following_valid_recovery(
 
 
 @pytest.mark.asyncio
+async def test_wrong_aggregate_type_fails_closed_without_blocking_valid_recovery(
+    db_session, monkeypatch, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    parse_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    document = await db_session.get(Document, UUID(str(parse_job.payload["document_id"])))
+    assert document is not None
+    parent_job = await _successful_parent_sync_job(db_session, source_id=document.source_id)
+    payload = {
+        "organization_id": str(document.organization_id),
+        "source_id": str(document.source_id),
+        "document_id": str(document.id),
+        "parent_sync_job_id": str(parent_job.id),
+    }
+    malformed_event = OutboxEvent(
+        event_type="knowledge.document.parse.requested",
+        aggregate_type="document",
+        aggregate_id=parse_job.id,
+        payload=payload,
+    )
+    valid_event = OutboxEvent(
+        event_type="knowledge.document.parse.requested",
+        aggregate_type="job",
+        aggregate_id=parse_job.id,
+        payload=payload,
+    )
+    db_session.add_all([malformed_event, valid_event])
+    await db_session.commit()
+    delivered: list[str] = []
+    monkeypatch.setattr(document_parse, "delay", delivered.append)
+
+    await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
+
+    await db_session.refresh(malformed_event)
+    await db_session.refresh(valid_event)
+    assert malformed_event.published_at is None
+    assert malformed_event.publish_attempts == 0
+    assert delivered == [str(parse_job.id)]
+    assert valid_event.published_at is not None
+
+
+@pytest.mark.asyncio
 async def test_new_parse_event_with_missing_or_malformed_binding_fails_closed(
     db_session, monkeypatch, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]
