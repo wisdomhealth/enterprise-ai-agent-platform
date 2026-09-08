@@ -202,7 +202,10 @@ async def test_completed_drive_sync_wakes_each_committed_document_parse_event(
         source_id = source.id
         event_id = parse_event.event_id
 
-    async def completed_sync(_self, source_id_value, _page_token):  # type: ignore[no-untyped-def]
+    async def completed_sync(  # type: ignore[no-untyped-def]
+        _self, source_id_value, _page_token, *, parent_sync_job_id
+    ):
+        assert parent_sync_job_id == job_id
         return SyncResult(
             source_id_value,
             "cursor-2",

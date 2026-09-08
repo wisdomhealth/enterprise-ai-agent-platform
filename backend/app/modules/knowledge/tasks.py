@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.database import async_sessionmaker
 from app.modules.connectors.service import ConnectorService
-from app.modules.jobs.models import ErrorClass, JobIntent
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.ingestion import DocumentIngestionService
@@ -154,6 +154,7 @@ async def _dispatch_document_parse_outbox_event(
         event is None
         or event.event_type != DOCUMENT_PARSE_REQUESTED_EVENT_TYPE
         or event.published_at is not None
+        or not await _parent_sync_succeeded(event, db_session)
     ):
         return False
     try:
@@ -188,6 +189,25 @@ async def _dispatch_pending_document_parse_outbox_events(
     )
     for event_id in event_ids:
         await _dispatch_document_parse_outbox_event(event_id, db_session=db_session)
+
+
+async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
+    raw_parent_job_id = event.payload.get("parent_sync_job_id")
+    if not isinstance(raw_parent_job_id, str):
+        return False
+    try:
+        parent_job_id = UUID(raw_parent_job_id)
+    except ValueError:
+        return False
+    return (
+        await db_session.scalar(
+            select(JobIntent.id).where(
+                JobIntent.id == parent_job_id,
+                JobIntent.kind == "knowledge.drive_source.sync",
+                JobIntent.state == JobState.SUCCEEDED,
+            )
+        )
+    ) is not None
 
 
 async def _run_drive_sync(job_id: str | None) -> None:
@@ -259,7 +279,11 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
                 db_session,
                 connector_service=connector_service,
                 drive_gateway_factory=gateway_factory,
-            ).sync(source_id, raw_page_token)
+            ).sync(
+                source_id,
+                raw_page_token,
+                parent_sync_job_id=job.id,
+            )
             if result.reauth_required:
                 await lease_service.retry(
                     job.id,

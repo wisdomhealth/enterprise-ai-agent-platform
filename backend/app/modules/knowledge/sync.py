@@ -90,7 +90,13 @@ class DriveSyncService:
         files, next_cursor = await list_changes(source_id, cursor)
         return DriveChangePage(files=list(files), next_cursor=next_cursor)
 
-    async def sync(self, source_id: UUID, page_token: str | None = None) -> SyncResult:
+    async def sync(
+        self,
+        source_id: UUID,
+        page_token: str | None = None,
+        *,
+        parent_sync_job_id: UUID | None = None,
+    ) -> SyncResult:
         if self._db_session is None:
             raise RuntimeError("a database session is required")
         source = await self._db_session.scalar(
@@ -131,7 +137,14 @@ class DriveSyncService:
             if drive_file.mime_type not in SUPPORTED_DOCUMENT_MIME_TYPES:
                 continue
             document = await self._upsert_document(source, drive_file)
-            parse_outbox_event_ids.append(await self._enqueue_parse(source, document, drive_file))
+            parse_outbox_event_ids.append(
+                await self._enqueue_parse(
+                    source,
+                    document,
+                    drive_file,
+                    parent_sync_job_id=parent_sync_job_id,
+                )
+            )
             enqueued += 1
 
         # This assignment and all page effects are committed together below.  A
@@ -227,7 +240,12 @@ class DriveSyncService:
         return document
 
     async def _enqueue_parse(
-        self, source: DriveSource, document: Document, drive_file: DriveFile
+        self,
+        source: DriveSource,
+        document: Document,
+        drive_file: DriveFile,
+        *,
+        parent_sync_job_id: UUID | None,
     ) -> UUID:
         assert self._db_session is not None
         modified = (
@@ -259,6 +277,11 @@ class DriveSyncService:
                 "organization_id": str(source.organization_id),
                 "source_id": str(source.id),
                 "document_id": str(document.id),
+                **(
+                    {"parent_sync_job_id": str(parent_sync_job_id)}
+                    if parent_sync_job_id is not None
+                    else {}
+                ),
             },
         )
         return event.event_id

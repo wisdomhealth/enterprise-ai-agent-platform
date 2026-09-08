@@ -59,6 +59,18 @@ class _EmbeddingProvider:
         return [[1.0] * 1536 for _ in texts]
 
 
+async def _successful_parent_sync_job(db_session) -> JobIntent:  # type: ignore[no-untyped-def]
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.drive_source.sync",
+        f"document-parse-parent-sync-{uuid4()}",
+        {"source_id": str(uuid4())},
+    )
+    job.state = JobState.SUCCEEDED
+    await db_session.flush()
+    return job
+
+
 async def _parse_job_fixture(
     db_session, tmp_path: Path, *, mime_type: str
 ) -> tuple[JobIntent, ConnectorService, _FakeDriveGateway]:  # type: ignore[no-untyped-def]
@@ -172,11 +184,15 @@ async def test_document_parse_outbox_dispatches_once_and_publishes_after_broker_
     db_session, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     job_id = uuid4()
+    parent_job = await _successful_parent_sync_job(db_session)
     event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
         aggregate_id=job_id,
-        payload={"document_id": str(uuid4())},
+        payload={
+            "document_id": str(uuid4()),
+            "parent_sync_job_id": str(parent_job.id),
+        },
     )
     db_session.add(event)
     await db_session.flush()
@@ -196,11 +212,15 @@ async def test_document_parse_outbox_dispatches_once_and_publishes_after_broker_
 async def test_document_parse_broker_failure_leaves_event_unpublished_for_recovery(
     db_session, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
+    parent_job = await _successful_parent_sync_job(db_session)
     event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
         aggregate_id=uuid4(),
-        payload={"document_id": str(uuid4())},
+        payload={
+            "document_id": str(uuid4()),
+            "parent_sync_job_id": str(parent_job.id),
+        },
     )
     db_session.add(event)
     await db_session.commit()
@@ -222,11 +242,15 @@ async def test_document_parse_pending_sweeper_recovers_unpublished_events(
     db_session, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     job_id = uuid4()
+    parent_job = await _successful_parent_sync_job(db_session)
     event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
         aggregate_id=job_id,
-        payload={"document_id": str(uuid4())},
+        payload={
+            "document_id": str(uuid4()),
+            "parent_sync_job_id": str(parent_job.id),
+        },
     )
     db_session.add(event)
     await db_session.commit()
@@ -239,6 +263,53 @@ async def test_document_parse_pending_sweeper_recovers_unpublished_events(
     assert delivered == [str(job_id)]
     assert event.published_at is not None
     assert event.publish_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_document_parse_sweeper_waits_for_its_parent_sync_job_to_succeed(
+    db_session, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    service = JobService()
+    parent_job = await service.enqueue(
+        db_session,
+        "knowledge.drive_source.sync",
+        f"document-parse-parent-sync-{uuid4()}",
+        {"source_id": str(uuid4())},
+    )
+    parse_job = await service.enqueue(
+        db_session,
+        "knowledge.document.parse",
+        f"document-parse-child-{uuid4()}",
+        {"document_id": str(uuid4())},
+    )
+    event = OutboxEvent(
+        event_type="knowledge.document.parse.requested",
+        aggregate_type="job",
+        aggregate_id=parse_job.id,
+        payload={
+            "document_id": str(uuid4()),
+            "parent_sync_job_id": str(parent_job.id),
+        },
+    )
+    db_session.add(event)
+    await db_session.commit()
+    delivered: list[str] = []
+    monkeypatch.setattr(document_parse, "delay", delivered.append)
+
+    await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
+
+    await db_session.refresh(event)
+    assert delivered == []
+    assert event.published_at is None
+    assert event.publish_attempts == 0
+
+    parent_job.state = JobState.SUCCEEDED
+    await db_session.commit()
+    await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
+
+    await db_session.refresh(event)
+    assert delivered == [str(parse_job.id)]
+    assert event.published_at is not None
 
 
 @pytest.mark.asyncio
