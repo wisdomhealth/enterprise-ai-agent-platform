@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select
@@ -10,6 +11,7 @@ from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import Document, DriveSource, KnowledgeBase
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.sync import DriveSyncService
+from app.modules.outbox.models import OutboxEvent
 
 
 class FakeDriveChangeBoundary:
@@ -75,7 +77,12 @@ async def test_cursor_advances_only_after_page_is_persisted(db_session) -> None:
     boundary = FakeDriveChangeBoundary([_authorized_file()], "cursor-2")
     service = DriveSyncService(db_session, page_gateway=boundary)
 
-    result = await service.sync(source_id, source.sync_cursor)
+    parent_sync_job_id = uuid4()
+    result = await service.sync(
+        source_id,
+        source.sync_cursor,
+        parent_sync_job_id=parent_sync_job_id,
+    )
 
     db_session.expire_all()
     persisted = await db_session.get(DriveSource, source_id)
@@ -84,6 +91,15 @@ async def test_cursor_advances_only_after_page_is_persisted(db_session) -> None:
     assert persisted.sync_cursor == "cursor-2"
     assert await db_session.scalar(select(func.count(Document.id))) == 1
     assert await db_session.scalar(select(func.count(JobIntent.id))) == 1
+    parse_events = (
+        await db_session.scalars(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "knowledge.document.parse.requested"
+            )
+        )
+    ).all()
+    assert result.parse_outbox_event_ids == (parse_events[0].event_id,)
+    assert parse_events[0].payload["parent_sync_job_id"] == str(parent_sync_job_id)
     assert boundary.calls == [(str(source_id), "cursor-1")]
 
 

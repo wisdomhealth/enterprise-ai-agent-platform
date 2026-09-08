@@ -13,11 +13,12 @@ from app.modules.jobs.service import JobService
 from app.modules.knowledge.models import DriveSource, DriveSourceStatus, KnowledgeBase
 from app.modules.knowledge.operations import DriveSyncOperations
 from app.modules.knowledge.service import KnowledgeSourceService
-from app.modules.knowledge.sync import drive_sync_job_key
+from app.modules.knowledge.sync import SyncResult, drive_sync_job_key
 from app.modules.knowledge.tasks import (
     _consume_drive_sync_intent,
     _dispatch_drive_sync_outbox_event,
     _dispatch_pending_drive_sync_outbox_events,
+    dispatch_document_parse_outbox_event,
     dispatch_drive_sync_outbox_event,
     dispatch_pending_drive_sync_outbox_events,
     drive_source_sync,
@@ -160,6 +161,83 @@ async def test_pending_outbox_sweeper_redelivers_after_post_commit_wakeup_loss(
     assert persisted is not None
     assert persisted.published_at is not None
     assert persisted.publish_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_drive_sync_wakes_each_committed_document_parse_event(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    async with async_sessionmaker() as setup_session:
+        organization = Organization(name=f"parse wakeup owner {uuid4()}")
+        setup_session.add(organization)
+        await setup_session.flush()
+        knowledge_base = KnowledgeBase(organization_id=organization.id)
+        setup_session.add(knowledge_base)
+        await setup_session.flush()
+        source = DriveSource(
+            organization_id=organization.id,
+            knowledge_base_id=knowledge_base.id,
+            root_folder_id="root",
+            allowed_descendant_ids=[],
+            connection_identity="reader@example.test",
+            sync_cursor="cursor-1",
+        )
+        setup_session.add(source)
+        await setup_session.flush()
+        job = await JobService().enqueue(
+            setup_session,
+            "knowledge.drive_source.sync",
+            drive_sync_job_key(source.id, source.sync_cursor),
+            {"source_id": str(source.id), "page_token": source.sync_cursor},
+        )
+        parse_event = OutboxEvent(
+            event_type="knowledge.document.parse.requested",
+            aggregate_type="job",
+            aggregate_id=uuid4(),
+            payload={"document_id": str(uuid4())},
+        )
+        setup_session.add(parse_event)
+        await setup_session.commit()
+        job_id = job.id
+        source_id = source.id
+        event_id = parse_event.event_id
+
+    async def completed_sync(  # type: ignore[no-untyped-def]
+        _self, source_id_value, _page_token, *, parent_sync_job_id
+    ):
+        assert parent_sync_job_id == job_id
+        return SyncResult(
+            source_id_value,
+            "cursor-2",
+            1,
+            0,
+            0,
+            parse_outbox_event_ids=(event_id,),
+        )
+
+    dispatched: list[str] = []
+    monkeypatch.setattr("app.modules.knowledge.tasks.DriveSyncService.sync", completed_sync)
+    monkeypatch.setattr(
+        "app.modules.knowledge.tasks.ConnectorService.from_settings",
+        classmethod(lambda _cls, _settings: object()),
+    )
+    monkeypatch.setattr(
+        "app.modules.knowledge.tasks.GoogleDriveGatewayFactory.from_settings",
+        classmethod(lambda _cls, _settings: object()),
+    )
+    monkeypatch.setattr(dispatch_document_parse_outbox_event, "delay", dispatched.append)
+
+    try:
+        await _consume_drive_sync_intent(job_id)
+        async with async_sessionmaker() as inspection_session:
+            persisted_job = await inspection_session.get(JobIntent, job_id)
+            assert persisted_job is not None
+            assert persisted_job.state is JobState.SUCCEEDED
+            persisted_source = await inspection_session.get(DriveSource, source_id)
+            assert persisted_source is not None
+        assert dispatched == [str(event_id)]
+    finally:
+        await engine.dispose()
 
 
 class _ConfigurationBoundary:

@@ -1,7 +1,7 @@
 """Executable Celery consumer for durable Drive synchronization intents."""
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
 
 from celery import shared_task  # type: ignore[import-untyped]
@@ -11,17 +11,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.database import async_sessionmaker
 from app.modules.connectors.service import ConnectorService
-from app.modules.jobs.models import ErrorClass, JobIntent
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
+from app.modules.knowledge.ingestion import DocumentIngestionService
 from app.modules.knowledge.models import Document, DocumentVersion, DriveSource, DriveSourceStatus
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
+from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.knowledge.sync import DriveSyncService
 from app.modules.outbox.models import OutboxEvent
 
 DRIVE_SYNC_TASK_NAME = "app.modules.knowledge.tasks.drive_source_sync"
 DRIVE_SYNC_WORKER_ID = "celery-drive-sync"
 DRIVE_SYNC_LEASE_SECONDS = 300
+DOCUMENT_PARSE_TASK_NAME = "app.modules.knowledge.tasks.document_parse"
+DOCUMENT_PARSE_WORKER_ID = "celery-document-parse"
+DOCUMENT_PARSE_LEASE_SECONDS = 300
+DOCUMENT_PARSE_REQUESTED_EVENT_TYPE = "knowledge.document.parse.requested"
 
 
 class DocumentParseTask:
@@ -47,6 +53,12 @@ def drive_source_sync(job_id: str | None = None) -> None:
     asyncio.run(_run_drive_sync(job_id))
 
 
+@shared_task(name=DOCUMENT_PARSE_TASK_NAME)  # type: ignore[untyped-decorator]
+def document_parse(job_id: str) -> None:
+    """Consume one durable document-parse intent through the authorized service."""
+    asyncio.run(_consume_document_parse_intent(UUID(job_id)))
+
+
 @shared_task(name="app.modules.knowledge.tasks.dispatch_drive_sync_outbox_event")  # type: ignore[untyped-decorator]
 def dispatch_drive_sync_outbox_event(event_id: str) -> None:
     """At-least-once outbox delivery into the one Drive sync job consumer."""
@@ -57,6 +69,18 @@ def dispatch_drive_sync_outbox_event(event_id: str) -> None:
 def dispatch_pending_drive_sync_outbox_events() -> None:
     """Retry durable events left behind by a post-commit broker wakeup failure."""
     asyncio.run(_dispatch_pending_drive_sync_outbox_events())
+
+
+@shared_task(name="app.modules.knowledge.tasks.dispatch_document_parse_outbox_event")  # type: ignore[untyped-decorator]
+def dispatch_document_parse_outbox_event(event_id: str) -> None:
+    """At-least-once outbox delivery into one document-parse job consumer."""
+    asyncio.run(_dispatch_document_parse_outbox_event(UUID(event_id)))
+
+
+@shared_task(name="app.modules.knowledge.tasks.dispatch_pending_document_parse_outbox_events")  # type: ignore[untyped-decorator]
+def dispatch_pending_document_parse_outbox_events() -> None:
+    """Recover document-parse events left pending after broker wakeup loss."""
+    asyncio.run(_dispatch_pending_document_parse_outbox_events())
 
 
 async def _dispatch_drive_sync_outbox_event(
@@ -113,6 +137,138 @@ async def _dispatch_pending_drive_sync_outbox_events(
     )
     for event_id in event_ids:
         await _dispatch_drive_sync_outbox_event(event_id, db_session=db_session)
+
+
+async def _dispatch_document_parse_outbox_event(
+    event_id: UUID, *, db_session: AsyncSession | None = None
+) -> bool:
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            return await _dispatch_document_parse_outbox_event(event_id, db_session=owned_session)
+    event = await db_session.scalar(
+        select(OutboxEvent)
+        .where(OutboxEvent.event_id == event_id)
+        .execution_options(populate_existing=True)
+    )
+    if (
+        event is None
+        or event.event_type != DOCUMENT_PARSE_REQUESTED_EVENT_TYPE
+        or event.aggregate_type != "job"
+        or event.published_at is not None
+        or not await _parent_sync_succeeded(event, db_session)
+    ):
+        return False
+    try:
+        document_parse.delay(str(event.aggregate_id))
+    except Exception:
+        event.publish_attempts += 1
+        await db_session.commit()
+        raise
+    event.publish_attempts += 1
+    event.published_at = func.clock_timestamp()
+    await db_session.commit()
+    return True
+
+
+async def _dispatch_pending_document_parse_outbox_events(
+    *, db_session: AsyncSession | None = None
+) -> None:
+    """Sweep committed document-parse events that have no broker receipt."""
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            await _dispatch_pending_document_parse_outbox_events(db_session=owned_session)
+            return
+    event_ids = list(
+        (
+            await db_session.scalars(
+                select(OutboxEvent.event_id).where(
+                    OutboxEvent.event_type == DOCUMENT_PARSE_REQUESTED_EVENT_TYPE,
+                    OutboxEvent.published_at.is_(None),
+                )
+            )
+        ).all()
+    )
+    for event_id in event_ids:
+        await _dispatch_document_parse_outbox_event(event_id, db_session=db_session)
+
+
+async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
+    binding = await _validated_parse_event_binding(event, db_session)
+    if binding is None:
+        return False
+    _, source_id, _ = binding
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return False
+    if "parent_sync_job_id" not in payload:
+        return False
+    raw_parent_job_id = payload["parent_sync_job_id"]
+    if not isinstance(raw_parent_job_id, str):
+        return False
+    try:
+        parent_job_id = UUID(raw_parent_job_id)
+    except ValueError:
+        return False
+    return (
+        await db_session.scalar(
+            select(JobIntent.id).where(
+                JobIntent.id == parent_job_id,
+                JobIntent.kind == "knowledge.drive_source.sync",
+                JobIntent.state == JobState.SUCCEEDED,
+                JobIntent.payload["source_id"].as_string() == str(source_id),
+                JobIntent.updated_at >= event.occurred_at,
+            )
+        )
+    ) is not None
+
+
+async def _validated_parse_event_binding(
+    event: OutboxEvent, db_session: AsyncSession
+) -> tuple[UUID, UUID, UUID] | None:
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return None
+    raw_organization_id = payload.get("organization_id")
+    raw_source_id = payload.get("source_id")
+    raw_document_id = payload.get("document_id")
+    if (
+        not isinstance(raw_organization_id, str)
+        or not isinstance(raw_source_id, str)
+        or not isinstance(raw_document_id, str)
+    ):
+        return None
+    try:
+        organization_id = UUID(raw_organization_id)
+        source_id = UUID(raw_source_id)
+        document_id = UUID(raw_document_id)
+    except ValueError:
+        return None
+    parse_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.id == event.aggregate_id,
+            JobIntent.kind == "knowledge.document.parse",
+        )
+    )
+    if parse_job is None or not isinstance(parse_job.payload, Mapping):
+        return None
+    if (
+        parse_job.payload.get("document_id") != raw_document_id
+        or parse_job.payload.get("source_id") != raw_source_id
+    ):
+        return None
+    document_exists = await db_session.scalar(
+        select(Document.id)
+        .join(DriveSource, DriveSource.id == Document.source_id)
+        .where(
+            Document.id == document_id,
+            Document.organization_id == organization_id,
+            Document.source_id == source_id,
+            DriveSource.organization_id == organization_id,
+        )
+    )
+    if document_exists is None:
+        return None
+    return organization_id, source_id, document_id
 
 
 async def _run_drive_sync(job_id: str | None) -> None:
@@ -184,7 +340,11 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
                 db_session,
                 connector_service=connector_service,
                 drive_gateway_factory=gateway_factory,
-            ).sync(source_id, raw_page_token)
+            ).sync(
+                source_id,
+                raw_page_token,
+                parent_sync_job_id=job.id,
+            )
             if result.reauth_required:
                 await lease_service.retry(
                     job.id,
@@ -196,6 +356,13 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
             else:
                 await lease_service.complete(job.id, DRIVE_SYNC_WORKER_ID)
             await db_session.commit()
+            for event_id in result.parse_outbox_event_ids:
+                try:
+                    dispatch_document_parse_outbox_event.delay(str(event_id))
+                except Exception:
+                    # The committed event remains authoritative; the periodic
+                    # sweep recovers this best-effort broker wakeup.
+                    pass
         except JobLeaseLost:
             await db_session.rollback()
             raise
@@ -209,3 +376,39 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
             )
             await db_session.commit()
             raise
+
+
+async def _consume_document_parse_intent(job_id: UUID) -> None:
+    """Run the existing lease-fenced authorized parsing pipeline for one intent."""
+    async with async_sessionmaker() as db_session:
+        settings = Settings()
+        connector_service = ConnectorService.from_settings(settings)
+        gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
+        if connector_service is None or gateway_factory is None:
+            lease_service = JobLeaseService(db_session)
+            job = await lease_service.claim(
+                job_id,
+                DOCUMENT_PARSE_WORKER_ID,
+                DOCUMENT_PARSE_LEASE_SECONDS,
+            )
+            if job is None:
+                return
+            await lease_service.retry(
+                job.id,
+                DOCUMENT_PARSE_WORKER_ID,
+                error_code="DOCUMENT_PARSE_TRANSIENT_FAILURE",
+                error_class=ErrorClass.RETRYABLE,
+                expected_version=job.version,
+            )
+            await db_session.commit()
+            raise RuntimeError("Google Drive connector credentials are not configured")
+        service = DocumentIngestionService(
+            db_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                gateway_factory,
+            ),
+            worker_id=DOCUMENT_PARSE_WORKER_ID,
+            job_lease_seconds=DOCUMENT_PARSE_LEASE_SECONDS,
+        )
+        await service.parse(job_id)
