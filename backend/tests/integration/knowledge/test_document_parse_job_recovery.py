@@ -59,12 +59,14 @@ class _EmbeddingProvider:
         return [[1.0] * 1536 for _ in texts]
 
 
-async def _successful_parent_sync_job(db_session) -> JobIntent:  # type: ignore[no-untyped-def]
+async def _successful_parent_sync_job(
+    db_session, *, source_id: UUID | None = None
+) -> JobIntent:  # type: ignore[no-untyped-def]
     job = await JobService().enqueue(
         db_session,
         "knowledge.drive_source.sync",
         f"document-parse-parent-sync-{uuid4()}",
-        {"source_id": str(uuid4())},
+        {"source_id": str(source_id or uuid4())},
     )
     job.state = JobState.SUCCEEDED
     await db_session.flush()
@@ -121,6 +123,7 @@ async def _parse_job_fixture(
         f"document-parse-task-{uuid4()}",
         {
             "document_id": str(document.id),
+            "source_id": str(source.id),
             "drive_file": {
                 "id": "drive-file-1",
                 "name": "policy.pdf",
@@ -181,16 +184,22 @@ def test_document_parse_outbox_sweeper_is_scheduled_for_restart_recovery() -> No
 
 @pytest.mark.asyncio
 async def test_document_parse_outbox_dispatches_once_and_publishes_after_broker_acceptance(
-    db_session, monkeypatch
+    db_session, monkeypatch, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]
-    job_id = uuid4()
-    parent_job = await _successful_parent_sync_job(db_session)
+    parse_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    document = await db_session.get(Document, UUID(str(parse_job.payload["document_id"])))
+    assert document is not None
+    parent_job = await _successful_parent_sync_job(db_session, source_id=document.source_id)
     event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
-        aggregate_id=job_id,
+        aggregate_id=parse_job.id,
         payload={
-            "document_id": str(uuid4()),
+            "organization_id": str(document.organization_id),
+            "source_id": str(document.source_id),
+            "document_id": str(document.id),
             "parent_sync_job_id": str(parent_job.id),
         },
     )
@@ -203,22 +212,29 @@ async def test_document_parse_outbox_dispatches_once_and_publishes_after_broker_
     assert not await _dispatch_document_parse_outbox_event(event.event_id, db_session=db_session)
 
     await db_session.refresh(event)
-    assert delivered == [str(job_id)]
+    assert delivered == [str(parse_job.id)]
     assert event.published_at is not None
     assert event.publish_attempts == 1
 
 
 @pytest.mark.asyncio
 async def test_document_parse_broker_failure_leaves_event_unpublished_for_recovery(
-    db_session, monkeypatch
+    db_session, monkeypatch, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]
-    parent_job = await _successful_parent_sync_job(db_session)
+    parse_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    document = await db_session.get(Document, UUID(str(parse_job.payload["document_id"])))
+    assert document is not None
+    parent_job = await _successful_parent_sync_job(db_session, source_id=document.source_id)
     event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
-        aggregate_id=uuid4(),
+        aggregate_id=parse_job.id,
         payload={
-            "document_id": str(uuid4()),
+            "organization_id": str(document.organization_id),
+            "source_id": str(document.source_id),
+            "document_id": str(document.id),
             "parent_sync_job_id": str(parent_job.id),
         },
     )
@@ -239,16 +255,22 @@ async def test_document_parse_broker_failure_leaves_event_unpublished_for_recove
 
 @pytest.mark.asyncio
 async def test_document_parse_pending_sweeper_recovers_unpublished_events(
-    db_session, monkeypatch
+    db_session, monkeypatch, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]
-    job_id = uuid4()
-    parent_job = await _successful_parent_sync_job(db_session)
+    parse_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    document = await db_session.get(Document, UUID(str(parse_job.payload["document_id"])))
+    assert document is not None
+    parent_job = await _successful_parent_sync_job(db_session, source_id=document.source_id)
     event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
-        aggregate_id=job_id,
+        aggregate_id=parse_job.id,
         payload={
-            "document_id": str(uuid4()),
+            "organization_id": str(document.organization_id),
+            "source_id": str(document.source_id),
+            "document_id": str(document.id),
             "parent_sync_job_id": str(parent_job.id),
         },
     )
@@ -260,34 +282,35 @@ async def test_document_parse_pending_sweeper_recovers_unpublished_events(
     await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
 
     await db_session.refresh(event)
-    assert delivered == [str(job_id)]
+    assert delivered == [str(parse_job.id)]
     assert event.published_at is not None
     assert event.publish_attempts == 1
 
 
 @pytest.mark.asyncio
 async def test_document_parse_sweeper_waits_for_its_parent_sync_job_to_succeed(
-    db_session, monkeypatch
+    db_session, monkeypatch, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]
     service = JobService()
+    parse_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    document = await db_session.get(Document, UUID(str(parse_job.payload["document_id"])))
+    assert document is not None
     parent_job = await service.enqueue(
         db_session,
         "knowledge.drive_source.sync",
         f"document-parse-parent-sync-{uuid4()}",
-        {"source_id": str(uuid4())},
-    )
-    parse_job = await service.enqueue(
-        db_session,
-        "knowledge.document.parse",
-        f"document-parse-child-{uuid4()}",
-        {"document_id": str(uuid4())},
+        {"source_id": str(document.source_id)},
     )
     event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
         aggregate_id=parse_job.id,
         payload={
-            "document_id": str(uuid4()),
+            "organization_id": str(document.organization_id),
+            "source_id": str(document.source_id),
+            "document_id": str(document.id),
             "parent_sync_job_id": str(parent_job.id),
         },
     )
@@ -334,6 +357,7 @@ async def test_legacy_document_parse_event_recovers_after_matching_sync_succeeds
         aggregate_type="job",
         aggregate_id=parse_job.id,
         payload={
+            "organization_id": str(document.organization_id),
             "document_id": str(document.id),
             "source_id": str(document.source_id),
         },
@@ -378,6 +402,7 @@ async def test_legacy_document_parse_event_rejects_a_different_source_sync(
         aggregate_type="job",
         aggregate_id=parse_job.id,
         payload={
+            "organization_id": str(document.organization_id),
             "document_id": str(document.id),
             "source_id": str(document.source_id),
         },
@@ -418,6 +443,7 @@ async def test_document_parse_event_with_null_parent_provenance_fails_closed(
         aggregate_type="job",
         aggregate_id=parse_job.id,
         payload={
+            "organization_id": str(document.organization_id),
             "document_id": str(document.id),
             "source_id": str(document.source_id),
             "parent_sync_job_id": None,
@@ -445,7 +471,9 @@ async def test_malformed_parse_event_does_not_block_following_valid_recovery(
     parse_job, _, _ = await _parse_job_fixture(
         db_session, tmp_path, mime_type="application/pdf"
     )
-    parent_job = await _successful_parent_sync_job(db_session)
+    document = await db_session.get(Document, UUID(str(parse_job.payload["document_id"])))
+    assert document is not None
+    parent_job = await _successful_parent_sync_job(db_session, source_id=document.source_id)
     malformed_event = OutboxEvent(
         event_type="knowledge.document.parse.requested",
         aggregate_type="job",
@@ -457,6 +485,8 @@ async def test_malformed_parse_event_does_not_block_following_valid_recovery(
         aggregate_type="job",
         aggregate_id=parse_job.id,
         payload={
+            "organization_id": str(document.organization_id),
+            "source_id": str(document.source_id),
             "document_id": str(parse_job.payload["document_id"]),
             "parent_sync_job_id": str(parent_job.id),
         },
@@ -473,6 +503,105 @@ async def test_malformed_parse_event_does_not_block_following_valid_recovery(
     assert malformed_event.published_at is None
     assert malformed_event.publish_attempts == 0
     assert delivered == [str(parse_job.id)]
+    assert valid_event.published_at is not None
+
+
+@pytest.mark.asyncio
+async def test_new_parse_event_with_missing_or_malformed_binding_fails_closed(
+    db_session, monkeypatch, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    parse_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    document_id = UUID(str(parse_job.payload["document_id"]))
+    document = await db_session.get(Document, document_id)
+    assert document is not None
+    parent_job = await _successful_parent_sync_job(db_session, source_id=document.source_id)
+    malformed_events = [
+        OutboxEvent(
+            event_type="knowledge.document.parse.requested",
+            aggregate_type="job",
+            aggregate_id=parse_job.id,
+            payload={"parent_sync_job_id": str(parent_job.id)},
+        ),
+        OutboxEvent(
+            event_type="knowledge.document.parse.requested",
+            aggregate_type="job",
+            aggregate_id=parse_job.id,
+            payload={
+                "organization_id": str(document.organization_id),
+                "source_id": 7,
+                "document_id": str(document.id),
+                "parent_sync_job_id": str(parent_job.id),
+            },
+        ),
+    ]
+    db_session.add_all(malformed_events)
+    await db_session.commit()
+    delivered: list[str] = []
+    monkeypatch.setattr(document_parse, "delay", delivered.append)
+
+    await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
+
+    for event in malformed_events:
+        await db_session.refresh(event)
+        assert event.published_at is None
+        assert event.publish_attempts == 0
+    assert delivered == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_legacy_parse_job_payload_does_not_block_valid_recovery(
+    db_session, monkeypatch, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    malformed_job, _, _ = await _parse_job_fixture(
+        db_session, tmp_path, mime_type="application/pdf"
+    )
+    malformed_document_id = UUID(str(malformed_job.payload["document_id"]))
+    malformed_document = await db_session.get(Document, malformed_document_id)
+    assert malformed_document is not None
+    malformed_job.payload = []  # type: ignore[assignment]
+    malformed_event = OutboxEvent(
+        event_type="knowledge.document.parse.requested",
+        aggregate_type="job",
+        aggregate_id=malformed_job.id,
+        payload={
+            "organization_id": str(malformed_document.organization_id),
+            "source_id": str(malformed_document.source_id),
+            "document_id": str(malformed_document.id),
+        },
+    )
+    valid_job, _, _ = await _parse_job_fixture(
+        db_session,
+        tmp_path,
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    valid_document_id = UUID(str(valid_job.payload["document_id"]))
+    valid_document = await db_session.get(Document, valid_document_id)
+    assert valid_document is not None
+    valid_parent = await _successful_parent_sync_job(db_session, source_id=valid_document.source_id)
+    valid_event = OutboxEvent(
+        event_type="knowledge.document.parse.requested",
+        aggregate_type="job",
+        aggregate_id=valid_job.id,
+        payload={
+            "organization_id": str(valid_document.organization_id),
+            "source_id": str(valid_document.source_id),
+            "document_id": str(valid_document.id),
+            "parent_sync_job_id": str(valid_parent.id),
+        },
+    )
+    db_session.add_all([malformed_event, valid_event])
+    await db_session.commit()
+    delivered: list[str] = []
+    monkeypatch.setattr(document_parse, "delay", delivered.append)
+
+    await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
+
+    await db_session.refresh(malformed_event)
+    await db_session.refresh(valid_event)
+    assert malformed_event.published_at is None
+    assert delivered == [str(valid_job.id)]
     assert valid_event.published_at is not None
 
 

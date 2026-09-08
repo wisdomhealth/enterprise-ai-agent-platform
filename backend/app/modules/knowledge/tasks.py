@@ -192,11 +192,15 @@ async def _dispatch_pending_document_parse_outbox_events(
 
 
 async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
+    binding = await _validated_parse_event_binding(event, db_session)
+    if binding is None:
+        return False
+    _, source_id, _ = binding
     payload = event.payload
     if not isinstance(payload, Mapping):
         return False
     if "parent_sync_job_id" not in payload:
-        return await _legacy_parse_event_sync_succeeded(event, db_session)
+        return await _legacy_parse_event_sync_succeeded(event, source_id, db_session)
     raw_parent_job_id = payload["parent_sync_job_id"]
     if not isinstance(raw_parent_job_id, str):
         return False
@@ -210,12 +214,64 @@ async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -
                 JobIntent.id == parent_job_id,
                 JobIntent.kind == "knowledge.drive_source.sync",
                 JobIntent.state == JobState.SUCCEEDED,
+                JobIntent.payload["source_id"].as_string() == str(source_id),
             )
         )
     ) is not None
 
 
-async def _legacy_parse_event_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
+async def _validated_parse_event_binding(
+    event: OutboxEvent, db_session: AsyncSession
+) -> tuple[UUID, UUID, UUID] | None:
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return None
+    raw_organization_id = payload.get("organization_id")
+    raw_source_id = payload.get("source_id")
+    raw_document_id = payload.get("document_id")
+    if (
+        not isinstance(raw_organization_id, str)
+        or not isinstance(raw_source_id, str)
+        or not isinstance(raw_document_id, str)
+    ):
+        return None
+    try:
+        organization_id = UUID(raw_organization_id)
+        source_id = UUID(raw_source_id)
+        document_id = UUID(raw_document_id)
+    except ValueError:
+        return None
+    parse_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.id == event.aggregate_id,
+            JobIntent.kind == "knowledge.document.parse",
+        )
+    )
+    if parse_job is None or not isinstance(parse_job.payload, Mapping):
+        return None
+    if (
+        parse_job.payload.get("document_id") != raw_document_id
+        or parse_job.payload.get("source_id") != raw_source_id
+    ):
+        return None
+    document_exists = await db_session.scalar(
+        select(Document.id)
+        .join(DriveSource, DriveSource.id == Document.source_id)
+        .where(
+            Document.id == document_id,
+            Document.organization_id == organization_id,
+            Document.source_id == source_id,
+            DriveSource.organization_id == organization_id,
+        )
+    )
+    if document_exists is None:
+        return None
+    return organization_id, source_id, document_id
+
+
+async def _legacy_parse_event_sync_succeeded(
+    event: OutboxEvent, source_id: UUID, db_session: AsyncSession
+) -> bool:
     """Recover pre-provenance parse events only from matching durable source facts.
 
     Older events did not retain their originating sync JobIntent ID.  They can
@@ -223,38 +279,12 @@ async def _legacy_parse_event_sync_succeeded(event: OutboxEvent, db_session: Asy
     durable and a sync for that same source completed after the event was
     committed.  New events must use the stricter exact parent ID above.
     """
-    raw_document_id = event.payload.get("document_id")
-    raw_source_id = event.payload.get("source_id")
-    if not isinstance(raw_document_id, str) or not isinstance(raw_source_id, str):
-        return False
-    try:
-        document_id = UUID(raw_document_id)
-        source_id = UUID(raw_source_id)
-    except ValueError:
-        return False
-
-    parse_job = await db_session.scalar(
-        select(JobIntent).where(
-            JobIntent.id == event.aggregate_id,
-            JobIntent.kind == "knowledge.document.parse",
-        )
-    )
-    if parse_job is None or parse_job.payload.get("document_id") != raw_document_id:
-        return False
-    document_exists = await db_session.scalar(
-        select(Document.id).where(
-            Document.id == document_id,
-            Document.source_id == source_id,
-        )
-    )
-    if document_exists is None:
-        return False
     return (
         await db_session.scalar(
             select(JobIntent.id).where(
                 JobIntent.kind == "knowledge.drive_source.sync",
                 JobIntent.state == JobState.SUCCEEDED,
-                JobIntent.payload["source_id"].as_string() == raw_source_id,
+                JobIntent.payload["source_id"].as_string() == str(source_id),
                 JobIntent.updated_at >= event.occurred_at,
             )
         )
