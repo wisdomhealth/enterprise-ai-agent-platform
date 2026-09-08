@@ -8,6 +8,14 @@ not a developer account.
 | Environment variable | Owner | Description |
 |---|---|---|
 | `DATABASE_URL` | Platform operations | Application PostgreSQL role and endpoint reference. |
+| `DATABASE_POOL_SIZE` | Platform operations | Per-FastAPI-process bounded SQLAlchemy connection pool size. |
+| `DATABASE_MAX_OVERFLOW` | Platform operations | Per-FastAPI-process bounded temporary SQLAlchemy overflow capacity. |
+| `API_PROCESS_COUNT` | Platform operations | Number of FastAPI worker processes included in the database connection budget. |
+| `CELERY_WORKER_CONCURRENCY` | Platform operations | Per-worker prefork concurrency included in the database connection budget. |
+| `CELERY_WORKER_INSTANCES` | Platform operations | Number of Celery worker processes included in the database connection budget. |
+| `CELERY_TASK_CONNECTION_PEAK` | Platform operations | Maximum simultaneous database sessions per Celery task, including lease renewal. |
+| `POSTGRES_ADMIN_MIGRATION_RESERVE` | Data platform | PostgreSQL connections reserved for migrations, administration, and recovery. |
+| `POSTGRES_MAX_CONNECTIONS` | Data platform | PostgreSQL connection ceiling validated against the application connection budget. |
 | `MIGRATION_DATABASE_URL` | Platform operations | Separate migration principal and endpoint reference. |
 | `POSTGRES_DB` | Platform operations | Production database name. |
 | `POSTGRES_USER` | Platform operations | PostgreSQL application-role name. |

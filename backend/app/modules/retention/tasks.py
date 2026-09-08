@@ -8,7 +8,7 @@ from celery import shared_task  # type: ignore[import-untyped]
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import async_sessionmaker
+from app.core.database import celery_async_sessionmaker as async_sessionmaker
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.outbox.service import OutboxService

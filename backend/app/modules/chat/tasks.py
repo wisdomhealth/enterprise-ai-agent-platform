@@ -7,7 +7,7 @@ from celery import shared_task  # type: ignore[import-untyped]
 from sqlalchemy import and_, func, or_, select
 
 from app.core.config import Settings
-from app.core.database import async_sessionmaker
+from app.core.database import celery_async_sessionmaker as async_sessionmaker
 from app.modules.chat.answering import CHAT_ANSWER_KIND, ChatAnswerService, CustomerAnswerService
 from app.modules.chat.sse import RedisChatEventPublisher
 from app.modules.jobs.models import JobIntent, JobState
@@ -37,7 +37,10 @@ async def _consume_chat_answer(job_id: UUID) -> None:
     settings = Settings()
     async with async_sessionmaker() as db_session:
         try:
-            answer_service: CustomerAnswerService = GroundedAnswerService.from_settings(settings)
+            answer_service: CustomerAnswerService = GroundedAnswerService.from_settings(
+                settings,
+                session_factory=async_sessionmaker,
+            )
         except RuntimeError:
             answer_service = _UnavailableAnswerService(settings.grounded_refusal_message)
         publisher = None

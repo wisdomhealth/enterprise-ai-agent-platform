@@ -9,7 +9,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.database import async_sessionmaker
+from app.core.database import celery_async_sessionmaker as async_sessionmaker
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
 from app.modules.email.actors import email_worker_principal
@@ -470,7 +470,7 @@ async def _consume_draft(
     if item is None:
         raise LookupError("email work item not found")
     principal = email_worker_principal(item.organization_id, item.knowledge_base_id, job.id)
-    grounded = GroundedAnswerService.from_settings(settings)
+    grounded = GroundedAnswerService.from_settings(settings, session_factory=async_sessionmaker)
     await EmailDraftingService(db_session, grounded, principal).generate(item.id, job_id=job.id)
 
 
