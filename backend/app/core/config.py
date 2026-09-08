@@ -14,6 +14,54 @@ class Settings(BaseSettings):
     )
 
     database_url: PostgresDsn | None = Field(default=None, validation_alias="DATABASE_URL")
+    database_pool_size: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        validation_alias="DATABASE_POOL_SIZE",
+    )
+    database_max_overflow: int = Field(
+        default=5,
+        ge=0,
+        le=50,
+        validation_alias="DATABASE_MAX_OVERFLOW",
+    )
+    api_process_count: int = Field(
+        default=1,
+        ge=1,
+        le=50,
+        validation_alias="API_PROCESS_COUNT",
+    )
+    celery_worker_concurrency: int = Field(
+        default=4,
+        ge=1,
+        le=100,
+        validation_alias="CELERY_WORKER_CONCURRENCY",
+    )
+    celery_worker_instances: int = Field(
+        default=1,
+        ge=1,
+        le=50,
+        validation_alias="CELERY_WORKER_INSTANCES",
+    )
+    celery_task_connection_peak: int = Field(
+        default=2,
+        ge=2,
+        le=10,
+        validation_alias="CELERY_TASK_CONNECTION_PEAK",
+    )
+    postgres_admin_migration_reserve: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        validation_alias="POSTGRES_ADMIN_MIGRATION_RESERVE",
+    )
+    postgres_max_connections: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        validation_alias="POSTGRES_MAX_CONNECTIONS",
+    )
     migration_database_url: PostgresDsn | None = Field(
         default=None,
         validation_alias="MIGRATION_DATABASE_URL",

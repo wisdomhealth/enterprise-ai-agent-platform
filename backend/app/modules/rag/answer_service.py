@@ -4,6 +4,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from uuid import UUID
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from app.core.config import Settings
 from app.core.telemetry import (
     record_grounded_answer,
@@ -66,11 +68,15 @@ class GroundedAnswerService:
         self._telemetry = telemetry
 
     @classmethod
-    def from_settings(cls, settings: "Settings") -> "GroundedAnswerService":
+    def from_settings(
+        cls,
+        settings: "Settings",
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> "GroundedAnswerService":
         """Build the live read-only RAG path from explicitly configured providers."""
         from redis.asyncio import from_url
 
-        from app.core.database import async_sessionmaker
         from app.modules.rag.embeddings import OpenAIEmbeddingProvider
         from app.modules.rag.llm import AnthropicGenerationProvider, RedisCircuitStore
         from app.modules.rag.retriever import HybridRetriever
@@ -83,9 +89,14 @@ class GroundedAnswerService:
             raise RuntimeError(
                 "OPENAI_API_KEY, ANTHROPIC_API_KEY, and REDIS_URL are required for Staff Assist"
             )
+        if session_factory is None:
+            # Request-path callers intentionally use FastAPI's bounded pool.
+            from app.core.database import async_sessionmaker as request_sessionmaker
+
+            session_factory = request_sessionmaker
         embedding_provider = OpenAIEmbeddingProvider.from_settings(settings)
         retriever = HybridRetriever.from_session_factory(
-            async_sessionmaker,
+            session_factory,
             embedding_provider,
             reranker_enabled=settings.reranker_enabled,
         )

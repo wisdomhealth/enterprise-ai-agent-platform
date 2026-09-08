@@ -19,6 +19,7 @@ def create_celery(settings: Settings | None = None) -> Celery:
         task_ignore_result=True,
         task_acks_late=True,
         task_reject_on_worker_lost=True,
+        worker_concurrency=settings.celery_worker_concurrency,
         broker_connection_retry_on_startup=True,
         beat_schedule={
             "knowledge-drive-source-sync": {
