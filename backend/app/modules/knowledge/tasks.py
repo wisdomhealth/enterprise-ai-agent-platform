@@ -1,7 +1,7 @@
 """Executable Celery consumer for durable Drive synchronization intents."""
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
 
 from celery import shared_task  # type: ignore[import-untyped]
@@ -192,9 +192,12 @@ async def _dispatch_pending_document_parse_outbox_events(
 
 
 async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
-    if "parent_sync_job_id" not in event.payload:
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return False
+    if "parent_sync_job_id" not in payload:
         return await _legacy_parse_event_sync_succeeded(event, db_session)
-    raw_parent_job_id = event.payload["parent_sync_job_id"]
+    raw_parent_job_id = payload["parent_sync_job_id"]
     if not isinstance(raw_parent_job_id, str):
         return False
     try:
