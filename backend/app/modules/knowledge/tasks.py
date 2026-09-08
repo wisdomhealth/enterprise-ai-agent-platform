@@ -201,7 +201,7 @@ async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -
     if not isinstance(payload, Mapping):
         return False
     if "parent_sync_job_id" not in payload:
-        return await _legacy_parse_event_sync_succeeded(event, source_id, db_session)
+        return False
     raw_parent_job_id = payload["parent_sync_job_id"]
     if not isinstance(raw_parent_job_id, str):
         return False
@@ -269,28 +269,6 @@ async def _validated_parse_event_binding(
     if document_exists is None:
         return None
     return organization_id, source_id, document_id
-
-
-async def _legacy_parse_event_sync_succeeded(
-    event: OutboxEvent, source_id: UUID, db_session: AsyncSession
-) -> bool:
-    """Recover pre-provenance parse events only from matching durable source facts.
-
-    Older events did not retain their originating sync JobIntent ID.  They can
-    still be safely released when their exact document/source binding is
-    durable and a sync for that same source completed after the event was
-    committed.  New events must use the stricter exact parent ID above.
-    """
-    return (
-        await db_session.scalar(
-            select(JobIntent.id).where(
-                JobIntent.kind == "knowledge.drive_source.sync",
-                JobIntent.state == JobState.SUCCEEDED,
-                JobIntent.payload["source_id"].as_string() == str(source_id),
-                JobIntent.updated_at >= event.occurred_at,
-            )
-        )
-    ) is not None
 
 
 async def _run_drive_sync(job_id: str | None) -> None:

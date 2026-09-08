@@ -374,7 +374,7 @@ async def test_document_parse_event_rejects_an_older_successful_parent_sync(
 
 
 @pytest.mark.asyncio
-async def test_legacy_document_parse_event_recovers_after_matching_sync_succeeds(
+async def test_legacy_document_parse_event_without_exact_parent_fails_closed(
     db_session, monkeypatch, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]
     """Pre-parent-provenance events remain recoverable only after their source sync succeeds."""
@@ -415,8 +415,9 @@ async def test_legacy_document_parse_event_recovers_after_matching_sync_succeeds
     await _dispatch_pending_document_parse_outbox_events(db_session=db_session)
 
     await db_session.refresh(event)
-    assert delivered == [str(parse_job.id)]
-    assert event.published_at is not None
+    assert delivered == []
+    assert event.published_at is None
+    assert event.publish_attempts == 0
 
 
 @pytest.mark.asyncio
