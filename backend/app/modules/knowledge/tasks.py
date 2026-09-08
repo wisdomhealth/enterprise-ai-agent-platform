@@ -192,9 +192,9 @@ async def _dispatch_pending_document_parse_outbox_events(
 
 
 async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
-    raw_parent_job_id = event.payload.get("parent_sync_job_id")
-    if raw_parent_job_id is None:
+    if "parent_sync_job_id" not in event.payload:
         return await _legacy_parse_event_sync_succeeded(event, db_session)
+    raw_parent_job_id = event.payload["parent_sync_job_id"]
     if not isinstance(raw_parent_job_id, str):
         return False
     try:
