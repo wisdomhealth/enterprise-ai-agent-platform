@@ -49,6 +49,7 @@ class SyncResult:
     revoked_documents: int
     isolated_files: int
     reauth_required: bool = False
+    parse_outbox_event_ids: tuple[UUID, ...] = ()
 
 
 def drive_sync_job_key(source_id: UUID | str, cursor: str | None) -> str:
@@ -120,6 +121,7 @@ class DriveSyncService:
             raise
 
         enqueued = revoked = isolated = 0
+        parse_outbox_event_ids: list[UUID] = []
         for drive_file in files:
             if drive_file.removed or not self._is_file_authorized(source, drive_file):
                 did_revoke = await self._revoke_file(source, drive_file.id)
@@ -129,7 +131,7 @@ class DriveSyncService:
             if drive_file.mime_type not in SUPPORTED_DOCUMENT_MIME_TYPES:
                 continue
             document = await self._upsert_document(source, drive_file)
-            await self._enqueue_parse(source, document, drive_file)
+            parse_outbox_event_ids.append(await self._enqueue_parse(source, document, drive_file))
             enqueued += 1
 
         # This assignment and all page effects are committed together below.  A
@@ -137,7 +139,14 @@ class DriveSyncService:
         source.sync_cursor = next_cursor
         source.status = DriveSourceStatus.ACTIVE
         await self._db_session.commit()
-        return SyncResult(source.id, next_cursor, enqueued, revoked, isolated)
+        return SyncResult(
+            source.id,
+            next_cursor,
+            enqueued,
+            revoked,
+            isolated,
+            parse_outbox_event_ids=tuple(parse_outbox_event_ids),
+        )
 
     async def _list_changes(
         self, source: DriveSource, sync_cursor: str | None
@@ -219,7 +228,7 @@ class DriveSyncService:
 
     async def _enqueue_parse(
         self, source: DriveSource, document: Document, drive_file: DriveFile
-    ) -> None:
+    ) -> UUID:
         assert self._db_session is not None
         modified = (
             drive_file.modified_time.astimezone(UTC).isoformat() if drive_file.modified_time else ""
@@ -241,7 +250,7 @@ class DriveSyncService:
         job = await self._job_service.enqueue(
             self._db_session, "knowledge.document.parse", key, payload
         )
-        await self._outbox_service.add(
+        event = await self._outbox_service.add(
             self._db_session,
             "knowledge.document.parse.requested",
             "job",
@@ -252,6 +261,7 @@ class DriveSyncService:
                 "document_id": str(document.id),
             },
         )
+        return event.event_id
 
     async def _revoke_file(self, source: DriveSource, file_id: str) -> bool:
         assert self._db_session is not None

@@ -271,6 +271,13 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
             else:
                 await lease_service.complete(job.id, DRIVE_SYNC_WORKER_ID)
             await db_session.commit()
+            for event_id in result.parse_outbox_event_ids:
+                try:
+                    dispatch_document_parse_outbox_event.delay(str(event_id))
+                except Exception:
+                    # The committed event remains authoritative; the periodic
+                    # sweep recovers this best-effort broker wakeup.
+                    pass
         except JobLeaseLost:
             await db_session.rollback()
             raise

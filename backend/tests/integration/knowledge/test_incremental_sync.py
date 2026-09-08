@@ -10,6 +10,7 @@ from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import Document, DriveSource, KnowledgeBase
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.sync import DriveSyncService
+from app.modules.outbox.models import OutboxEvent
 
 
 class FakeDriveChangeBoundary:
@@ -84,6 +85,14 @@ async def test_cursor_advances_only_after_page_is_persisted(db_session) -> None:
     assert persisted.sync_cursor == "cursor-2"
     assert await db_session.scalar(select(func.count(Document.id))) == 1
     assert await db_session.scalar(select(func.count(JobIntent.id))) == 1
+    parse_events = (
+        await db_session.scalars(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "knowledge.document.parse.requested"
+            )
+        )
+    ).all()
+    assert result.parse_outbox_event_ids == (parse_events[0].event_id,)
     assert boundary.calls == [(str(source_id), "cursor-1")]
 
 
