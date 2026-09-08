@@ -300,7 +300,7 @@ async def enqueue_drive_sync_intent(
         JobState.RECONCILIATION,
     ):
         return EnqueuedDriveSync(job=existing, outbox_event_id=None)
-    idempotency_key = base_key if existing is None else f"{base_key}:run:{existing.version}"
+    idempotency_key = base_key if existing is None else f"{base_key}:run:{existing.id}"
     job = await job_service.enqueue(
         db_session,
         "knowledge.drive_source.sync",

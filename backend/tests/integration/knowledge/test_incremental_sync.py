@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -135,13 +136,123 @@ async def test_next_periodic_run_uses_a_new_intent_after_prior_success(db_sessio
     source = await _source(db_session)
     first = (await enqueue_drive_sync_intent(db_session, source)).job
     first.state = JobState.SUCCEEDED
-    first.version += 1
     await db_session.commit()
 
     second = (await enqueue_drive_sync_intent(db_session, source)).job
 
     assert second.id != first.id
     assert second.state is JobState.PENDING
+    assert first.idempotency_key == f"knowledge-drive-sync:{source.id}:cursor-1"
+    assert second.idempotency_key == f"{first.idempotency_key}:run:{first.id}"
+
+
+@pytest.mark.asyncio
+async def test_terminal_jobs_with_matching_versions_still_create_a_distinct_successor(
+) -> None:  # type: ignore[no-untyped-def]
+    async with async_sessionmaker() as setup_session:
+        source = await _source(setup_session)
+        source_id = source.id
+        organization_id = source.organization_id
+
+    async with async_sessionmaker() as first_session:
+        source = await first_session.get(DriveSource, source_id)
+        assert source is not None
+        first = (await enqueue_drive_sync_intent(first_session, source)).job
+        first.state = JobState.SUCCEEDED
+        first.version = 3
+        await first_session.commit()
+        first_id = first.id
+
+    async with async_sessionmaker() as second_session:
+        source = await second_session.get(DriveSource, source_id)
+        assert source is not None
+        second = (await enqueue_drive_sync_intent(second_session, source)).job
+        second.state = JobState.SUCCEEDED
+        second.version = 3
+        await second_session.commit()
+        second_id = second.id
+        second_key = second.idempotency_key
+
+    async with async_sessionmaker() as third_session:
+        source = await third_session.get(DriveSource, source_id)
+        assert source is not None
+        third = (await enqueue_drive_sync_intent(third_session, source)).job
+        await third_session.commit()
+        third_id = third.id
+        third_key = third.idempotency_key
+
+    assert len({first_id, second_id, third_id}) == 3
+    assert second_key.endswith(f":run:{first_id}")
+    assert third_key.endswith(f":run:{second_id}")
+
+    async with async_sessionmaker() as cleanup_session:
+        organization = await cleanup_session.get(Organization, organization_id)
+        assert organization is not None
+        await cleanup_session.delete(organization)
+        await cleanup_session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    (JobState.PENDING, JobState.RUNNING, JobState.RECONCILIATION),
+)
+async def test_active_sync_intent_is_reused(db_session, state: JobState) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session)
+    first = (await enqueue_drive_sync_intent(db_session, source)).job
+    first.state = state
+    await db_session.commit()
+
+    second = (await enqueue_drive_sync_intent(db_session, source)).job
+
+    assert second.id == first.id
+
+
+@pytest.mark.asyncio
+async def test_concurrent_enqueue_from_one_terminal_predecessor_creates_one_successor(
+) -> None:  # type: ignore[no-untyped-def]
+    async with async_sessionmaker() as setup_session:
+        source = await _source(setup_session)
+        source_id = source.id
+        organization_id = source.organization_id
+        first = (await enqueue_drive_sync_intent(setup_session, source)).job
+        first.state = JobState.SUCCEEDED
+        await setup_session.commit()
+        first_id = first.id
+        first_key = first.idempotency_key
+
+    async def enqueue_once():  # type: ignore[no-untyped-def]
+        async with async_sessionmaker() as session:
+            current_source = await session.get(DriveSource, source_id)
+            assert current_source is not None
+            enqueued = await enqueue_drive_sync_intent(session, current_source)
+            await session.commit()
+            return enqueued.job.id
+
+    first_successor_id, second_successor_id = await asyncio.gather(
+        enqueue_once(), enqueue_once()
+    )
+
+    assert first_successor_id == second_successor_id
+    async with async_sessionmaker() as verification_session:
+        jobs = (
+            await verification_session.scalars(
+                select(JobIntent).where(
+                    JobIntent.kind == "knowledge.drive_source.sync",
+                    (JobIntent.idempotency_key == first_key)
+                    | JobIntent.idempotency_key.like(f"{first_key}:run:%"),
+                )
+            )
+        ).all()
+    successors = [job for job in jobs if job.id != first_id]
+    assert len(successors) == 1
+    assert successors[0].idempotency_key == f"{first_key}:run:{first_id}"
+
+    async with async_sessionmaker() as cleanup_session:
+        organization = await cleanup_session.get(Organization, organization_id)
+        assert organization is not None
+        await cleanup_session.delete(organization)
+        await cleanup_session.commit()
 
 
 @pytest.mark.asyncio
