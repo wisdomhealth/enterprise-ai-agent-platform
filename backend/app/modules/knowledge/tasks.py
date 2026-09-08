@@ -193,6 +193,8 @@ async def _dispatch_pending_document_parse_outbox_events(
 
 async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
     raw_parent_job_id = event.payload.get("parent_sync_job_id")
+    if raw_parent_job_id is None:
+        return await _legacy_parse_event_sync_succeeded(event, db_session)
     if not isinstance(raw_parent_job_id, str):
         return False
     try:
@@ -205,6 +207,52 @@ async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -
                 JobIntent.id == parent_job_id,
                 JobIntent.kind == "knowledge.drive_source.sync",
                 JobIntent.state == JobState.SUCCEEDED,
+            )
+        )
+    ) is not None
+
+
+async def _legacy_parse_event_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
+    """Recover pre-provenance parse events only from matching durable source facts.
+
+    Older events did not retain their originating sync JobIntent ID.  They can
+    still be safely released when their exact document/source binding is
+    durable and a sync for that same source completed after the event was
+    committed.  New events must use the stricter exact parent ID above.
+    """
+    raw_document_id = event.payload.get("document_id")
+    raw_source_id = event.payload.get("source_id")
+    if not isinstance(raw_document_id, str) or not isinstance(raw_source_id, str):
+        return False
+    try:
+        document_id = UUID(raw_document_id)
+        source_id = UUID(raw_source_id)
+    except ValueError:
+        return False
+
+    parse_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.id == event.aggregate_id,
+            JobIntent.kind == "knowledge.document.parse",
+        )
+    )
+    if parse_job is None or parse_job.payload.get("document_id") != raw_document_id:
+        return False
+    document_exists = await db_session.scalar(
+        select(Document.id).where(
+            Document.id == document_id,
+            Document.source_id == source_id,
+        )
+    )
+    if document_exists is None:
+        return False
+    return (
+        await db_session.scalar(
+            select(JobIntent.id).where(
+                JobIntent.kind == "knowledge.drive_source.sync",
+                JobIntent.state == JobState.SUCCEEDED,
+                JobIntent.payload["source_id"].as_string() == raw_source_id,
+                JobIntent.updated_at >= event.occurred_at,
             )
         )
     ) is not None
