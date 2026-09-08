@@ -249,11 +249,13 @@ async def _authorized_ingestion_service(
     ), gateway
 
 
-def _drive_file_payload(*, parent_id: str) -> dict[str, object]:
+def _drive_file_payload(
+    *, parent_id: str, mime_type: str = "application/pdf", name: str = "policy.pdf"
+) -> dict[str, object]:
     return {
         "id": "drive-file-1",
-        "name": "policy.pdf",
-        "mime_type": "application/pdf",
+        "name": name,
+        "mime_type": mime_type,
         "modified_time": datetime.now(UTC).isoformat(),
         "parent_ids": [parent_id],
         "web_view_link": None,
@@ -345,6 +347,60 @@ async def test_parse_job_embeds_authorized_file_and_publishes_complete_version(
     ).all()
     assert chunks
     assert all(chunk.embedding is not None for chunk in chunks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fixture_name", "mime_type", "file_name"),
+    [
+        ("sample.pdf", "application/pdf", "policy.pdf"),
+        (
+            "sample.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "policy.docx",
+        ),
+    ],
+)
+async def test_parse_job_persists_versions_and_chunks_for_supported_drive_documents(
+    db_session, tmp_path, fixture_name, mime_type, file_name
+) -> None:  # type: ignore[no-untyped-def]
+    document = await _document(db_session, current_is_retrievable=False)
+    document.mime_type = mime_type
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    service, _ = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        content=(FIXTURE_DIRECTORY / fixture_name).read_bytes(),
+        embedding_provider=ValidEmbeddingProvider(),
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        f"document-parse-{fixture_name}-{uuid4()}",
+        {
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(
+                parent_id="authorized-folder",
+                mime_type=mime_type,
+                name=file_name,
+            ),
+        },
+    )
+
+    version = await service.parse(job.id)
+    chunks = (
+        await db_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_version_id == version.id)
+        )
+    ).all()
+
+    await db_session.refresh(job)
+    assert job.state is JobState.SUCCEEDED
+    assert version.state is DocumentVersionState.RETRIEVABLE
+    assert chunks
 
 
 @pytest.mark.asyncio

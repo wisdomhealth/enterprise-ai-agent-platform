@@ -29,6 +29,10 @@ def create_celery(settings: Settings | None = None) -> Celery:
                 "task": "app.modules.knowledge.tasks.dispatch_pending_drive_sync_outbox_events",
                 "schedule": 60,
             },
+            "knowledge-document-parse-outbox-dispatch": {
+                "task": "app.modules.knowledge.tasks.dispatch_pending_document_parse_outbox_events",
+                "schedule": 60,
+            },
             "chat-answer-intent-dispatch": {
                 "task": "app.modules.chat.tasks.dispatch_pending_chat_answer_jobs",
                 "schedule": 60,
