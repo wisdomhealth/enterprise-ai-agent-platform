@@ -73,7 +73,7 @@ class DeterministicChunker:
                             ordinal=ordinal,
                             text=text,
                             page_number=semantic_section.page_number,
-                            section=semantic_section.title,
+                            section=self._database_section(semantic_section.title),
                             token_count=len(self._tokenizer.encode(text)),
                             metadata={
                                 "chunking_version": "structural-v1",
@@ -195,8 +195,15 @@ class DeterministicChunker:
 
     def _render(self, section: _SemanticSection, body: str) -> str:
         prefix = self._prefix(section)
-        text = self._join(prefix, body) if prefix else body
-        return self._tokenizer.decode(self._tokenizer.encode(text)[: self.max_tokens])
+        if not prefix:
+            return body
+        prefix_tokens = self._tokenizer.encode(prefix)
+        while prefix_tokens:
+            text = self._join(self._tokenizer.decode(prefix_tokens), body)
+            if len(self._tokenizer.encode(text)) <= self.max_tokens:
+                return text
+            prefix_tokens.pop()
+        return body
 
     @staticmethod
     def _join(left: str, right: str) -> str:
@@ -211,6 +218,10 @@ class DeterministicChunker:
         if page_number is None:
             return None
         return {"start": page_number, "end": page_number}
+
+    @staticmethod
+    def _database_section(title: str | None) -> str | None:
+        return title[:1024] if title is not None else None
 
     @staticmethod
     def _normalize(value: str) -> str:

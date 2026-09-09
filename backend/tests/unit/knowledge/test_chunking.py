@@ -185,6 +185,9 @@ def test_chunker_keeps_an_oversized_heading_within_the_token_ceiling() -> None:
     )
 
     assert all(chunk.token_count <= 800 for chunk in chunks)
+    assert any("Evidence" in chunk.text for chunk in chunks)
+    assert any(chunk.text.endswith(".") for chunk in chunks)
+    assert all(chunk.section is not None and len(chunk.section) <= 1024 for chunk in chunks)
     assert chunks[0].metadata["section_title"] == heading
 
 
@@ -196,6 +199,9 @@ def test_chunker_enforces_the_ceiling_with_the_production_tokenizer() -> None:
     )
 
     assert all(chunk.token_count <= 800 for chunk in chunks)
+    assert any("Evidence" in chunk.text for chunk in chunks)
+    assert any(chunk.text.endswith(".") for chunk in chunks)
+    assert all(chunk.section is not None and len(chunk.section) <= 1024 for chunk in chunks)
 
 
 @pytest.mark.parametrize("heading", ("第一条", "第一章", "一、", "（一）", "1.", "1.1"))
