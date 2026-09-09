@@ -188,6 +188,35 @@ def test_chunker_keeps_an_oversized_heading_within_the_token_ceiling() -> None:
     assert chunks[0].metadata["section_title"] == heading
 
 
+def test_chunker_enforces_the_ceiling_with_the_production_tokenizer() -> None:
+    heading = "1. " + " ".join(f"heading-{index}" for index in range(850))
+    chunks = DeterministicChunker().chunk(
+        document_version_id=UUID("9b652e7c-c891-4e53-9152-0d8079276c8a"),
+        sections=[ParsedSection(text=f"{heading}\nEvidence.", page_number=1, section=None)],
+    )
+
+    assert all(chunk.token_count <= 800 for chunk in chunks)
+
+
+@pytest.mark.parametrize("heading", ("第一条", "第一章", "一、", "（一）", "1.", "1.1"))
+def test_chunker_treats_standalone_heading_markers_as_hard_boundaries(heading: str) -> None:
+    chunks = DeterministicChunker(tokenizer=WhitespaceTokenizer()).chunk(
+        document_version_id=UUID("9b652e7c-c891-4e53-9152-0d8079276c8a"),
+        sections=[
+            ParsedSection(
+                text=f"{heading}\nFirst body.\n\n{heading}\nSecond body.",
+                page_number=1,
+                section=None,
+            )
+        ],
+    )
+
+    assert len(chunks) == 2
+    assert all(chunk.metadata["section_title"] == heading for chunk in chunks)
+    assert chunks[0].text.endswith("First body.")
+    assert chunks[1].text.endswith("Second body.")
+
+
 @pytest.mark.parametrize(
     "heading",
     ("第一章 总则", "第一节 范围", "一、目的", "（一）定义", "1.1 Scope"),

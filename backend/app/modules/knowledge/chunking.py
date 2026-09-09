@@ -42,13 +42,15 @@ class DeterministicChunker:
     overlap_tokens = 64
 
     _chinese_heading = re.compile(
-        r"^第[一二三四五六七八九十百千万零〇0-9]+[章节条]\s*.+$"
+        r"^第[一二三四五六七八九十百千万零〇0-9]+[章节条](?:\s*.*)?$"
     )
-    _chinese_list_heading = re.compile(r"^[一二三四五六七八九十百千万零〇]+、\s*.+$")
+    _chinese_list_heading = re.compile(r"^[一二三四五六七八九十百千万零〇]+、(?:\s*.*)?$")
     _chinese_parenthetical_heading = re.compile(
-        r"^[（(][一二三四五六七八九十百千万零〇0-9]+[）)]\s*.+$"
+        r"^[（(][一二三四五六七八九十百千万零〇0-9]+[）)](?:\s*.*)?$"
     )
-    _numbered_heading = re.compile(r"^\d+(?:\.\d+)*[.)、]?\s+.+$")
+    _numbered_heading = re.compile(
+        r"^(?:\d+(?:\.\d+)+(?:\s+.*)?|\d+[.)、](?:\s*.*)?)$"
+    )
     _sentence_boundary = re.compile(r"(?<=[。！？!?])\s*")
 
     def __init__(self, tokenizer: Tokenizer | None = None) -> None:
@@ -193,7 +195,8 @@ class DeterministicChunker:
 
     def _render(self, section: _SemanticSection, body: str) -> str:
         prefix = self._prefix(section)
-        return self._join(prefix, body) if prefix else body
+        text = self._join(prefix, body) if prefix else body
+        return self._tokenizer.decode(self._tokenizer.encode(text)[: self.max_tokens])
 
     @staticmethod
     def _join(left: str, right: str) -> str:
