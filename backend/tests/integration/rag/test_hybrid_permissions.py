@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.authorization.models import ResourceGrant
 from app.modules.email.actors import email_worker_principal
-from app.modules.identity.dependencies import Principal
+from app.modules.identity.dependencies import Principal, PublicChatPrincipal
 from app.modules.identity.models import Organization, StaffSession, StaffUser, UserRole, UserStatus
 from app.modules.knowledge.models import (
     Document,
@@ -15,6 +15,7 @@ from app.modules.knowledge.models import (
     DocumentVersion,
     DocumentVersionState,
     DriveSource,
+    DriveSourceStatus,
     KnowledgeBase,
 )
 from app.modules.rag.text_search import TextCandidateSource
@@ -102,6 +103,21 @@ async def _grant_read(db_session, principal: Principal, knowledge_base_id: UUID)
     await db_session.flush()
 
 
+def _public_chat_principal(
+    organization_id: UUID, knowledge_base_id: UUID
+) -> PublicChatPrincipal:
+    session_id = uuid4()
+    return PublicChatPrincipal(
+        subject_id=session_id,
+        organization_id=organization_id,
+        email="public-chat@invalid.local",
+        role=UserRole.MEMBER,
+        session_id=session_id,
+        csrf_hash="",
+        knowledge_base_id=knowledge_base_id,
+    )
+
+
 @pytest.mark.asyncio
 async def test_each_candidate_branch_excludes_unauthorized_chunks(db_session) -> None:
     organization = Organization(name=f"RAG org {uuid4()}")
@@ -132,6 +148,32 @@ async def test_each_candidate_branch_excludes_unauthorized_chunks(db_session) ->
 
 
 @pytest.mark.asyncio
+async def test_regular_member_without_knowledge_read_grant_cannot_retrieve(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"RAG no grant {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    principal = await _principal(db_session, organization)
+    knowledge_base, _ = await _retrievable_chunk(
+        db_session, organization, text="policy refund", embedding=[1.0] * 1536
+    )
+
+    assert (
+        await VectorCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10, query_embedding=[1.0] * 1536
+        )
+        == []
+    )
+    assert (
+        await TextCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
 async def test_revoked_current_version_is_excluded_before_each_branch_ranks(db_session) -> None:
     organization = Organization(name=f"RAG revoked {uuid4()}")
     db_session.add(organization)
@@ -153,6 +195,122 @@ async def test_revoked_current_version_is_excluded_before_each_branch_ranks(db_s
 
     assert vector == []
     assert text == []
+
+
+@pytest.mark.asyncio
+async def test_public_chat_retrieves_only_its_bound_knowledge_base_without_staff_grant(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"Public chat RAG {uuid4()}")
+    foreign_organization = Organization(name=f"Public chat foreign {uuid4()}")
+    db_session.add_all([organization, foreign_organization])
+    await db_session.flush()
+    knowledge_base, chunk = await _retrievable_chunk(
+        db_session, organization, text="public policy", embedding=[1.0] * 1536
+    )
+    foreign_knowledge_base, _ = await _retrievable_chunk(
+        db_session, foreign_organization, text="foreign policy", embedding=[1.0] * 1536
+    )
+    principal = _public_chat_principal(organization.id, knowledge_base.id)
+
+    vector = await VectorCandidateSource(db_session).search(
+        principal, knowledge_base.id, "policy", 10, query_embedding=[1.0] * 1536
+    )
+    text = await TextCandidateSource(db_session).search(
+        principal, knowledge_base.id, "policy", 10
+    )
+
+    assert {item.chunk_id for item in vector} == {chunk.id}
+    assert {item.chunk_id for item in text} == {chunk.id}
+    assert (
+        await VectorCandidateSource(db_session).search(
+            principal,
+            foreign_knowledge_base.id,
+            "policy",
+            10,
+            query_embedding=[1.0] * 1536,
+        )
+        == []
+    )
+    assert (
+        await TextCandidateSource(db_session).search(
+            principal, foreign_knowledge_base.id, "policy", 10
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_chat_excludes_inactive_and_noncurrent_or_unretrievable_sources(
+    db_session: AsyncSession,
+) -> None:
+    organization = Organization(name=f"Public chat eligibility {uuid4()}")
+    db_session.add(organization)
+    await db_session.flush()
+    knowledge_base, chunk = await _retrievable_chunk(
+        db_session, organization, text="eligible policy", embedding=[1.0] * 1536
+    )
+    principal = _public_chat_principal(organization.id, knowledge_base.id)
+    version = await db_session.get(DocumentVersion, chunk.document_version_id)
+    assert version is not None
+    document = await db_session.get(Document, version.document_id)
+    assert isinstance(document, Document)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert isinstance(source, DriveSource)
+    source.status = DriveSourceStatus.DISABLED
+    await db_session.flush()
+
+    assert (
+        await VectorCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10, query_embedding=[1.0] * 1536
+        )
+        == []
+    )
+    assert (
+        await TextCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10
+        )
+        == []
+    )
+
+    source.status = DriveSourceStatus.ACTIVE
+    version.state = DocumentVersionState.PROCESSING
+    await db_session.flush()
+    assert (
+        await VectorCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10, query_embedding=[1.0] * 1536
+        )
+        == []
+    )
+    assert (
+        await TextCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10
+        )
+        == []
+    )
+
+    version.state = DocumentVersionState.RETRIEVABLE
+    replacement = DocumentVersion(
+        document_id=document.id,
+        state=DocumentVersionState.RETRIEVABLE,
+        content_sha256=uuid4().hex + uuid4().hex,
+    )
+    db_session.add(replacement)
+    await db_session.flush()
+    document.current_version_id = replacement.id
+    await db_session.flush()
+    assert (
+        await VectorCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10, query_embedding=[1.0] * 1536
+        )
+        == []
+    )
+    assert (
+        await TextCandidateSource(db_session).search(
+            principal, knowledge_base.id, "policy", 10
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio

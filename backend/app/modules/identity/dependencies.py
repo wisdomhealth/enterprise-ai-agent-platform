@@ -50,6 +50,13 @@ class ServicePrincipal(Principal):
     purpose: str
 
 
+@dataclass(frozen=True, slots=True)
+class PublicChatPrincipal(Principal):
+    """Customer-chat identity constrained to its already-authorized knowledge base."""
+
+    knowledge_base_id: UUID
+
+
 async def get_db_session() -> AsyncIterator[AsyncSession]:
     async with async_sessionmaker() as session:
         yield session

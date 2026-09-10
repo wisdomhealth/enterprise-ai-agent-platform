@@ -5,7 +5,7 @@ from sqlalchemy import Select, and_, false, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.authorization.models import ResourceGrant
-from app.modules.identity.dependencies import Principal, ServicePrincipal
+from app.modules.identity.dependencies import Principal, PublicChatPrincipal, ServicePrincipal
 from app.modules.knowledge.models import (
     Document,
     DocumentChunk,
@@ -91,7 +91,10 @@ def _authorized_chunks_query(
         .join(DriveSource, DriveSource.id == Document.source_id)
         .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
     )
-    if isinstance(principal, ServicePrincipal):
+    if isinstance(principal, PublicChatPrincipal):
+        if principal.knowledge_base_id != knowledge_base_id:
+            query = query.where(false())
+    elif isinstance(principal, ServicePrincipal):
         if (
             principal.resource_type != "knowledge"
             or principal.resource_id != knowledge_base_id
