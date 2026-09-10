@@ -69,10 +69,11 @@ class VectorCandidateSource:
         query_embedding: list[float],
         limit: int,
     ) -> list[RetrievedChunk]:
+        distance = DocumentChunk.embedding.cosine_distance(query_embedding)
         rows = await db_session.execute(
             _authorized_chunks_query(principal, knowledge_base_id)
-            .where(DocumentChunk.embedding.is_not(None))
-            .order_by(DocumentChunk.embedding.cosine_distance(query_embedding), DocumentChunk.id)
+            .where(DocumentChunk.embedding.is_not(None), distance < 0.4)
+            .order_by(distance, DocumentChunk.id)
             .limit(limit)
         )
         return [
