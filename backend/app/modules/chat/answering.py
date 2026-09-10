@@ -19,7 +19,7 @@ from app.modules.chat.models import (
     ChatSession,
     ConversationState,
 )
-from app.modules.identity.dependencies import Principal
+from app.modules.identity.dependencies import Principal, PublicChatPrincipal
 from app.modules.identity.models import UserRole
 from app.modules.jobs.models import ErrorClass, JobIntent
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
@@ -477,20 +477,21 @@ class ChatAnswerService:
             return
 
 
-def _public_session_principal(session: ChatSession) -> Principal:
+def _public_session_principal(session: ChatSession) -> PublicChatPrincipal:
     """A request-scoped principal bounded to the already-authorized session.
 
     The customer route has already checked its opaque bearer and fixed this
     principal to one organization/knowledge base.  The RAG path still applies
     its candidate authorization and eligibility predicates before generation.
     """
-    return Principal(
+    return PublicChatPrincipal(
         subject_id=session.id,
         organization_id=session.organization_id,
         email="public-chat@invalid.local",
         role=UserRole.MEMBER,
         session_id=session.id,
         csrf_hash="",
+        knowledge_base_id=session.knowledge_base_id,
     )
 
 
