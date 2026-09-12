@@ -413,8 +413,34 @@ export type AdminRetentionPolicy = {
   legal_compliance_guarantee: false;
 };
 
+export type ConnectorGrantAction = "connector.create" | "connector.reauthorize" | "connector.revoke";
+
+export type AdminConnectorAuthorization = {
+  staff_user_id: string;
+  kind: "DRIVE" | "GMAIL";
+  resource_id: string;
+  authorize_endpoint: string;
+  actions: { action: ConnectorGrantAction; granted: boolean }[];
+};
+
 export function getAdminOperationsSummary(): Promise<AdminOperationsSummary> {
   return adminRequest<AdminOperationsSummary>("/operations/summary");
+}
+
+export function getAdminConnectorAuthorizations(): Promise<AdminConnectorAuthorization[]> {
+  return adminRequest<AdminConnectorAuthorization[]>("/authorization/connectors");
+}
+
+export function updateAdminConnectorAuthorization(
+  kind: AdminConnectorAuthorization["kind"],
+  staffUserId: string,
+  actions: ConnectorGrantAction[],
+): Promise<AdminConnectorAuthorization> {
+  return adminRequest<AdminConnectorAuthorization>(`/authorization/connectors/${kind}/grants`, {
+    method: "PUT",
+    headers: { "Idempotency-Key": idempotencyKey("connector-grants", kind) },
+    body: JSON.stringify({ staff_user_id: staffUserId, actions }),
+  });
 }
 
 export function listAdminFailedJobs(): Promise<AdminFailedJob[]> {

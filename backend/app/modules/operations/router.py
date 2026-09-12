@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.connectors.models import ConnectorKind
 from app.modules.connectors.service import ConnectorService
 from app.modules.idempotency.models import IdempotencyState
 from app.modules.idempotency.service import (
@@ -22,7 +23,10 @@ from app.modules.identity.dependencies import (
     require_staff_csrf,
     require_staff_session,
 )
+from app.modules.operations.connector_authorization import ConnectorAuthorizationService
 from app.modules.operations.schemas import (
+    ConnectorAuthorizationRead,
+    ConnectorGrantReplace,
     ConnectorReauthorizationRead,
     FailedJobRead,
     JobRetryRead,
@@ -138,6 +142,44 @@ async def operations_summary(
     db_session: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> OperationsSummaryRead:
     return await OperationsService(db_session).summary(principal)
+
+
+@router.get("/authorization/connectors", response_model=list[ConnectorAuthorizationRead])
+async def connector_authorizations(
+    principal: Annotated[Principal, Depends(require_admin_session)],
+    db_session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> list[ConnectorAuthorizationRead]:
+    return await ConnectorAuthorizationService(db_session).list_for(principal)
+
+
+@router.put(
+    "/authorization/connectors/{kind}/grants",
+    response_model=ConnectorAuthorizationRead,
+)
+async def replace_connector_grants(
+    kind: ConnectorKind,
+    request_body: ConnectorGrantReplace,
+    principal: Annotated[Principal, Depends(require_admin_csrf)],
+    db_session: Annotated[AsyncSession, Depends(get_db_session)],
+    idempotency_key: Annotated[str, Depends(_write_key)],
+) -> ConnectorAuthorizationRead:
+    resource_id = ConnectorService.configuration_resource_id(principal.organization_id, kind)
+    service = ConnectorAuthorizationService(db_session)
+    return await _idempotent_action(
+        db_session=db_session,
+        principal=principal,
+        key=idempotency_key,
+        operation="admin.connector_grants.replace",
+        object_id=resource_id,
+        request_body=request_body.model_dump(mode="json"),
+        response_type=ConnectorAuthorizationRead,
+        invoke=lambda: service.replace(
+            principal,
+            target_staff_user_id=request_body.staff_user_id,
+            kind=kind,
+            actions=request_body.actions,
+        ),
+    )
 
 
 @router.get("/jobs/failed", response_model=list[FailedJobRead])
