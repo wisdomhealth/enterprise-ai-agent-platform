@@ -331,37 +331,65 @@ async def _consume_email_job(job_id: UUID) -> None:
         job = await lease_service.claim(job_id, execution_owner, lease_seconds=EMAIL_LEASE_SECONDS)
         if job is None:
             return
+        claimed_job_id = job.id
+        claimed_job_kind = job.kind
+        claimed_job_payload = dict(job.payload)
+        claimed_version = job.version
         await db_session.commit()
         try:
-            if job.kind == EMAIL_HISTORY_KIND:
+            if claimed_job_kind == EMAIL_HISTORY_KIND:
                 result = await _consume_history_with_lease_renewal(
-                    db_session, job, settings, execution_owner
+                    db_session,
+                    claimed_job_id,
+                    claimed_job_payload,
+                    settings,
+                    execution_owner,
+                    claimed_version,
+                )
+                current_version = await _current_claim_version(
+                    db_session, claimed_job_id, execution_owner
                 )
                 if result:
                     await lease_service.retry(
-                        job.id,
+                        claimed_job_id,
                         execution_owner,
                         error_code="GMAIL_REAUTH_REQUIRED",
                         error_class=ErrorClass.NON_RETRYABLE,
-                        expected_version=job.version,
+                        expected_version=current_version,
                     )
                 else:
                     await lease_service.complete(
-                        job.id, execution_owner, expected_version=job.version
+                        claimed_job_id, execution_owner, expected_version=current_version
                     )
-            elif job.kind == EMAIL_CLASSIFY_KIND:
-                await _consume_classification(db_session, job, settings)
-                await lease_service.complete(job.id, execution_owner, expected_version=job.version)
-            elif job.kind == EMAIL_DRAFT_KIND:
-                await _consume_draft(db_session, job, settings)
-                await lease_service.complete(job.id, execution_owner, expected_version=job.version)
+            elif claimed_job_kind == EMAIL_CLASSIFY_KIND:
+                await _consume_classification(
+                    db_session, claimed_job_id, claimed_job_payload, settings
+                )
+                await lease_service.complete(
+                    claimed_job_id,
+                    execution_owner,
+                    expected_version=await _current_claim_version(
+                        db_session, claimed_job_id, execution_owner
+                    ),
+                )
+            elif claimed_job_kind == EMAIL_DRAFT_KIND:
+                await _consume_draft(db_session, claimed_job_id, claimed_job_payload, settings)
+                await lease_service.complete(
+                    claimed_job_id,
+                    execution_owner,
+                    expected_version=await _current_claim_version(
+                        db_session, claimed_job_id, execution_owner
+                    ),
+                )
             else:
                 await lease_service.retry(
-                    job.id,
+                    claimed_job_id,
                     execution_owner,
                     error_code="EMAIL_JOB_KIND_INVALID",
                     error_class=ErrorClass.NON_RETRYABLE,
-                    expected_version=job.version,
+                    expected_version=await _current_claim_version(
+                        db_session, claimed_job_id, execution_owner
+                    ),
                 )
             await db_session.commit()
         except JobLeaseLost:
@@ -369,15 +397,44 @@ async def _consume_email_job(job_id: UUID) -> None:
             raise
         except Exception:
             await db_session.rollback()
-            await lease_service.retry(
-                job.id,
+            await _recover_failed_email_job(claimed_job_id, execution_owner)
+            raise
+
+
+async def _current_claim_version(
+    db_session: AsyncSession, job_id: UUID, execution_owner: str
+) -> int:
+    version = await db_session.scalar(
+        select(JobIntent.version).where(
+            JobIntent.id == job_id,
+            JobIntent.state == JobState.RUNNING,
+            JobIntent.lease_owner == execution_owner,
+        )
+    )
+    if version is None:
+        raise JobLeaseLost(job_id)
+    return int(version)
+
+
+async def _recover_failed_email_job(job_id: UUID, execution_owner: str) -> None:
+    """Best-effort durable retry that never masks the original business failure."""
+    try:
+        async with async_sessionmaker() as recovery_session:
+            current_version = await _current_claim_version(
+                recovery_session, job_id, execution_owner
+            )
+            await JobLeaseService(recovery_session).retry(
+                job_id,
                 execution_owner,
                 error_code="EMAIL_WORKER_TRANSIENT_FAILURE",
                 error_class=ErrorClass.RETRYABLE,
-                expected_version=job.version,
+                expected_version=current_version,
             )
-            await db_session.commit()
-            raise
+            await recovery_session.commit()
+    except Exception:
+        # The caller must retain the original processing exception.  A lost
+        # lease means another worker is now authoritative for this JobIntent.
+        return
 
 
 async def _consume_delivery_job(
@@ -397,12 +454,14 @@ async def _consume_delivery_job(
 
 async def _consume_history_with_lease_renewal(
     db_session: AsyncSession,
-    job: JobIntent,
+    job_id: UUID,
+    payload: dict[str, object],
     settings: Settings,
     execution_owner: str,
+    expected_version: int,
 ) -> bool:
-    operation = asyncio.create_task(_consume_history(db_session, job, settings))
-    heartbeat = asyncio.create_task(_renew_history_lease(job.id, execution_owner, job.version))
+    operation = asyncio.create_task(_consume_history(db_session, job_id, payload, settings))
+    heartbeat = asyncio.create_task(_renew_history_lease(job_id, execution_owner, expected_version))
     done, _pending = await asyncio.wait({operation, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
     if operation in done:
         heartbeat.cancel()
@@ -411,7 +470,7 @@ async def _consume_history_with_lease_renewal(
     operation.cancel()
     await asyncio.gather(operation, return_exceptions=True)
     await heartbeat
-    raise JobLeaseLost(job.id)
+    raise JobLeaseLost(job_id)
 
 
 async def _renew_history_lease(job_id: UUID, execution_owner: str, expected_version: int) -> None:
@@ -419,17 +478,18 @@ async def _renew_history_lease(job_id: UUID, execution_owner: str, expected_vers
     while True:
         await asyncio.sleep(interval)
         async with async_sessionmaker() as heartbeat_session:
-            await JobLeaseService(heartbeat_session).renew(
+            renewed = await JobLeaseService(heartbeat_session).renew(
                 job_id,
                 execution_owner,
                 EMAIL_LEASE_SECONDS,
                 expected_version=expected_version,
             )
             await heartbeat_session.commit()
+            expected_version = renewed.version
 
 
 async def _consume_history(
-    db_session: AsyncSession, job: JobIntent, settings: Settings
+    db_session: AsyncSession, job_id: UUID, payload: dict[str, object], settings: Settings
 ) -> bool:
     connector_service = ConnectorService.from_settings(settings)
     gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
@@ -442,36 +502,38 @@ async def _consume_history(
         gateway_factory=gateway_factory,
     )
     result = await service.ingest_history(
-        UUID(str(job.payload["connector_id"])),
-        UUID(str(job.payload["knowledge_base_id"])),
+        UUID(str(payload["connector_id"])),
+        UUID(str(payload["knowledge_base_id"])),
         commit=False,
-        job_id=job.id,
+        job_id=job_id,
     )
     return result.reauth_required
 
 
 async def _consume_classification(
     db_session: AsyncSession,
-    job: JobIntent,
+    job_id: UUID,
+    payload: dict[str, object],
     settings: Settings,
 ) -> None:
     await EmailIngestionService(
         db_session, classifier=_build_classifier(settings)
-    ).process_classification(UUID(str(job.payload["work_item_id"])), job_id=job.id)
+    ).process_classification(UUID(str(payload["work_item_id"])), job_id=job_id)
 
 
 async def _consume_draft(
     db_session: AsyncSession,
-    job: JobIntent,
+    job_id: UUID,
+    payload: dict[str, object],
     settings: Settings,
 ) -> None:
-    item_id = UUID(str(job.payload["work_item_id"]))
+    item_id = UUID(str(payload["work_item_id"]))
     item = await db_session.get(EmailWorkItem, item_id)
     if item is None:
         raise LookupError("email work item not found")
-    principal = email_worker_principal(item.organization_id, item.knowledge_base_id, job.id)
+    principal = email_worker_principal(item.organization_id, item.knowledge_base_id, job_id)
     grounded = GroundedAnswerService.from_settings(settings, session_factory=async_sessionmaker)
-    await EmailDraftingService(db_session, grounded, principal).generate(item.id, job_id=job.id)
+    await EmailDraftingService(db_session, grounded, principal).generate(item.id, job_id=job_id)
 
 
 def _build_classifier(settings: Settings) -> EmailClassifier:
