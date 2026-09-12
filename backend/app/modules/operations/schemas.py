@@ -1,8 +1,9 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.modules.connectors.models import ConnectorKind, ConnectorStatus
 
@@ -94,3 +95,23 @@ class ConnectorReauthorizationRead(BaseModel):
     connector_id: UUID
     authorization_url: str
     requested_scopes: list[str]
+
+
+class ConnectorAuthorizationActionRead(BaseModel):
+    action: Literal["connector.create", "connector.reauthorize", "connector.revoke"]
+    granted: bool
+
+
+class ConnectorAuthorizationRead(BaseModel):
+    staff_user_id: UUID
+    kind: ConnectorKind
+    resource_id: UUID
+    authorize_endpoint: str
+    actions: list[ConnectorAuthorizationActionRead]
+
+
+class ConnectorGrantReplace(BaseModel):
+    staff_user_id: UUID
+    actions: list[Literal["connector.create", "connector.reauthorize", "connector.revoke"]] = Field(
+        default_factory=list
+    )

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-import { AdminConnectorStatus } from "../../lib/staff-api";
+import { AdminConnectorAuthorization, AdminConnectorStatus } from "../../lib/staff-api";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { formatUtc, statusLabel } from "./format";
 
@@ -14,9 +14,11 @@ function connectorName(kind: AdminConnectorStatus["kind"]) {
 
 export function ConnectorStatus({
   connectors,
+  authorizations,
   onReauthorize,
 }: {
   connectors: AdminConnectorStatus[];
+  authorizations?: AdminConnectorAuthorization[];
   onReauthorize: (connectorId: string) => Promise<void>;
 }) {
   const [pending, setPending] = useState<AdminConnectorStatus | null>(null);
@@ -26,6 +28,9 @@ export function ConnectorStatus({
       <ul>
         {connectorKinds.map((kind) => {
           const connector = connectors.find((candidate) => candidate.kind === kind);
+          const createGranted = authorizations === undefined || authorizations
+            .find((authorization) => authorization.kind === kind)
+            ?.actions.find((action) => action.action === "connector.create")?.granted === true;
           const name = connectorName(kind);
           return (
             <li key={kind}>
@@ -42,14 +47,23 @@ export function ConnectorStatus({
                 </>
               ) : (
                 <>
-                  {" · Not connected"}
+                  {createGranted ? " · Not connected" : " · Authorization required"}
                   <p>
-                    <button
-                      type="button"
-                      onClick={() => window.location.assign(`/api/v1/admin/connectors/${kind}/authorize`)}
-                    >
-                      Connect {name}
-                    </button>
+                    {createGranted ? (
+                      <button
+                        type="button"
+                        onClick={() => window.location.assign(`/api/v1/admin/connectors/${kind}/authorize`)}
+                      >
+                        Connect {name}
+                      </button>
+                    ) : (
+                      <>
+                        <span>Missing permission: connector.create</span>{" "}
+                        <button type="button" onClick={() => window.location.assign("/staff/admin/authorization")}>
+                          Manage authorization
+                        </button>
+                      </>
+                    )}
                   </p>
                 </>
               )}

@@ -139,6 +139,43 @@ it("shows initial Drive and Gmail authorization when no connectors exist", () =>
   expect(screen.getByRole("button", { name: "Connect Gmail" })).toBeVisible();
 });
 
+it("routes missing initial connector permission to authorization management", () => {
+  const assign = vi.fn();
+  vi.stubGlobal("location", { assign });
+  render(
+    <ConnectorStatus
+      connectors={[]}
+      authorizations={[
+        {
+          staff_user_id: "admin-1",
+          kind: "DRIVE",
+          resource_id: "drive-resource",
+          authorize_endpoint: "/api/v1/admin/connectors/DRIVE/authorize",
+          actions: [{ action: "connector.create", granted: false }],
+        },
+        {
+          staff_user_id: "admin-1",
+          kind: "GMAIL",
+          resource_id: "gmail-resource",
+          authorize_endpoint: "/api/v1/admin/connectors/GMAIL/authorize",
+          actions: [{ action: "connector.create", granted: true }],
+        },
+      ]}
+      onReauthorize={vi.fn().mockResolvedValue(undefined)}
+    />,
+  );
+
+  expect(screen.getByText("Google Drive").closest("li")).toHaveTextContent(
+    "Google Drive · Authorization required",
+  );
+  expect(screen.getByText("Missing permission: connector.create")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Connect Google Drive" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Manage authorization" }));
+  expect(assign).toHaveBeenCalledWith("/staff/admin/authorization");
+  expect(screen.getByRole("button", { name: "Connect Gmail" })).toBeVisible();
+  vi.unstubAllGlobals();
+});
+
 it("uses existing Drive status without a duplicate initial authorization button", () => {
   render(
     <ConnectorStatus

@@ -9,12 +9,14 @@ import { QualitySummary } from "../../../components/admin/QualitySummary";
 import { RetentionPolicyControl } from "../../../components/admin/RetentionPolicyControl";
 import { UserManagement } from "../../../components/admin/UserManagement";
 import {
+  AdminConnectorAuthorization,
   AdminFailedJob,
   AdminOperationsSummary,
   AdminRetentionPolicy,
   AdminUser,
   beginConnectorReauthorization,
   configureAdminDriveScope,
+  getAdminConnectorAuthorizations,
   getAdminOperationsSummary,
   getAdminRetentionPolicy,
   inviteAdminUser,
@@ -28,6 +30,7 @@ import {
 
 export default function AdminOperationsPage() {
   const [summary, setSummary] = useState<AdminOperationsSummary | null>(null);
+  const [authorizations, setAuthorizations] = useState<AdminConnectorAuthorization[]>([]);
   const [jobs, setJobs] = useState<AdminFailedJob[]>([]);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [retentionPolicy, setRetentionPolicy] = useState<AdminRetentionPolicy | null>(null);
@@ -35,16 +38,18 @@ export default function AdminOperationsPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextSummary, nextJobs, nextUsers, nextRetentionPolicy] = await Promise.all([
+      const [nextSummary, nextJobs, nextUsers, nextRetentionPolicy, nextAuthorizations] = await Promise.all([
         getAdminOperationsSummary(),
         listAdminFailedJobs(),
         listAdminUsers(),
         getAdminRetentionPolicy(),
+        getAdminConnectorAuthorizations(),
       ]);
       setSummary(nextSummary);
       setJobs(nextJobs);
       setUsers(nextUsers);
       setRetentionPolicy(nextRetentionPolicy);
+      setAuthorizations(nextAuthorizations);
       setNotice(null);
     } catch {
       setNotice("Administrator operations are unavailable or not authorized.");
@@ -59,7 +64,7 @@ export default function AdminOperationsPage() {
       <h1 id="admin-operations-heading">Administrator operations</h1>
       <p aria-live="polite">{notice}</p>
       <p>Queue depth {summary.jobs.queue_depth} · Failed {summary.jobs.failed} · Support backlog {summary.support.backlog}</p>
-      <ConnectorStatus connectors={summary.connectors} onReauthorize={async (id) => {
+      <ConnectorStatus connectors={summary.connectors} authorizations={authorizations} onReauthorize={async (id) => {
         const result = await beginConnectorReauthorization(id);
         window.location.assign(result.authorization_url);
       }} />
