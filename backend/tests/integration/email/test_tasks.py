@@ -183,7 +183,7 @@ async def test_history_consumer_renews_real_pg_lease_without_duplicate_paid_work
         raw_content_ref="gmail://fixture/renewal",
     )
 
-    async def consume_history(db_session, running_job, _settings):  # type: ignore[no-untyped-def]
+    async def consume_history(db_session, running_job_id, payload, _settings):  # type: ignore[no-untyped-def]
         result = await EmailIngestionService(
             db_session,
             gateway=OnePageGateway(message),
@@ -192,7 +192,7 @@ async def test_history_consumer_renews_real_pg_lease_without_duplicate_paid_work
             connector_id,
             knowledge_base_id,
             commit=False,
-            job_id=running_job.id,
+            job_id=running_job_id,
         )
         return result.reauth_required
 
