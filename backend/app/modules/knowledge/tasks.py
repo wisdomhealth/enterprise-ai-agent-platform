@@ -2,7 +2,8 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-from uuid import UUID
+from typing import Any
+from uuid import UUID, uuid4
 
 from celery import shared_task  # type: ignore[import-untyped]
 from sqlalchemy import func, select
@@ -18,12 +19,13 @@ from app.modules.knowledge.ingestion import DocumentIngestionService
 from app.modules.knowledge.models import Document, DocumentVersion, DriveSource, DriveSourceStatus
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.service import KnowledgeSourceService
-from app.modules.knowledge.sync import DriveSyncService
+from app.modules.knowledge.sync import DriveSyncService, SyncResult
 from app.modules.outbox.models import OutboxEvent
 
 DRIVE_SYNC_TASK_NAME = "app.modules.knowledge.tasks.drive_source_sync"
 DRIVE_SYNC_WORKER_ID = "celery-drive-sync"
 DRIVE_SYNC_LEASE_SECONDS = 300
+DRIVE_SYNC_RENEW_INTERVAL_SECONDS = 100
 DOCUMENT_PARSE_TASK_NAME = "app.modules.knowledge.tasks.document_parse"
 DOCUMENT_PARSE_WORKER_ID = "celery-document-parse"
 DOCUMENT_PARSE_LEASE_SECONDS = 300
@@ -295,13 +297,58 @@ async def _run_drive_sync(job_id: str | None) -> None:
         await _consume_drive_sync_intent(intent_id)
 
 
+async def _renew_drive_sync_lease(
+    job_id: UUID,
+    execution_owner: str,
+    expected_version: int,
+) -> None:
+    while True:
+        await asyncio.sleep(DRIVE_SYNC_RENEW_INTERVAL_SECONDS)
+        async with async_sessionmaker() as heartbeat_session:
+            renewed = await JobLeaseService(heartbeat_session).renew(
+                job_id,
+                execution_owner,
+                DRIVE_SYNC_LEASE_SECONDS,
+                expected_version=expected_version,
+            )
+            await heartbeat_session.commit()
+            expected_version = renewed.version
+
+
+async def _run_drive_sync_with_lease_renewal(
+    operation: Awaitable[SyncResult],
+    *,
+    job_id: UUID,
+    execution_owner: str,
+    expected_version: int,
+) -> SyncResult:
+    operation_task: asyncio.Future[SyncResult] = asyncio.ensure_future(operation)
+    heartbeat_task: asyncio.Task[None] = asyncio.create_task(
+        _renew_drive_sync_lease(job_id, execution_owner, expected_version)
+    )
+    waitables: set[asyncio.Future[Any]] = {operation_task, heartbeat_task}
+    done, _pending = await asyncio.wait(
+        waitables, return_when=asyncio.FIRST_COMPLETED
+    )
+    if heartbeat_task in done:
+        operation_task.cancel()
+        await asyncio.gather(operation_task, return_exceptions=True)
+        await heartbeat_task
+        raise JobLeaseLost(job_id)
+    heartbeat_task.cancel()
+    await asyncio.gather(heartbeat_task, return_exceptions=True)
+    return await operation_task
+
+
 async def _consume_drive_sync_intent(job_id: UUID) -> None:
     """The only consumer path for scheduled and manual sync intents."""
     async with async_sessionmaker() as db_session:
         lease_service = JobLeaseService(db_session)
-        job = await lease_service.claim(job_id, DRIVE_SYNC_WORKER_ID, DRIVE_SYNC_LEASE_SECONDS)
+        execution_owner = f"{DRIVE_SYNC_WORKER_ID}:{uuid4()}"
+        job = await lease_service.claim(job_id, execution_owner, DRIVE_SYNC_LEASE_SECONDS)
         if job is None:
             return
+        expected_version = job.version
         await db_session.commit()
         try:
             source_id = UUID(str(job.payload["source_id"]))
@@ -321,10 +368,10 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
                 )
                 await lease_service.retry(
                     job.id,
-                    DRIVE_SYNC_WORKER_ID,
+                    execution_owner,
                     error_code=error_code,
                     error_class=ErrorClass.NON_RETRYABLE,
-                    expected_version=job.version,
+                    expected_version=expected_version,
                 )
                 await db_session.commit()
                 return
@@ -336,25 +383,34 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
             raw_page_token = job.payload.get("page_token")
             if raw_page_token is not None and not isinstance(raw_page_token, str):
                 raise ValueError("invalid Drive sync page token")
-            result = await DriveSyncService(
-                db_session,
-                connector_service=connector_service,
-                drive_gateway_factory=gateway_factory,
-            ).sync(
-                source_id,
-                raw_page_token,
-                parent_sync_job_id=job.id,
+            result = await _run_drive_sync_with_lease_renewal(
+                DriveSyncService(
+                    db_session,
+                    connector_service=connector_service,
+                    drive_gateway_factory=gateway_factory,
+                ).sync(
+                    source_id,
+                    raw_page_token,
+                    parent_sync_job_id=job.id,
+                ),
+                job_id=job.id,
+                execution_owner=execution_owner,
+                expected_version=expected_version,
             )
             if result.reauth_required:
                 await lease_service.retry(
                     job.id,
-                    DRIVE_SYNC_WORKER_ID,
+                    execution_owner,
                     error_code="DRIVE_REAUTH_REQUIRED",
                     error_class=ErrorClass.NON_RETRYABLE,
-                    expected_version=job.version,
+                    expected_version=expected_version,
                 )
             else:
-                await lease_service.complete(job.id, DRIVE_SYNC_WORKER_ID)
+                await lease_service.complete(
+                    job.id,
+                    execution_owner,
+                    expected_version=expected_version,
+                )
             await db_session.commit()
             for event_id in result.parse_outbox_event_ids:
                 try:
@@ -369,10 +425,10 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
         except Exception:
             await lease_service.retry(
                 job.id,
-                DRIVE_SYNC_WORKER_ID,
+                execution_owner,
                 error_code="DRIVE_SYNC_TRANSIENT_FAILURE",
                 error_class=ErrorClass.RETRYABLE,
-                expected_version=job.version,
+                expected_version=expected_version,
             )
             await db_session.commit()
             raise
