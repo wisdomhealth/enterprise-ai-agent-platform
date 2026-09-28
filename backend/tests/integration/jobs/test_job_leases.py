@@ -40,6 +40,31 @@ async def test_only_one_worker_holds_a_live_job_lease(
 
 
 @pytest.mark.asyncio
+async def test_renew_extends_the_live_lease_without_changing_generation(
+    job_service, lease_service, db_session
+):
+    job = await job_service.enqueue(
+        db_session, "drive.sync", "drive:renew", {"source_id": "1"}
+    )
+    await db_session.flush()
+    claimed = await lease_service.claim(job.id, "worker-a", 60)
+    assert claimed is not None
+    original_expiry = claimed.lease_expires_at
+
+    renewed = await lease_service.renew(
+        job.id,
+        "worker-a",
+        300,
+        expected_version=claimed.version,
+    )
+
+    assert renewed.lease_expires_at is not None
+    assert original_expiry is not None
+    assert renewed.lease_expires_at > original_expiry
+    assert renewed.version == claimed.version
+
+
+@pytest.mark.asyncio
 async def test_expired_lease_is_recovered_without_losing_payload(
     job_service, lease_service, db_session
 ):
