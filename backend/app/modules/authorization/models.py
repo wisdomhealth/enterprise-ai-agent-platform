@@ -42,21 +42,27 @@ class ResourceGrant(Base):
         ),
     )
 
+    # 资源授权的唯一标识。
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
         server_default=text("gen_random_uuid()"),
     )
+    # 所属组织的唯一标识，用于实施租户数据隔离。
     organization_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # 获得资源权限的主体唯一标识。
     subject_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         nullable=False,
     )
+    # 授权资源的类型。
     resource_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    # 授权资源的唯一标识。
     resource_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    # 允许主体在资源上执行的操作集合。
     actions: Mapped[list[str]] = mapped_column(ARRAY(String(100)), nullable=False)

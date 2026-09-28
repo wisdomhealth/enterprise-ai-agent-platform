@@ -31,36 +31,50 @@ class IdempotencyRecord(Base):
         ),
     )
 
+    # 幂等请求记录的唯一标识。
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
         server_default=text("gen_random_uuid()"),
     )
+    # 幂等范围的唯一标识，用于隔离不同业务域。
     scope_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    # 执行当前操作的主体唯一标识。
     actor_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    # 受幂等保护的业务操作名称。
     operation: Mapped[str] = mapped_column(String(150), nullable=False)
+    # 被操作业务对象的唯一标识。
     object_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    # 客户端提供的幂等键。
     key: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 请求内容摘要，用于检测同一幂等键下的参数冲突。
     request_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 记录当前状态机状态。
     state: Mapped[IdempotencyState] = mapped_column(
         Enum(IdempotencyState, name="idempotency_state"),
         nullable=False,
         default=IdempotencyState.IN_PROGRESS,
         server_default=text("'IN_PROGRESS'::idempotency_state"),
     )
+    # 当前处理者持有的随机租约令牌。
     lease_token: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         nullable=False,
         default=uuid4,
         server_default=text("gen_random_uuid()"),
     )
+    # 当前处理租约的过期时间。
     lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # 已缓存 HTTP 响应的状态码。
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 已缓存 HTTP 响应的结构化内容。
     response_body: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # 记录创建时间，由数据库在插入时生成。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # 记录最近更新时间，由数据库在更新时维护。
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )

@@ -43,20 +43,24 @@ class KnowledgeBase(Base):
     __tablename__ = "knowledge_bases"
     __table_args__ = (UniqueConstraint("organization_id", name="uq_knowledge_bases_organization"),)
 
+    # 知识库的唯一标识。
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
         server_default=sql_text("gen_random_uuid()"),
     )
+    # 所属组织的唯一标识，用于实施租户数据隔离。
     organization_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # 知识库默认语言代码。
     default_language: Mapped[str] = mapped_column(
         String(16), nullable=False, default="en", server_default=sql_text("'en'")
     )
+    # 知识库对外引用使用的随机公开键。
     public_key: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
@@ -64,9 +68,11 @@ class KnowledgeBase(Base):
         default=lambda: token_urlsafe(24),
         server_default=sql_text("replace(gen_random_uuid()::text, '-', '')"),
     )
+    # 记录创建时间，由数据库在插入时生成。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # 记录最近更新时间，由数据库在更新时维护。
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -79,40 +85,51 @@ class DriveSource(Base):
         Index("ix_drive_sources_organization", "organization_id"),
     )
 
+    # Google Drive 数据源的唯一标识。
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
         server_default=sql_text("gen_random_uuid()"),
     )
+    # 所属组织的唯一标识，用于实施租户数据隔离。
     organization_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # 所属知识库的唯一标识。
     knowledge_base_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # Google Drive 同步根目录的外部标识。
     root_folder_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    # 标记同步范围是否包含根目录的所有后代目录。
     include_descendants: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sql_text("true")
     )
+    # 经过授权、允许同步的后代目录标识集合。
     allowed_descendant_ids: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sql_text("'[]'::jsonb")
     )
+    # Google Drive Changes API 的持久化增量同步游标。
     sync_cursor: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # 记录当前业务状态。
     status: Mapped[DriveSourceStatus] = mapped_column(
         Enum(DriveSourceStatus, name="drive_source_status"),
         nullable=False,
         default=DriveSourceStatus.ACTIVE,
         server_default=sql_text("'ACTIVE'::drive_source_status"),
     )
+    # 连接 Google Drive 时使用的账号身份。
     connection_identity: Mapped[str] = mapped_column(String(320), nullable=False)
+    # 记录创建时间，由数据库在插入时生成。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # 记录最近更新时间，由数据库在更新时维护。
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -125,38 +142,48 @@ class Document(Base):
         Index("ix_documents_knowledge_base", "knowledge_base_id"),
     )
 
+    # 知识文档的唯一标识。
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
         server_default=sql_text("gen_random_uuid()"),
     )
+    # 所属组织的唯一标识，用于实施租户数据隔离。
     organization_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # 所属知识库的唯一标识。
     knowledge_base_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # 文档所属外部数据源的唯一标识。
     source_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("drive_sources.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    # 文档在外部数据源中的唯一标识。
     external_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    # 文档标题。
     title: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # 文档 MIME 类型，用于选择解析器。
     mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 当前可检索文档版本的唯一标识。
     current_version_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("document_versions.id", ondelete="SET NULL", use_alter=True),
         nullable=True,
     )
+    # 记录创建时间，由数据库在插入时生成。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # 记录最近更新时间，由数据库在更新时维护。
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -179,28 +206,35 @@ class DocumentVersion(Base):
         Index("ix_document_versions_document_state", "document_id", "state"),
     )
 
+    # 文档版本的唯一标识。
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
         server_default=sql_text("gen_random_uuid()"),
     )
+    # 所属文档的唯一标识。
     document_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("documents.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # 记录当前状态机状态。
     state: Mapped[DocumentVersionState] = mapped_column(
         Enum(DocumentVersionState, name="document_version_state"),
         nullable=False,
         default=DocumentVersionState.PROCESSING,
         server_default=sql_text("'PROCESSING'::document_version_state"),
     )
+    # 原始文档内容的 SHA-256 摘要，用于版本去重。
     content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 本次处理失败的标准错误码。
     error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    # 记录创建时间，由数据库在插入时生成。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # 记录最近更新时间，由数据库在更新时维护。
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -229,25 +263,36 @@ class DocumentChunk(Base):
         ),
     )
 
+    # 文档分块的唯一标识。
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    # 所属文档版本的唯一标识。
     document_version_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("document_versions.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # 分块在文档版本中的稳定顺序编号。
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 分块的可检索文本内容。
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 分块来源页码；无法确定时为空。
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 分块所属章节名称；无法确定时为空。
     section: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # 分块文本的令牌数量。
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 分块的附加结构化元数据。
     metadata_: Mapped[dict[str, object]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default=sql_text("'{}'::jsonb")
     )
+    # 分块文本的向量表示，用于语义检索。
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
+    # 由数据库维护的全文检索向量。
     search_vector: Mapped[object] = mapped_column(
         TSVECTOR,
         Computed("to_tsvector('english', text)", persisted=True),
     )
+    # 记录创建时间，由数据库在插入时生成。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
