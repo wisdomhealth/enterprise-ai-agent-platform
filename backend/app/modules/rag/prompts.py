@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from app.modules.rag.types import RetrievedChunk
 
-PROMPT_VERSION = "grounded-answer-v1"
+PROMPT_VERSION = "grounded-answer-v2"
 
 _SYSTEM_RULES = (
     "You answer only from the supplied retrieved context. "
@@ -15,6 +15,11 @@ _SYSTEM_RULES = (
     "Use English unless instructed otherwise by trusted application configuration. "
     "Do not invoke or request tools or side effects."
 )
+_RETRY_INSTRUCTION = (
+    "Previous output failed the trusted citation contract. Correct the output using only the "
+    "same supplied context; ensure every answer sentence is an atomic claim copied exactly from "
+    "one cited evidence sentence."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +29,7 @@ class GroundedPrompt:
     system_rules_position: int
     untrusted_context_position: int
     untrusted_context_is_delimited: bool
+    retry_instruction: bool = False
     version: str = PROMPT_VERSION
 
 
@@ -52,14 +58,22 @@ def _render_chunk(chunk: RetrievedChunk) -> str:
     )
 
 
-def build_grounded_prompt(query: str, chunks: list[RetrievedChunk]) -> GroundedPrompt:
+def build_grounded_prompt(
+    query: str,
+    chunks: list[RetrievedChunk],
+    *,
+    retry_instruction: bool = False,
+) -> GroundedPrompt:
     context = "\n".join(_render_chunk(chunk) for chunk in chunks)
     start = "<untrusted_retrieved_context>"
     user_message = f"Question: {query}\n\n{start}\n{context}\n</untrusted_retrieved_context>"
     return GroundedPrompt(
-        system_message=_SYSTEM_RULES,
+        system_message=(
+            f"{_SYSTEM_RULES} {_RETRY_INSTRUCTION}" if retry_instruction else _SYSTEM_RULES
+        ),
         user_message=user_message,
         system_rules_position=0,
         untrusted_context_position=len(f"Question: {query}\n\n"),
         untrusted_context_is_delimited=True,
+        retry_instruction=retry_instruction,
     )
