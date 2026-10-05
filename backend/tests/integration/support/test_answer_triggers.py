@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -6,6 +5,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import async_sessionmaker
+from app.core.openai import OpenAIStructuredResponseError
 from app.modules.chat.answering import ChatAnswerService
 from app.modules.chat.models import ChatActor, ChatMessage, ChatSession, ConversationState
 from app.modules.identity.models import Organization
@@ -15,7 +15,7 @@ from app.modules.outbox.service import OutboxService
 from app.modules.rag.types import ClaimSupport, ValidatedAnswer
 from app.modules.support.models import Handoff, HandoffTrigger, SensitiveTopic
 from app.modules.support.triggers import (
-    AnthropicStructuredSafetyClassifier,
+    OpenAIStructuredSafetyClassifier,
     SensitiveTopicClassification,
 )
 
@@ -64,13 +64,9 @@ class NoTopicClassifier:
         return SensitiveTopicClassification(sensitive_topic=None)
 
 
-class _MalformedClassifierMessages:
-    async def create(self, **_kwargs: object) -> object:
-        return SimpleNamespace(content=[SimpleNamespace(text="{}")])
-
-
 class _MalformedClassifierClient:
-    messages = _MalformedClassifierMessages()
+    async def invoke(self, *_args: object, **_kwargs: object) -> object:
+        raise OpenAIStructuredResponseError()
 
 
 class _SharedSessionFactory:
@@ -441,9 +437,7 @@ async def test_registered_worker_fails_closed_for_missing_structured_classificat
     monkeypatch.setattr(
         tasks,
         "_build_safety_classifier",
-        lambda _settings: AnthropicStructuredSafetyClassifier(
-            "not-a-real-key", client=_MalformedClassifierClient()
-        ),
+        lambda _settings: OpenAIStructuredSafetyClassifier(_MalformedClassifierClient()),
     )
 
     await tasks._consume_chat_answer(job.id)

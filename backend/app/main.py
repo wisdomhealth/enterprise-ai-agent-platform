@@ -70,7 +70,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         GroundedAnswerService.from_settings(settings)
         if (
             settings.openai_api_key is not None
-            and settings.anthropic_api_key is not None
             and settings.redis_url is not None
         )
         else None

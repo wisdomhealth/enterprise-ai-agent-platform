@@ -40,7 +40,7 @@ async def test_readiness_distinguishes_required_failure_from_safe_degradation() 
         erasure_replay=DependencyStatus.UP,
         key_wrapping=DependencyStatus.UP,
         redis=DependencyStatus.DOWN,
-        claude=DependencyStatus.DEGRADED,
+        openai=DependencyStatus.DEGRADED,
         drive=DependencyStatus.UP,
         gmail=DependencyStatus.UP,
     )
@@ -49,7 +49,11 @@ async def test_readiness_distinguishes_required_failure_from_safe_degradation() 
     assert report.dependencies["database"].required is True
     assert report.dependencies["redis"].recoverable_from_postgres is True
     assert report.dependencies["redis"].affected_features == ("live notifications",)
-    assert report.dependencies["claude"].affected_features == ("AI answers", "email drafting")
+    assert report.dependencies["openai"].affected_features == (
+        "AI answers",
+        "email classification",
+        "email drafting",
+    )
 
 
 @pytest.mark.asyncio
@@ -60,7 +64,7 @@ async def test_optional_dependency_failure_keeps_process_ready_but_degraded() ->
         erasure_replay=DependencyStatus.UP,
         key_wrapping=DependencyStatus.UP,
         redis=DependencyStatus.DOWN,
-        claude=DependencyStatus.DEGRADED,
+        openai=DependencyStatus.DEGRADED,
         drive=DependencyStatus.DOWN,
         gmail=DependencyStatus.DOWN,
     )
@@ -68,6 +72,27 @@ async def test_optional_dependency_failure_keeps_process_ready_but_degraded() ->
     assert report.ready is True
     assert report.status == "degraded"
     assert report.dependencies["drive"].required is False
+
+
+def test_app_enables_grounded_answers_with_openai_and_redis_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    monkeypatch.setattr(
+        "app.main.GroundedAnswerService.from_settings",
+        classmethod(lambda _cls, _settings: sentinel),
+    )
+
+    app = create_app(
+        Settings.model_validate(
+            {
+                "OPENAI_API_KEY": "test-openai-key",
+                "REDIS_URL": "redis://127.0.0.1:6379/0",
+            }
+        )
+    )
+
+    assert app.state.grounded_answer_service is sentinel
 
 
 @pytest.mark.asyncio
@@ -79,7 +104,7 @@ async def test_each_required_safety_gate_fails_readiness(required_name: str) -> 
         "erasure_replay": DependencyStatus.UP,
         "key_wrapping": DependencyStatus.UP,
         "redis": DependencyStatus.UP,
-        "claude": DependencyStatus.UP,
+        "openai": DependencyStatus.UP,
         "drive": DependencyStatus.UP,
         "gmail": DependencyStatus.UP,
     }
@@ -102,7 +127,7 @@ async def test_health_endpoints_keep_liveness_process_only_and_use_ready_status(
             erasure_replay=DependencyStatus.DOWN,
             key_wrapping=DependencyStatus.DOWN,
             redis=DependencyStatus.DOWN,
-            claude=DependencyStatus.DOWN,
+            openai=DependencyStatus.DOWN,
             drive=DependencyStatus.DOWN,
             gmail=DependencyStatus.DOWN,
         )
