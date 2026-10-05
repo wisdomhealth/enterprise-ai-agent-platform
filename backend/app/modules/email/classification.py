@@ -41,7 +41,7 @@ class ClassificationExecution:
     input_tokens: int
     output_tokens: int
     estimated_cost: float
-    usage_complete: bool = False
+    usage_complete: bool = True
 
 
 class EmailClassifier(Protocol):

@@ -50,7 +50,7 @@ class EmailDraftProvenance(BaseModel):
     estimated_cost: float = Field(ge=0)
     retrieval_principal_id: UUID
     retrieval_actor_type: str = "STAFF"
-    usage_complete: bool = False
+    usage_complete: bool = True
 
 
 class EmailDraftResult(BaseModel):

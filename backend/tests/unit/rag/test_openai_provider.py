@@ -6,6 +6,7 @@ from app.core.openai import (
     StructuredModelResult,
 )
 from app.modules.rag.llm import (
+    GeneratedAnswer,
     OpenAIGenerationProvider,
     ProviderResponseError,
     ProviderTransientError,
@@ -22,6 +23,19 @@ class _StructuredClient:
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
+
+
+def test_generated_answer_legacy_constructor_treats_explicit_counts_as_complete() -> None:
+    answer = _StructuredGeneration(text="Answer.", claims=[])
+    generated = GeneratedAnswer(
+        text=answer.text,
+        claims=answer.claims,
+        model="legacy-test",
+        input_tokens=1,
+        output_tokens=1,
+    )
+
+    assert generated.usage_complete is True
 
 
 @pytest.mark.asyncio

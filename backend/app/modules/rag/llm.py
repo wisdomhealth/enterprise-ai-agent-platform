@@ -40,7 +40,7 @@ class GeneratedAnswer(BaseModel):
     model: str
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
-    usage_complete: bool = False
+    usage_complete: bool = True
 
 
 class _StructuredGeneration(BaseModel):
