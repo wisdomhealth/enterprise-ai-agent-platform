@@ -101,6 +101,7 @@ async def test_draft_contains_only_authorized_staff_citations(
         input_tokens=21,
         output_tokens=8,
         estimated_cost=0.0002,
+        usage_complete=True,
     )
     chunk = RetrievedChunk(
         chunk_id=chunk_id,
@@ -139,6 +140,7 @@ async def test_draft_contains_only_authorized_staff_citations(
     assert draft.provenance.model == "claude-draft"
     assert draft.provenance.retrieval_latency_ms == 2
     assert draft.provenance.retrieval_actor_type == "SYSTEM"
+    assert draft.provenance.usage_complete is True
     history = await db_session.scalar(
         select(EmailStateHistory).where(
             EmailStateHistory.work_item_id == item.id,

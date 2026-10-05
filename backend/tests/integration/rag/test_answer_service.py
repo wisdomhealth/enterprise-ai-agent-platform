@@ -5,7 +5,7 @@ import pytest
 
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
-from app.modules.rag.answer_service import GroundedAnswerService
+from app.modules.rag.answer_service import GroundedAnswerService, estimated_cost
 from app.modules.rag.groundedness import CitationValidator
 from app.modules.rag.llm import (
     GeneratedAnswer,
@@ -40,6 +40,17 @@ class RaisingLLM:
 
     async def generate(self, prompt):  # type: ignore[no-untyped-def]
         raise self.error
+
+
+class SequenceLLM:
+    def __init__(self, answers: list[GeneratedAnswer]) -> None:
+        self.answers = answers
+        self.calls = 0
+
+    async def generate(self, prompt):  # type: ignore[no-untyped-def]
+        answer = self.answers[self.calls]
+        self.calls += 1
+        return answer
 
 
 class MalformedLLM:
@@ -78,6 +89,61 @@ def _service(chunk: RetrievedChunk, llm: FakeLLM) -> GroundedAnswerService:
         CitationValidator(),
         ProviderCircuitBreaker(InMemoryRedisCircuitStore()),
     )
+
+
+def test_cost_uses_configured_rates() -> None:
+    assert (
+        estimated_cost(
+            1_000_000,
+            2_000_000,
+            input_rate=1.25,
+            output_rate=5.0,
+        )
+        == 11.25
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_usage_and_completeness_reach_answer() -> None:
+    principal = _principal()
+    chunk = _chunk(principal)
+    provider = SequenceLLM(
+        [
+            GeneratedAnswer(
+                text="Unsupported answer.",
+                claims=[ClaimSupport(text="Unsupported answer.", citation_ids=[chunk.chunk_id])],
+                model="gpt-test",
+                input_tokens=8,
+                output_tokens=4,
+                usage_complete=False,
+            ),
+            GeneratedAnswer(
+                text=chunk.text,
+                claims=[ClaimSupport(text=chunk.text, citation_ids=[chunk.chunk_id])],
+                model="gpt-test",
+                input_tokens=12,
+                output_tokens=8,
+                usage_complete=True,
+            ),
+        ]
+    )
+    service = GroundedAnswerService(
+        FakeRetriever([chunk]),
+        provider,
+        CitationValidator(),
+        ProviderCircuitBreaker(InMemoryRedisCircuitStore()),
+    )
+
+    execution = await service.answer_with_evidence(
+        principal,
+        chunk.knowledge_base_id,
+        "How long do refunds take?",
+        AnswerAudience.STAFF,
+    )
+
+    assert execution.answer.input_tokens == 20
+    assert execution.answer.output_tokens == 12
+    assert execution.answer.usage_complete is False
 
 
 @pytest.mark.asyncio

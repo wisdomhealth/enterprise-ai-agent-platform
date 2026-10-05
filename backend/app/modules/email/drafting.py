@@ -106,6 +106,7 @@ class EmailDraftingService:
                 estimated_cost=execution.answer.estimated_cost,
                 retrieval_principal_id=self._principal.subject_id,
                 retrieval_actor_type=self._actor_type,
+                usage_complete=execution.answer.usage_complete,
             )
         except _DraftFailure as error:
             await self._fail(item, error.code, job_id=job_id)
