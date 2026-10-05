@@ -1,8 +1,10 @@
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from llama_index.core.schema import NodeWithScore, TextNode
 from sqlalchemy import delete, func, select
 
 from app.modules.knowledge.models import (
@@ -89,24 +91,77 @@ async def test_embedding_publication_switches_current_version_only_after_every_c
 
 
 @pytest.mark.asyncio
-async def test_hybrid_retriever_runs_both_branches_and_fuses_stable_chunk_ids() -> None:
+async def test_llamaindex_fuses_authorized_branches_and_deduplicates_stable_chunks() -> None:
+    organization_id = uuid4()
+    knowledge_base_id = uuid4()
+    original_a = chunk("a", organization_id, knowledge_base_id)
+    original_b = chunk("b", organization_id, knowledge_base_id)
+    original_c = chunk("c", organization_id, knowledge_base_id)
+    cross_tenant = chunk("foreign", uuid4(), knowledge_base_id)
+
     class VectorSource:
         async def search(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            return [chunk("a"), chunk("b")]
+            return [original_a, cross_tenant, original_b]
 
     class TextSource:
         async def search(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            return [chunk("b"), chunk("c")]
+            return [original_b, original_c]
 
     class Provider:
         async def embed(self, texts: list[str]) -> list[list[float]]:
             return [[1.0] * 1536]
 
     result = await HybridRetriever(VectorSource(), TextSource(), Provider()).retrieve(
-        object(), uuid4(), "policy", 10
+        SimpleNamespace(organization_id=organization_id), knowledge_base_id, "policy", 10
     )
 
     assert [item.stable_id for item in result] == ["b", "a", "c"]
+    assert result[0].document_version_id == original_b.document_version_id
+    assert result[0].page_number == original_b.page_number
+
+
+@pytest.mark.asyncio
+async def test_llamaindex_postprocessor_cannot_add_or_corrupt_authorized_nodes() -> None:
+    organization_id = uuid4()
+    knowledge_base_id = uuid4()
+    authorized = chunk("authorized", organization_id, knowledge_base_id)
+
+    class Source:
+        async def search(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return [authorized]
+
+    class EmptySource:
+        async def search(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return []
+
+    class Provider:
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0] * 1536]
+
+    class MaliciousPostprocessor:
+        def postprocess_nodes(self, nodes, **kwargs):  # type: ignore[no-untyped-def]
+            nodes[0].node.metadata["organization_id"] = str(uuid4())
+            return nodes + [
+                NodeWithScore(
+                    node=TextNode(
+                        id_=str(uuid4()),
+                        text="injected",
+                        metadata={"stable_id": "injected"},
+                    ),
+                    score=1.0,
+                )
+            ]
+
+    result = await HybridRetriever(
+        Source(),
+        EmptySource(),
+        Provider(),
+        node_postprocessors=[MaliciousPostprocessor()],
+    ).retrieve(
+        SimpleNamespace(organization_id=organization_id), knowledge_base_id, "policy", 10
+    )
+
+    assert result == []
 
 
 @pytest.mark.asyncio
@@ -470,9 +525,9 @@ async def test_hybrid_retriever_rejects_shared_postgresql_session(db_session) ->
         await retriever.retrieve(object(), uuid4(), "policy", 10)
 
 
-def chunk(stable_id: str) -> RetrievedChunk:
+def chunk(stable_id: str, organization_id, knowledge_base_id) -> RetrievedChunk:  # type: ignore[no-untyped-def]
     return RetrievedChunk(
         chunk_id=uuid4(), stable_id=stable_id, document_version_id=uuid4(), document_id=uuid4(),
-        organization_id=uuid4(), knowledge_base_id=uuid4(), ordinal=0, text=stable_id,
-        page_number=None, section=None, resource_authorized=True,
+        organization_id=organization_id, knowledge_base_id=knowledge_base_id, ordinal=0,
+        text=stable_id, page_number=2, section="Policy", resource_authorized=True,
     )
