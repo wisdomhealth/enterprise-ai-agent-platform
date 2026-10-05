@@ -2196,7 +2196,7 @@
             "type": "string"
           },
           "usage_complete": {
-            "default": false,
+            "default": true,
             "title": "Usage Complete",
             "type": "boolean"
           }
