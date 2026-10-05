@@ -1,13 +1,23 @@
-import json
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
-from anthropic import AsyncAnthropic
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.openai import (
+    LangChainStructuredClient,
+    ModelUsage,
+    OpenAIStructuredResponseError,
+    StructuredModelResult,
+    build_structured_openai_client,
+)
 from app.modules.rag.prompts import GroundedPrompt
 from app.modules.rag.types import ClaimSupport
+
+if TYPE_CHECKING:
+    from app.core.config import Settings
 
 
 class ProviderTransientError(RuntimeError):
@@ -16,6 +26,10 @@ class ProviderTransientError(RuntimeError):
 
 class ProviderResponseError(RuntimeError):
     """The provider returned output outside the strict generation contract."""
+
+    def __init__(self, message: str, *, usage: ModelUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage or ModelUsage(input_tokens=0, output_tokens=0, complete=False)
 
 
 class GeneratedAnswer(BaseModel):
@@ -26,10 +40,11 @@ class GeneratedAnswer(BaseModel):
     model: str
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
+    usage_complete: bool = False
 
 
 class _StructuredGeneration(BaseModel):
-    """The exact JSON schema accepted from Claude before provider metadata is attached."""
+    """The exact JSON schema accepted before trusted provider metadata is attached."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -41,83 +56,54 @@ class GenerationProvider(Protocol):
     async def generate(self, prompt: GroundedPrompt) -> GeneratedAnswer: ...
 
 
-class _AnthropicMessages(Protocol):
-    async def create(self, **kwargs: object) -> object: ...
-
-
-class _AnthropicClient(Protocol):
-    messages: _AnthropicMessages
-
-
-class AnthropicGenerationProvider:
-    """The only generation provider; it does not expose tools or a fallback model."""
-
-    def __init__(
+class _GenerationStructuredClient(Protocol):
+    async def invoke(
         self,
-        api_key: str,
+        schema: type[_StructuredGeneration],
         *,
-        model: str = "claude-3-5-sonnet-latest",
-        base_url: str | None = None,
-        client: _AnthropicClient | None = None,
-    ) -> None:
-        self._model = model
-        self._client: _AnthropicClient = (
-            client
-            if client is not None
-            else cast(
-                _AnthropicClient,
-                (
-                    AsyncAnthropic(api_key=api_key, base_url=base_url)
-                    if base_url
-                    else AsyncAnthropic(api_key=api_key)
-                ),
-            )
+        system: str,
+        user: str,
+    ) -> StructuredModelResult[_StructuredGeneration]: ...
+
+
+class OpenAIGenerationProvider:
+    """Grounded generation through the shared validated LangChain OpenAI boundary."""
+
+    def __init__(self, client: object) -> None:
+        self._client = cast(_GenerationStructuredClient, client)
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> OpenAIGenerationProvider:
+        client: LangChainStructuredClient = build_structured_openai_client(
+            settings,
+            model_name=settings.openai_generation_model,
         )
+        return cls(client)
 
     async def generate(self, prompt: GroundedPrompt) -> GeneratedAnswer:
-        started = time.monotonic()
         try:
-            response = await self._client.messages.create(
-                model=self._model,
-                max_tokens=1_024,
+            result = await self._client.invoke(
+                _StructuredGeneration,
                 system=prompt.system_message,
-                messages=[{"role": "user", "content": prompt.user_message}],
+                user=prompt.user_message,
             )
+        except OpenAIStructuredResponseError as error:
+            raise ProviderResponseError(
+                "OpenAI returned invalid structured answer data",
+                usage=error.usage,
+            ) from error
         except Exception as error:
             if _is_transient_provider_error(error):
-                raise ProviderTransientError("Claude temporarily unavailable") from error
+                raise ProviderTransientError("OpenAI temporarily unavailable") from error
             raise
-        try:
-            payload = _response_text(response)
-            parsed = _StructuredGeneration.model_validate_json(payload)
-            usage = getattr(response, "usage")
-            return GeneratedAnswer(
-                text=parsed.text,
-                claims=parsed.claims,
-                model=str(getattr(response, "model", self._model)),
-                input_tokens=int(getattr(usage, "input_tokens", 0)),
-                output_tokens=int(getattr(usage, "output_tokens", 0)),
-            )
-        except (
-            AttributeError,
-            TypeError,
-            ValueError,
-            ValidationError,
-            json.JSONDecodeError,
-        ) as error:
-            raise ProviderResponseError("Claude returned invalid structured answer data") from error
-        finally:
-            _ = time.monotonic() - started
-
-
-def _response_text(response: object) -> str:
-    content = getattr(response, "content")
-    if not isinstance(content, list) or len(content) != 1:
-        raise ValueError("expected one Claude text block")
-    text = getattr(content[0], "text", None)
-    if not isinstance(text, str):
-        raise ValueError("expected Claude text block")
-    return text
+        return GeneratedAnswer(
+            text=result.value.text,
+            claims=result.value.claims,
+            model=result.model,
+            input_tokens=result.usage.input_tokens,
+            output_tokens=result.usage.output_tokens,
+            usage_complete=result.usage.complete,
+        )
 
 
 def _is_transient_provider_error(error: Exception) -> bool:

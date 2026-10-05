@@ -87,6 +87,7 @@ class ValidatedAnswer(BaseModel):
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     estimated_cost: float = Field(ge=0)
+    usage_complete: bool = False
 
 
 class EmbeddingProvider(Protocol):
