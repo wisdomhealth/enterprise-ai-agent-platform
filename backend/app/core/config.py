@@ -67,11 +67,6 @@ class Settings(BaseSettings):
         validation_alias="MIGRATION_DATABASE_URL",
     )
     redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
-    anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(
-        default="claude-3-5-sonnet-latest", validation_alias="ANTHROPIC_MODEL"
-    )
-    anthropic_base_url: AnyUrl | None = Field(default=None, validation_alias="ANTHROPIC_BASE_URL")
     safety_classifier_model: str | None = Field(
         default=None,
         validation_alias="SAFETY_CLASSIFIER_MODEL",
@@ -91,6 +86,43 @@ class Settings(BaseSettings):
     )
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     openai_base_url: AnyUrl | None = Field(default=None, validation_alias="OPENAI_BASE_URL")
+    openai_generation_model: str = Field(
+        default="gpt-4.1-mini", validation_alias="OPENAI_GENERATION_MODEL"
+    )
+    openai_classifier_model: str = Field(
+        default="gpt-4.1-mini", validation_alias="OPENAI_CLASSIFIER_MODEL"
+    )
+    openai_embedding_model: str = Field(
+        default="text-embedding-3-small", validation_alias="OPENAI_EMBEDDING_MODEL"
+    )
+    openai_request_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=120,
+        validation_alias="OPENAI_REQUEST_TIMEOUT_SECONDS",
+    )
+    rag_execution_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=300,
+        validation_alias="RAG_EXECUTION_TIMEOUT_SECONDS",
+    )
+    rag_max_generation_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        validation_alias="RAG_MAX_GENERATION_ATTEMPTS",
+    )
+    openai_input_cost_per_million: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias="OPENAI_INPUT_COST_PER_MILLION",
+    )
+    openai_output_cost_per_million: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias="OPENAI_OUTPUT_COST_PER_MILLION",
+    )
     reranker_enabled: bool = Field(default=False, validation_alias="RERANKER_ENABLED")
     google_oidc_client_id: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_OIDC_CLIENT_ID"
