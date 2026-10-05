@@ -5,7 +5,6 @@ from urllib.parse import unquote, urlsplit
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _EXTERNAL_PROVIDER_ENV = (
-    "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GOOGLE_OIDC_CLIENT_ID",
     "GOOGLE_OIDC_CLIENT_SECRET",
@@ -18,7 +17,7 @@ _EXTERNAL_PROVIDER_ENV = (
     "CONNECTOR_FILE_KEY_PATH",
     "REDIS_URL",
 )
-_TASK26_LOCAL_RUNTIME_KEYS = frozenset({"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "REDIS_URL"})
+_TASK26_LOCAL_RUNTIME_KEYS = frozenset({"OPENAI_API_KEY", "REDIS_URL"})
 
 
 def _is_task26_local_provider_url(value: str, *, expected_path: str) -> bool:
@@ -38,11 +37,7 @@ def _is_task26_local_provider_url(value: str, *, expected_path: str) -> bool:
 def _has_only_task26_local_provider(environ: Mapping[str, str]) -> bool:
     return (
         environ.get("TASK26_LOCAL_PROVIDER") == "1"
-        and environ.get("ANTHROPIC_API_KEY") == "task26-local"
         and environ.get("OPENAI_API_KEY") == "task26-local"
-        and _is_task26_local_provider_url(
-            environ.get("ANTHROPIC_BASE_URL", ""), expected_path=""
-        )
         and _is_task26_local_provider_url(
             environ.get("OPENAI_BASE_URL", ""), expected_path="/v1"
         )
@@ -75,9 +70,7 @@ def validate_task16_e2e_environment(environ: Mapping[str, str]) -> str:
 
     local_provider = _has_only_task26_local_provider(environ)
     provider_fields = (
-        "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
-        "ANTHROPIC_BASE_URL",
         "OPENAI_BASE_URL",
         "TASK26_LOCAL_PROVIDER",
     )

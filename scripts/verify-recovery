@@ -208,7 +208,6 @@ def _assert_isolated(
                 values.get("DATABASE_URL", ""), host="postgres", port=5432
             )
             for secret_name in (
-                "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
                 "GOOGLE_DRIVE_CLIENT_SECRET",
                 "GOOGLE_GMAIL_CLIENT_SECRET",

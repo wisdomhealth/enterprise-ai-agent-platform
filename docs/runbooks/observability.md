@@ -12,7 +12,7 @@ the source of actor, event, and recovery truth for every subsystem.
 - `/health/ready` returns `503` when PostgreSQL is unavailable, the schema is not
   at `0021_webhook_subscriptions`, required key wrapping is unavailable, or the
   configured post-restore erasure generation is incomplete. It returns `200`
-  with `status=degraded` when Redis, Claude, Drive, or Gmail is unavailable.
+  with `status=degraded` when Redis, OpenAI, Drive, or Gmail is unavailable.
 - `/metrics` exposes aggregate operational metadata only. It does not include
   prompts, answers, document text, email/chat bodies, credentials, customer
   identifiers, URLs, or tenant labels.

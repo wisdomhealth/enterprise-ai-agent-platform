@@ -79,6 +79,92 @@
         "title": "ClaimSupport",
         "type": "object"
       },
+      "ConnectorAuthorizationActionRead": {
+        "properties": {
+          "action": {
+            "enum": [
+              "connector.create",
+              "connector.reauthorize",
+              "connector.revoke"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "granted": {
+            "title": "Granted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action",
+          "granted"
+        ],
+        "title": "ConnectorAuthorizationActionRead",
+        "type": "object"
+      },
+      "ConnectorAuthorizationRead": {
+        "properties": {
+          "actions": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectorAuthorizationActionRead"
+            },
+            "title": "Actions",
+            "type": "array"
+          },
+          "authorize_endpoint": {
+            "title": "Authorize Endpoint",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ConnectorKind"
+          },
+          "resource_id": {
+            "format": "uuid",
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "staff_user_id": {
+            "format": "uuid",
+            "title": "Staff User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "staff_user_id",
+          "kind",
+          "resource_id",
+          "authorize_endpoint",
+          "actions"
+        ],
+        "title": "ConnectorAuthorizationRead",
+        "type": "object"
+      },
+      "ConnectorGrantReplace": {
+        "properties": {
+          "actions": {
+            "items": {
+              "enum": [
+                "connector.create",
+                "connector.reauthorize",
+                "connector.revoke"
+              ],
+              "type": "string"
+            },
+            "title": "Actions",
+            "type": "array"
+          },
+          "staff_user_id": {
+            "format": "uuid",
+            "title": "Staff User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "staff_user_id"
+        ],
+        "title": "ConnectorGrantReplace",
+        "type": "object"
+      },
       "ConnectorKind": {
         "enum": [
           "DRIVE",
@@ -2108,6 +2194,11 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "usage_complete": {
+            "default": false,
+            "title": "Usage Complete",
+            "type": "boolean"
           }
         },
         "required": [
@@ -2273,6 +2364,170 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/admin/authorization/connectors": {
+      "get": {
+        "operationId": "connector_authorizations_api_v1_admin_authorization_connectors_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectorAuthorizationRead"
+                  },
+                  "title": "Response Connector Authorizations Api V1 Admin Authorization Connectors Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Connector Authorizations",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/authorization/connectors/{kind}/grants": {
+      "put": {
+        "operationId": "replace_connector_grants_api_v1_admin_authorization_connectors__kind__grants_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ConnectorKind"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorGrantReplace"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorAuthorizationRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Replace Connector Grants",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
     "/api/v1/admin/connectors/{connector_id}/reauthorize": {
       "post": {
         "operationId": "reauthorize_connector_api_v1_admin_connectors__connector_id__reauthorize_post",

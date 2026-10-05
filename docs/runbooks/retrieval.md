@@ -3,7 +3,7 @@
 The first release uses `text-embedding-3-small` (1536 dimensions), pgvector
 cosine search, PostgreSQL English full-text search, and reciprocal-rank fusion
 (RRF, `k=60`). Configure `OPENAI_API_KEY` only through the deployment secret
-manager. `EMBEDDING_MODEL` defaults to `text-embedding-3-small`; changing it
+manager. `OPENAI_EMBEDDING_MODEL` defaults to `text-embedding-3-small`; changing it
 requires a new migration and a full re-embedding, not an in-place toggle.
 
 Each candidate branch enforces organization, knowledge-base resource grant,
@@ -12,6 +12,12 @@ inside its SQL query before ranking. A revoked version is never eligible. The
 Reranker protocol is deliberately disabled by default (`RERANKER_ENABLED=false`)
 until the fixed evaluation set demonstrates a quality improvement that justifies
 its latency and cost.
+
+LlamaIndex performs RRF only after both SQL branches have enforced authorization;
+it does not generate answers or broaden scope. LangChain handles strict structured
+OpenAI output, while a bounded LangGraph performs evidence checks, generation and
+citation validation. Optional reranking remains disabled until the fixed evaluation
+set proves value. The migration itself changes no schema and requires no re-embedding.
 
 ## Publishing embeddings
 

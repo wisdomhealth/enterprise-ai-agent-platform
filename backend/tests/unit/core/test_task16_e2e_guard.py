@@ -48,7 +48,7 @@ def _environment(**overrides: str) -> dict[str, str]:
             },
             "disposable",
         ),
-        ({"ANTHROPIC_API_KEY": "real-provider-secret"}, "loopback fake provider"),
+        ({"OPENAI_API_KEY": "real-provider-secret"}, "loopback fake provider"),
     ],
 )
 def test_e2e_environment_rejects_unsafe_configuration(
@@ -86,8 +86,6 @@ def test_release_gate_e2e_allows_only_the_explicit_local_fake_provider() -> None
     environment = _environment(
         DATABASE_URL="postgresql+asyncpg://postgres@127.0.0.1:55436/platform_task26_fix",
         TASK26_LOCAL_PROVIDER="1",
-        ANTHROPIC_API_KEY="task26-local",
-        ANTHROPIC_BASE_URL="http://127.0.0.1:3201",
         OPENAI_API_KEY="task26-local",
         OPENAI_BASE_URL="http://127.0.0.1:3201/v1",
         REDIS_URL="redis://127.0.0.1:56385/0",
@@ -102,28 +100,22 @@ def test_release_gate_e2e_allows_only_the_explicit_local_fake_provider() -> None
         (
             {
                 "TASK26_LOCAL_PROVIDER": "1",
-                "ANTHROPIC_API_KEY": "task26-local",
-                "ANTHROPIC_BASE_URL": "https://provider.example.test",
                 "OPENAI_API_KEY": "task26-local",
-                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+                "OPENAI_BASE_URL": "https://provider.example.test/v1",
             },
             "loopback fake provider",
         ),
         (
             {
                 "TASK26_LOCAL_PROVIDER": "1",
-                "ANTHROPIC_API_KEY": "task26-local",
-                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201?token=unsafe",
                 "OPENAI_API_KEY": "task26-local",
-                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1?token=unsafe",
             },
             "loopback fake provider",
         ),
         (
             {
                 "TASK26_LOCAL_PROVIDER": "1",
-                "ANTHROPIC_API_KEY": "task26-local",
-                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
                 "OPENAI_API_KEY": "task26-local",
                 "OPENAI_BASE_URL": "http://127.0.0.1:3202/v1",
             },
@@ -132,9 +124,7 @@ def test_release_gate_e2e_allows_only_the_explicit_local_fake_provider() -> None
         (
             {
                 "TASK26_LOCAL_PROVIDER": "1",
-                "ANTHROPIC_API_KEY": "real-provider-secret",
-                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
-                "OPENAI_API_KEY": "task26-local",
+                "OPENAI_API_KEY": "real-provider-secret",
                 "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
                 "REDIS_URL": "redis://127.0.0.1:56385/0",
             },
@@ -143,10 +133,8 @@ def test_release_gate_e2e_allows_only_the_explicit_local_fake_provider() -> None
         (
             {
                 "TASK26_LOCAL_PROVIDER": "1",
-                "ANTHROPIC_API_KEY": "task26-local",
-                "ANTHROPIC_BASE_URL": "http://192.0.2.10:3201",
                 "OPENAI_API_KEY": "task26-local",
-                "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
+                "OPENAI_BASE_URL": "http://192.0.2.10:3201/v1",
                 "REDIS_URL": "redis://127.0.0.1:56385/0",
             },
             "loopback fake provider",
@@ -154,8 +142,6 @@ def test_release_gate_e2e_allows_only_the_explicit_local_fake_provider() -> None
         (
             {
                 "TASK26_LOCAL_PROVIDER": "1",
-                "ANTHROPIC_API_KEY": "task26-local",
-                "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
                 "OPENAI_API_KEY": "task26-local",
                 "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
                 "REDIS_URL": "redis://192.0.2.10:56385/0",
@@ -185,7 +171,7 @@ def test_release_gate_e2e_rejects_any_non_local_provider_configuration(
             {
                 "TASK16_E2E": "1",
                 "APP_ENV": "test",
-                "ANTHROPIC_API_KEY": "provider-secret",
+                "OPENAI_API_KEY": "provider-secret",
             },
             "loopback fake provider",
         ),

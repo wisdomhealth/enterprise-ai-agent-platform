@@ -74,8 +74,6 @@ app = create_app(
     Settings.model_validate(
         {
             "SESSION_SECRET": "task16-browser-secret",
-            "ANTHROPIC_API_KEY": "task26-local",
-            "ANTHROPIC_BASE_URL": "http://127.0.0.1:3201",
             "OPENAI_API_KEY": "task26-local",
             "OPENAI_BASE_URL": "http://127.0.0.1:3201/v1",
             "REDIS_URL": "redis://127.0.0.1:56385/0",
@@ -282,7 +280,7 @@ async def seed_task16_lifecycle() -> None:
             draft_body="Initial grounded reply.",
             draft_citations=[],
             draft_provenance={
-                "model": "claude-e2e",
+                "model": "gpt-e2e",
                 "prompt_version": "email-e2e-v1",
             },
             version=3,
@@ -299,7 +297,7 @@ async def seed_task16_lifecycle() -> None:
             subject="Re: Browser review request",
             thread_id=email_item.gmail_thread_id,
             reviewer_instruction=None,
-            model="claude-e2e",
+            model="gpt-e2e",
             prompt_version="email-e2e-v1",
             retrieval_config={},
             citations=[],
@@ -328,7 +326,7 @@ async def seed_task16_lifecycle() -> None:
             draft_body="Stale browser draft.",
             draft_citations=[],
             draft_provenance={
-                "model": "claude-e2e",
+                "model": "gpt-e2e",
                 "prompt_version": "email-e2e-v1",
             },
             version=3,
@@ -345,7 +343,7 @@ async def seed_task16_lifecycle() -> None:
             subject="Re: Concurrent browser review",
             thread_id=conflict_email_item.gmail_thread_id,
             reviewer_instruction=None,
-            model="claude-e2e",
+            model="gpt-e2e",
             prompt_version="email-e2e-v1",
             retrieval_config={},
             citations=[],

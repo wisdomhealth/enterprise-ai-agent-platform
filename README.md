@@ -13,9 +13,9 @@ queueing, rate limiting, caching, and ephemeral event fan-out.
 
 The platform ingests administrator-authorized Google Drive knowledge, supports
 public customer chat and staff handoff, and provides Gmail triage, knowledge-grounded
-drafting, review, and controlled delivery workflows. OpenAI
-`text-embedding-3-small` is used only for embeddings. Anthropic Claude is the
-generation provider. Google OIDC authenticates staff members.
+drafting, review, and controlled delivery workflows. OpenAI provides configured
+generation, classification, and embeddings through one provider boundary. Google
+OIDC authenticates staff members.
 
 ## Key Features
 
@@ -30,12 +30,14 @@ generation provider. Google OIDC authenticates staff members.
 
 - OpenAI `text-embedding-3-small` embeddings with PostgreSQL pgvector search.
 - PostgreSQL full-text search running independently alongside vector search.
-- Authorization filtering before candidate ranking, followed by Reciprocal Rank
-  Fusion (RRF).
+- Authorization filtering before candidate ranking, followed by LlamaIndex
+  Reciprocal Rank Fusion (RRF).
 - An optional reranker boundary that remains disabled unless evaluation proves its
   value.
-- Grounded Claude answers, citation mapping, claim-support validation, and
+- LangChain OpenAI structured answers, citation mapping, claim-support validation, and
   customer-safe citation projection.
+- A bounded, checkpointer-free LangGraph workflow with at most two generation
+  attempts and a total execution timeout.
 
 ### Public chat and human support
 
@@ -80,8 +82,7 @@ flowchart TB
 
     workers --> drive[Google Drive: read-only knowledge]
     workers --> gmail[Gmail]
-    workers --> embeddings[OpenAI: embeddings only]
-    workers --> claude[Anthropic Claude: generation]
+    workers --> openai[OpenAI: generation, classification, embeddings]
     api --> kms[Google Cloud KMS: connector credential wrapping]
 ```
 
@@ -103,10 +104,11 @@ flowchart LR
     query[User query] --> queryembed[Query embedding]
     queryembed --> vector[Vector search: pgvector]
     query --> text[Full-text search]
-    vector --> rrf[Reciprocal Rank Fusion]
+    vector --> rrf[LlamaIndex Reciprocal Rank Fusion]
     text --> rrf
     rrf --> rerank[Optional reranker]
-    rerank --> generate[Claude generation]
+    rerank --> graph[Bounded LangGraph workflow]
+    graph --> generate[LangChain OpenAI structured generation]
     generate --> validate[Citation and claim validation]
     validate --> persist[Persist validated answer]
     persist --> sse[SSE to customer]
@@ -115,8 +117,9 @@ flowchart LR
 Vector and text retrieval run independently, and both enforce the same
 authorization and document-eligibility scope before ranking. RRF combines their
 independently ranked candidates. Reranking is optional and normally disabled unless
-evaluation demonstrates a meaningful benefit. OpenAI provides embeddings only;
-Claude is the generation provider.
+evaluation demonstrates a meaningful benefit. LangChain owns structured OpenAI
+calls, LlamaIndex owns authorized candidate fusion, and LangGraph owns bounded
+answer orchestration. There is no automatic provider fallback.
 
 ## Repository Structure
 
@@ -177,7 +180,7 @@ docs/
 | --- | --- |
 | Backend | Python 3.12, FastAPI, Pydantic 2, SQLAlchemy 2 async, Alembic, Celery |
 | Data | PostgreSQL, pgvector, Redis |
-| AI | Anthropic Claude for generation; OpenAI `text-embedding-3-small` for embeddings |
+| AI | LangChain OpenAI, LlamaIndex, LangGraph, configurable OpenAI generation/classifier/embedding models |
 | Google | Google Drive API, Gmail API, Google OIDC, Google Cloud KMS |
 | Frontend | Next.js, React, TypeScript, Tailwind CSS |
 | Testing and operations | pytest, Vitest, Playwright, Ruff, mypy, Docker Compose, Nginx, Prometheus, Grafana, Loki |
@@ -210,6 +213,13 @@ make typecheck
 
 The environment example contains empty placeholders only. Supply customer-owned
 credentials through the environment; do not commit `.env`.
+
+The AI runtime is configured with `OPENAI_API_KEY`, `OPENAI_GENERATION_MODEL`,
+`OPENAI_CLASSIFIER_MODEL`, `OPENAI_EMBEDDING_MODEL`, request/workflow timeouts,
+`RAG_MAX_GENERATION_ATTEMPTS`, and per-million-token cost rates. This framework
+migration changes no database schema and requires no re-embedding when the existing
+embedding model remains selected. Local verification uses deterministic fakes and
+makes no paid provider calls.
 
 Run the container baseline with `docker compose up --build`. The backend exposes
 `GET /health/live` on port 8000 and the frontend runs on port 3000. Liveness never

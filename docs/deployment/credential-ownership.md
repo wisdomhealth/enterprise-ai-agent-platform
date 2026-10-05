@@ -32,15 +32,20 @@ not a developer account.
 | `PGBACKREST_REPO1_S3_KEY_SECRET` | Data platform | Backup repository access secret. |
 | `PGBACKREST_REPO1_CIPHER_PASS` | Data platform | Separate pgBackRest encryption secret. |
 | `REDIS_URL` | Platform operations | Redis endpoint reference for broker and notifications. |
-| `ANTHROPIC_API_KEY` | AI platform | Customer Anthropic account secret. |
-| `ANTHROPIC_MODEL` | AI platform | Approved Anthropic model identifier. |
-| `ANTHROPIC_BASE_URL` | AI platform | Optional Anthropic-compatible endpoint; use the official provider when unset. |
 | `SAFETY_CLASSIFIER_MODEL` | AI platform | Approved optional safety classifier identifier. |
 | `GROUNDED_REFUSAL_MESSAGE` | Product operations | Approved customer-facing fallback message for ungrounded answers. |
 | `PROVIDER_CIRCUIT_FAILURE_THRESHOLD` | AI platform | Approved consecutive provider-failure count before circuit opening. |
 | `PROVIDER_CIRCUIT_RESET_SECONDS` | AI platform | Approved provider circuit recovery cooldown in seconds. |
-| `OPENAI_API_KEY` | AI platform | Customer OpenAI account secret for embeddings. |
+| `OPENAI_API_KEY` | AI platform | Customer OpenAI account secret for generation, classification, and embeddings. |
 | `OPENAI_BASE_URL` | AI platform | Optional OpenAI-compatible endpoint; use the official provider when unset. |
+| `OPENAI_GENERATION_MODEL` | AI platform | Approved structured answer-generation model. |
+| `OPENAI_CLASSIFIER_MODEL` | AI platform | Approved email and safety classification model. |
+| `OPENAI_EMBEDDING_MODEL` | AI platform | Approved embedding model; changing vector compatibility requires a migration and re-embedding. |
+| `OPENAI_REQUEST_TIMEOUT_SECONDS` | AI platform | Per-request provider timeout. |
+| `RAG_EXECUTION_TIMEOUT_SECONDS` | AI platform | Total bounded LangGraph execution timeout. |
+| `RAG_MAX_GENERATION_ATTEMPTS` | AI platform | Maximum model calls per graph execution (bounded to 1-3). |
+| `OPENAI_INPUT_COST_PER_MILLION` | FinOps | Input-token rate used for estimated cost metadata. |
+| `OPENAI_OUTPUT_COST_PER_MILLION` | FinOps | Output-token rate used for estimated cost metadata. |
 | `RERANKER_ENABLED` | Product operations | Approved retrieval reranker feature setting. |
 | `GOOGLE_OIDC_CLIENT_ID` | Google Cloud administrator | Staff OIDC client identifier. |
 | `GOOGLE_OIDC_CLIENT_SECRET` | Google Cloud administrator | Staff OIDC client secret. |

@@ -59,7 +59,7 @@ REQUIRED_HANDOFF_ASSET_MARKERS = (
     "VM, DNS, and TLS",
     "PostgreSQL, backups, KMS, and monitoring",
     "Google Cloud project, Drive/Gmail identities, and OAuth clients",
-    "Claude and OpenAI accounts, budgets, and usage alerts",
+    "OpenAI account, models, budgets, and usage alerts",
     "Data migrations, API documents, state machines, architecture, and security guidance",
     "Tests, regression and acceptance sets, evaluations, and cost/latency baselines",
     "PITR, RPO/RTO, Redis recovery, Gmail reconciliation, and erasure replay evidence",
@@ -91,6 +91,41 @@ def _check_documents(failures: list[str]) -> None:
     missing = [path for path in REQUIRED_DOCUMENTS if not (ROOT / path).is_file()]
     if missing:
         failures.append(f"missing documents: {', '.join(missing)}")
+
+
+def _check_removed_provider_references(failures: list[str]) -> None:
+    """Keep obsolete provider identifiers out of active runtime and operator guidance."""
+    roots = (
+        ROOT / "backend/app",
+        ROOT / "docs/architecture",
+        ROOT / "docs/deployment",
+        ROOT / "docs/readiness",
+        ROOT / "docs/runbooks",
+        ROOT / "scripts",
+    )
+    files = (
+        ROOT / "backend/pyproject.toml",
+        ROOT / ".env.example",
+        ROOT / "compose.yaml",
+        ROOT / "compose.test.yaml",
+        ROOT / "README.md",
+    )
+    forbidden = ("anth" + "ropic", "clau" + "de")
+    matches: list[str] = []
+    candidates = list(files)
+    for root in roots:
+        candidates.extend(path for path in root.rglob("*") if path.is_file())
+    for path in candidates:
+        if path.name == "Test.py" or "__pycache__" in path.parts:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").casefold()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if any(token in content for token in forbidden):
+            matches.append(str(path.relative_to(ROOT)))
+    if matches:
+        failures.append(f"obsolete provider references: {', '.join(sorted(set(matches)))}")
 
 
 def _load_current_openapi(failures: list[str]) -> dict[str, Any] | None:
@@ -318,6 +353,7 @@ def _check_cross_links(failures: list[str]) -> None:
 def main() -> int:
     failures: list[str] = []
     _check_documents(failures)
+    _check_removed_provider_references(failures)
     _check_openapi(failures)
     _check_state_machines(failures)
     _check_environment_registry(failures)
