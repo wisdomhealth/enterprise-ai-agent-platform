@@ -28,6 +28,12 @@ handoff recommendation, with no provider detail, prompt, source text, token,
 or credential. If configuration prevents provider construction, the worker
 uses the configured grounded refusal and marks it as a handoff recommendation.
 
+The answer path is a checkpointer-free LangGraph with a configured total timeout
+and bounded generation attempts. PostgreSQL `JobIntent` remains the durable retry
+authority. LangChain requests strict structured OpenAI output; there is no automatic
+provider fallback. Missing usage metadata is recorded separately from genuine zero
+token usage without exposing provider content.
+
 When investigating a delayed response:
 
 1. Locate the `job_intents` row with kind `chat.answer` and the session/message

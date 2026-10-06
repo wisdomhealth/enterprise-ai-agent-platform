@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -5,6 +6,7 @@ from sqlalchemy import func, select
 
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
 from app.modules.identity.models import Organization
+from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import (
     Document,
@@ -15,6 +17,7 @@ from app.modules.knowledge.models import (
     KnowledgeBase,
 )
 from app.modules.knowledge.sync import DriveSyncService
+from app.modules.outbox.models import OutboxEvent
 
 
 class AuthorizationBoundary:
@@ -60,6 +63,7 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
     organization = Organization(name="Authorization loss owner")
     db_session.add(organization)
     await db_session.flush()
+    organization_id = organization.id
     knowledge_base = KnowledgeBase(organization_id=organization.id)
     db_session.add(knowledge_base)
     await db_session.flush()
@@ -73,6 +77,7 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
     )
     db_session.add(source)
     await db_session.flush()
+    source_id = source.id
     document = Document(
         organization_id=organization.id,
         knowledge_base_id=knowledge_base.id,
@@ -105,7 +110,17 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
             metadata_={},
         )
     )
+    parse_job = JobIntent(
+        kind="knowledge.document.parse",
+        idempotency_key=f"parse:{document.id}",
+        payload={"source_id": str(source.id), "document_id": str(document.id)},
+        state=JobState.RUNNING,
+        lease_owner="old-parser",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    db_session.add(parse_job)
     await db_session.commit()
+    parse_job_id = parse_job.id
 
     await DriveSyncService(db_session, page_gateway=AuthorizationBoundary()).sync(
         source.id, "cursor-1"
@@ -118,7 +133,28 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
     assert persisted_version.state is DocumentVersionState.REVOKED
     assert persisted_document is not None
     assert persisted_document.current_version_id is None
-    assert await db_session.scalar(select(func.count(DocumentChunk.id))) == 1
+    assert await db_session.scalar(
+        select(func.count(DocumentChunk.id)).where(
+            DocumentChunk.document_version_id == version_id
+        )
+    ) == 1
+    persisted_job = await db_session.get(JobIntent, parse_job_id)
+    assert persisted_job is not None
+    assert persisted_job.state is JobState.FAILED
+    assert persisted_job.last_error_code == "DOCUMENT_REVOKED"
+    cleanup_event = await db_session.scalar(
+        select(OutboxEvent).where(
+            OutboxEvent.event_type == "knowledge.document.cleanup.requested",
+            OutboxEvent.aggregate_id == document_id,
+        )
+    )
+    assert cleanup_event is not None
+    assert cleanup_event.payload == {
+        "organization_id": str(organization_id),
+        "source_id": str(source_id),
+        "document_id": str(document_id),
+        "version_ids": [str(version_id)],
+    }
 
 
 @pytest.mark.asyncio

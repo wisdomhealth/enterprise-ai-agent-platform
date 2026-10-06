@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from celery import shared_task  # type: ignore[import-untyped]
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -16,11 +16,19 @@ from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService
 from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.ingestion import DocumentIngestionService
-from app.modules.knowledge.models import Document, DocumentVersion, DriveSource, DriveSourceStatus
+from app.modules.knowledge.models import (
+    Document,
+    DocumentChunk,
+    DocumentVersion,
+    DocumentVersionState,
+    DriveSource,
+    DriveSourceStatus,
+)
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.knowledge.sync import DriveSyncService, SyncResult
-from app.modules.outbox.models import OutboxEvent
+from app.modules.outbox.models import OutboxEvent, ProcessedEvent
+from app.modules.outbox.service import OutboxService
 
 DRIVE_SYNC_TASK_NAME = "app.modules.knowledge.tasks.drive_source_sync"
 DRIVE_SYNC_WORKER_ID = "celery-drive-sync"
@@ -30,6 +38,9 @@ DOCUMENT_PARSE_TASK_NAME = "app.modules.knowledge.tasks.document_parse"
 DOCUMENT_PARSE_WORKER_ID = "celery-document-parse"
 DOCUMENT_PARSE_LEASE_SECONDS = 300
 DOCUMENT_PARSE_REQUESTED_EVENT_TYPE = "knowledge.document.parse.requested"
+DOCUMENT_CLEANUP_EVENT_TYPE = "knowledge.document.cleanup.requested"
+DOCUMENT_CLEANUP_TASK_NAME = "app.modules.knowledge.tasks.document_cleanup"
+DOCUMENT_CLEANUP_CONSUMER = "knowledge-document-cleanup-v1"
 
 
 class DocumentParseTask:
@@ -83,6 +94,27 @@ def dispatch_document_parse_outbox_event(event_id: str) -> None:
 def dispatch_pending_document_parse_outbox_events() -> None:
     """Recover document-parse events left pending after broker wakeup loss."""
     asyncio.run(_dispatch_pending_document_parse_outbox_events())
+
+
+@shared_task(  # type: ignore[untyped-decorator]
+    name=DOCUMENT_CLEANUP_TASK_NAME,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=5,
+)
+def document_cleanup(event_id: str) -> None:
+    """Idempotently delete chunks for the exact revoked versions in one event."""
+    asyncio.run(_consume_document_cleanup_event(UUID(event_id)))
+
+
+@shared_task(name="app.modules.knowledge.tasks.dispatch_document_cleanup_outbox_event")  # type: ignore[untyped-decorator]
+def dispatch_document_cleanup_outbox_event(event_id: str) -> None:
+    asyncio.run(_dispatch_document_cleanup_outbox_event(UUID(event_id)))
+
+
+@shared_task(name="app.modules.knowledge.tasks.dispatch_pending_document_cleanup_outbox_events")  # type: ignore[untyped-decorator]
+def dispatch_pending_document_cleanup_outbox_events() -> None:
+    asyncio.run(_dispatch_pending_document_cleanup_outbox_events())
 
 
 async def _dispatch_drive_sync_outbox_event(
@@ -192,6 +224,167 @@ async def _dispatch_pending_document_parse_outbox_events(
     )
     for event_id in event_ids:
         await _dispatch_document_parse_outbox_event(event_id, db_session=db_session)
+
+
+async def _dispatch_document_cleanup_outbox_event(
+    event_id: UUID, *, db_session: AsyncSession | None = None
+) -> bool:
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            return await _dispatch_document_cleanup_outbox_event(
+                event_id, db_session=owned_session
+            )
+    event = await db_session.scalar(
+        select(OutboxEvent)
+        .where(OutboxEvent.event_id == event_id)
+        .execution_options(populate_existing=True)
+    )
+    if (
+        event is None
+        or event.event_type != DOCUMENT_CLEANUP_EVENT_TYPE
+        or event.aggregate_type != "document"
+        or await db_session.get(
+            ProcessedEvent,
+            {
+                "consumer_name": DOCUMENT_CLEANUP_CONSUMER,
+                "event_id": event_id,
+            },
+        )
+        is not None
+    ):
+        return False
+    try:
+        document_cleanup.delay(str(event.event_id))
+    except Exception:
+        event.publish_attempts += 1
+        await db_session.commit()
+        raise
+    event.publish_attempts += 1
+    if event.published_at is None:
+        event.published_at = func.clock_timestamp()
+    await db_session.commit()
+    return True
+
+
+async def _dispatch_pending_document_cleanup_outbox_events(
+    *, db_session: AsyncSession | None = None
+) -> None:
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            await _dispatch_pending_document_cleanup_outbox_events(
+                db_session=owned_session
+            )
+            return
+    processed = select(ProcessedEvent.event_id).where(
+        ProcessedEvent.consumer_name == DOCUMENT_CLEANUP_CONSUMER,
+        ProcessedEvent.event_id == OutboxEvent.event_id,
+    )
+    event_ids = list(
+        (
+            await db_session.scalars(
+                select(OutboxEvent.event_id).where(
+                    OutboxEvent.event_type == DOCUMENT_CLEANUP_EVENT_TYPE,
+                    OutboxEvent.aggregate_type == "document",
+                    ~processed.exists(),
+                )
+            )
+        ).all()
+    )
+    for event_id in event_ids:
+        await _dispatch_document_cleanup_outbox_event(event_id, db_session=db_session)
+
+
+async def _consume_document_cleanup_event(
+    event_id: UUID, *, db_session: AsyncSession | None = None
+) -> bool:
+    if db_session is None:
+        async with async_sessionmaker() as owned_session:
+            return await _consume_document_cleanup_event(event_id, db_session=owned_session)
+    try:
+        event = await db_session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_id == event_id,
+                OutboxEvent.event_type == DOCUMENT_CLEANUP_EVENT_TYPE,
+                OutboxEvent.aggregate_type == "document",
+            )
+        )
+        if event is None:
+            await db_session.rollback()
+            return False
+        if not await OutboxService().begin_processing(
+            db_session, DOCUMENT_CLEANUP_CONSUMER, event.event_id
+        ):
+            await db_session.rollback()
+            return False
+
+        organization_id = _cleanup_payload_uuid(event.payload, "organization_id")
+        source_id = _cleanup_payload_uuid(event.payload, "source_id")
+        document_id = _cleanup_payload_uuid(event.payload, "document_id")
+        raw_version_ids = event.payload.get("version_ids")
+        if (
+            not isinstance(raw_version_ids, list)
+            or not raw_version_ids
+            or not all(isinstance(value, str) for value in raw_version_ids)
+        ):
+            raise ValueError("cleanup event requires version_ids")
+        try:
+            version_ids = [UUID(value) for value in raw_version_ids]
+        except ValueError as exc:
+            raise ValueError("cleanup event contains an invalid version ID") from exc
+        if len(set(version_ids)) != len(version_ids):
+            raise ValueError("cleanup event contains duplicate version IDs")
+        if event.aggregate_id != document_id:
+            raise ValueError("cleanup event aggregate mismatch")
+
+        document = await db_session.scalar(
+            select(Document)
+            .join(DriveSource, DriveSource.id == Document.source_id)
+            .where(
+                Document.id == document_id,
+                Document.organization_id == organization_id,
+                Document.source_id == source_id,
+                DriveSource.id == source_id,
+                DriveSource.organization_id == organization_id,
+            )
+            .with_for_update()
+        )
+        if document is None:
+            raise ValueError("cleanup event ownership mismatch")
+        versions = list(
+            (
+                await db_session.scalars(
+                    select(DocumentVersion)
+                    .where(
+                        DocumentVersion.id.in_(version_ids),
+                        DocumentVersion.document_id == document.id,
+                    )
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if len(versions) != len(version_ids):
+            raise ValueError("cleanup event version ownership mismatch")
+        if any(version.state is not DocumentVersionState.REVOKED for version in versions):
+            raise ValueError("cleanup event may delete only revoked versions")
+
+        await db_session.execute(
+            delete(DocumentChunk).where(DocumentChunk.document_version_id.in_(version_ids))
+        )
+        await db_session.commit()
+        return True
+    except Exception:
+        await db_session.rollback()
+        raise
+
+
+def _cleanup_payload_uuid(payload: Mapping[str, object], field: str) -> UUID:
+    value = payload.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"cleanup event requires {field}")
+    try:
+        return UUID(value)
+    except ValueError as exc:
+        raise ValueError(f"cleanup event contains an invalid {field}") from exc
 
 
 async def _parent_sync_succeeded(event: OutboxEvent, db_session: AsyncSession) -> bool:
@@ -418,6 +611,13 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
                 except Exception:
                     # The committed event remains authoritative; the periodic
                     # sweep recovers this best-effort broker wakeup.
+                    pass
+            for event_id in result.cleanup_outbox_event_ids:
+                try:
+                    dispatch_document_cleanup_outbox_event.delay(str(event_id))
+                except Exception:
+                    # The cleanup event is already committed; the periodic
+                    # dispatcher recovers a failed post-commit broker wakeup.
                     pass
         except JobLeaseLost:
             await db_session.rollback()

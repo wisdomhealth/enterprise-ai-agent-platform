@@ -79,6 +79,20 @@ def test_celery_concurrency_matches_the_connection_budget_configuration() -> Non
     assert create_celery(settings).conf.worker_concurrency == 7
 
 
+def test_celery_recovers_pending_document_cleanup_events_each_minute() -> None:
+    schedule = create_celery(Settings()).conf.beat_schedule[
+        "knowledge-document-cleanup-outbox-dispatch"
+    ]
+
+    assert schedule == {
+        "task": (
+            "app.modules.knowledge.tasks."
+            "dispatch_pending_document_cleanup_outbox_events"
+        ),
+        "schedule": 60,
+    }
+
+
 def test_worker_rag_assembly_accepts_the_celery_safe_session_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -110,7 +124,6 @@ def test_worker_rag_assembly_accepts_the_celery_safe_session_factory(
         {
             "DATABASE_URL": "postgresql+asyncpg://platform@127.0.0.1/platform",
             "OPENAI_API_KEY": "test-openai-key",
-            "ANTHROPIC_API_KEY": "test-anthropic-key",
             "REDIS_URL": "redis://127.0.0.1:6379/0",
         }
     )
@@ -118,3 +131,15 @@ def test_worker_rag_assembly_accepts_the_celery_safe_session_factory(
     GroundedAnswerService.from_settings(settings, session_factory=celery_async_sessionmaker)
 
     assert captured["session_factory"] is celery_async_sessionmaker
+
+
+def test_workers_build_openai_classifiers_from_one_provider_configuration() -> None:
+    from app.modules.chat.tasks import _build_safety_classifier
+    from app.modules.email.classification import OpenAIEmailClassifier
+    from app.modules.email.tasks import _build_classifier
+    from app.modules.support.triggers import OpenAIStructuredSafetyClassifier
+
+    settings = Settings.model_validate({"OPENAI_API_KEY": "test-openai-key"})
+
+    assert isinstance(_build_safety_classifier(settings), OpenAIStructuredSafetyClassifier)
+    assert isinstance(_build_classifier(settings), OpenAIEmailClassifier)

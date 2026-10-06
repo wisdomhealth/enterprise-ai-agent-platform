@@ -21,9 +21,10 @@ Prompts, chunks and message bodies are excluded from metrics and safe logs.
 ## Provider and connector boundary
 
 Google Drive uses a read-only scope; Gmail delivery is a separate connector
-boundary. Google OIDC, Drive and Gmail client credentials are distinct. Anthropic
-and OpenAI keys are provider-specific and may be supplied only by customer-owned
-secret management. Provider timeouts/circuit failures fail closed into safe errors;
+boundary. Google OIDC, Drive and Gmail client credentials are distinct. The OpenAI
+key may be supplied only by customer-owned secret management and is shared by the
+explicitly configured generation, classifier and embedding clients. Provider
+timeouts/circuit failures fail closed into safe errors;
 they do not authorize fallback access to source data.
 
 ## Key and data boundary

@@ -34,7 +34,7 @@ normalized before persistence.
 
 ## Classification and drafting
 
-Claude classification accepts only the exact category values `ACTION_REQUIRED`, `INFORMATIONAL`,
+Structured OpenAI classification accepts only the exact category values `ACTION_REQUIRED`, `INFORMATIONAL`,
 `SPAM`, `UNKNOWN`; priority values `HIGH`, `NORMAL`, `LOW`; and a required boolean
 `reply_required`. Extra, missing, inconsistent, or unknown fields fail closed.
 

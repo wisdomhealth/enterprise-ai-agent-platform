@@ -11,7 +11,7 @@ not paste credentials, private keys or token values.
 | VM, DNS, and TLS | Customer infrastructure owner | Customer cloud account, DNS zone and certificate administration | Pending customer receipt |
 | PostgreSQL, backups, KMS, and monitoring | Customer data and observability owners | Customer database, backup store, KMS and monitoring tenancy | Pending customer receipt |
 | Google Cloud project, Drive/Gmail identities, and OAuth clients | Customer Google Cloud administrator | Customer project and separated identity/client records | Pending customer receipt |
-| Claude and OpenAI accounts, budgets, and usage alerts | Customer AI platform owner | Customer provider organizations and budget alerts | Pending customer receipt |
+| OpenAI account, models, budgets, and usage alerts | Customer AI platform owner | Customer provider organization and budget alerts | Pending customer receipt |
 | Data migrations, API documents, state machines, architecture, and security guidance | Customer engineering and security owners | Release tag plus `docs/` handoff package | Pending customer receipt |
 | Tests, regression and acceptance sets, evaluations, and cost/latency baselines | Customer quality owner | Customer-controlled test/evaluation storage and release evidence | Pending customer receipt |
 | PITR, RPO/RTO, Redis recovery, Gmail reconciliation, and erasure replay evidence | Customer recovery owner | `docs/evidence/` plus customer recovery evidence store | Pending customer receipt |

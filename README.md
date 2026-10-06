@@ -13,29 +13,34 @@ queueing, rate limiting, caching, and ephemeral event fan-out.
 
 The platform ingests administrator-authorized Google Drive knowledge, supports
 public customer chat and staff handoff, and provides Gmail triage, knowledge-grounded
-drafting, review, and controlled delivery workflows. OpenAI
-`text-embedding-3-small` is used only for embeddings. Anthropic Claude is the
-generation provider. Google OIDC authenticates staff members.
+drafting, review, and controlled delivery workflows. OpenAI provides configured
+generation, classification, and embeddings through one provider boundary. Google
+OIDC authenticates staff members.
 
 ## Key Features
 
 ### Knowledge ingestion
 
 - Administrator-authorized, read-only Google Drive sources.
-- PDF and DOCX parsing, deterministic structural chunking, and embedding generation.
+- Local LlamaIndex PDF parsing, structure-aware LlamaIndex sentence chunking,
+  LlamaIndex OpenAI embeddings, and unchanged DOCX support.
 - Versioned documents with a retrievable lifecycle and current-version publication.
 - Durable synchronization, parsing, and indexing jobs with lease-based recovery.
+- Version-scoped physical chunk cleanup after a Drive file is trashed, permanently
+  deleted, or moved outside the authorized folder tree.
 
 ### Retrieval-augmented generation
 
 - OpenAI `text-embedding-3-small` embeddings with PostgreSQL pgvector search.
 - PostgreSQL full-text search running independently alongside vector search.
-- Authorization filtering before candidate ranking, followed by Reciprocal Rank
-  Fusion (RRF).
+- Authorization filtering before candidate ranking, followed by LlamaIndex
+  Reciprocal Rank Fusion (RRF).
 - An optional reranker boundary that remains disabled unless evaluation proves its
   value.
-- Grounded Claude answers, citation mapping, claim-support validation, and
+- LangChain OpenAI structured answers, citation mapping, claim-support validation, and
   customer-safe citation projection.
+- A bounded, checkpointer-free LangGraph workflow with at most two generation
+  attempts and a total execution timeout.
 
 ### Public chat and human support
 
@@ -80,8 +85,7 @@ flowchart TB
 
     workers --> drive[Google Drive: read-only knowledge]
     workers --> gmail[Gmail]
-    workers --> embeddings[OpenAI: embeddings only]
-    workers --> claude[Anthropic Claude: generation]
+    workers --> openai[OpenAI: generation, classification, embeddings]
     api --> kms[Google Cloud KMS: connector credential wrapping]
 ```
 
@@ -95,18 +99,19 @@ state.
 ```mermaid
 flowchart LR
     drive[Authorized Google Drive] --> sync[Sync]
-    sync --> parse[Parse PDF or DOCX]
-    parse --> chunk[Chunk]
-    chunk --> embed[Generate embeddings]
+    sync --> parse[LlamaIndex local PDF reader or DOCX parser]
+    parse --> chunk[LlamaIndex SentenceSplitter per page or section]
+    chunk --> embed[LlamaIndex OpenAI embedding adapter]
     embed --> pg[(PostgreSQL)]
 
     query[User query] --> queryembed[Query embedding]
     queryembed --> vector[Vector search: pgvector]
     query --> text[Full-text search]
-    vector --> rrf[Reciprocal Rank Fusion]
+    vector --> rrf[LlamaIndex Reciprocal Rank Fusion]
     text --> rrf
     rrf --> rerank[Optional reranker]
-    rerank --> generate[Claude generation]
+    rerank --> graph[Bounded LangGraph workflow]
+    graph --> generate[LangChain OpenAI structured generation]
     generate --> validate[Citation and claim validation]
     validate --> persist[Persist validated answer]
     persist --> sse[SSE to customer]
@@ -115,8 +120,9 @@ flowchart LR
 Vector and text retrieval run independently, and both enforce the same
 authorization and document-eligibility scope before ranking. RRF combines their
 independently ranked candidates. Reranking is optional and normally disabled unless
-evaluation demonstrates a meaningful benefit. OpenAI provides embeddings only;
-Claude is the generation provider.
+evaluation demonstrates a meaningful benefit. LangChain owns structured OpenAI
+calls, LlamaIndex owns authorized candidate fusion, and LangGraph owns bounded
+answer orchestration. There is no automatic provider fallback.
 
 ## Repository Structure
 
@@ -177,7 +183,7 @@ docs/
 | --- | --- |
 | Backend | Python 3.12, FastAPI, Pydantic 2, SQLAlchemy 2 async, Alembic, Celery |
 | Data | PostgreSQL, pgvector, Redis |
-| AI | Anthropic Claude for generation; OpenAI `text-embedding-3-small` for embeddings |
+| AI | LangChain OpenAI, LlamaIndex, LangGraph, configurable OpenAI generation/classifier/embedding models |
 | Google | Google Drive API, Gmail API, Google OIDC, Google Cloud KMS |
 | Frontend | Next.js, React, TypeScript, Tailwind CSS |
 | Testing and operations | pytest, Vitest, Playwright, Ruff, mypy, Docker Compose, Nginx, Prometheus, Grafana, Loki |
@@ -211,6 +217,16 @@ make typecheck
 The environment example contains empty placeholders only. Supply customer-owned
 credentials through the environment; do not commit `.env`.
 
+The AI runtime is configured with `OPENAI_API_KEY`, `OPENAI_GENERATION_MODEL`,
+`OPENAI_CLASSIFIER_MODEL`, `OPENAI_EMBEDDING_MODEL`,
+`OPENAI_EMBEDDING_DIMENSIONS`, `OPENAI_EMBEDDING_BATCH_SIZE`,
+`OPENAI_EMBEDDING_MAX_RETRIES`, `KNOWLEDGE_CHUNK_SIZE`,
+`KNOWLEDGE_CHUNK_OVERLAP`, request/workflow timeouts,
+`RAG_MAX_GENERATION_ATTEMPTS`, and per-million-token cost rates. Embedding dimensions
+remain 1536 because the existing pgvector column is fixed at that size. Local
+verification uses synthetic documents and deterministic fakes and makes no paid
+provider calls.
+
 Run the container baseline with `docker compose up --build`. The backend exposes
 `GET /health/live` on port 8000 and the frontend runs on port 3000. Liveness never
 connects to PostgreSQL, Redis, or external APIs.
@@ -218,6 +234,11 @@ connects to PostgreSQL, Redis, or external APIs.
 See [the platform baseline runbook](docs/runbooks/platform-baseline.md) for
 operating commands and [the readiness checklist](docs/readiness/checklist.md) for
 the explicit not-ready delivery gates.
+
+See [knowledge ingestion](docs/architecture/knowledge-ingestion.md) for PDF page
+semantics, chunk/embedding configuration, OCR limitations, atomic publication,
+safe replacement, and rollback. See the [Drive sync runbook](docs/runbooks/drive-sync.md)
+for the administrator cleanup workflow.
 
 ## Documentation and Production Handoff
 

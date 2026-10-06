@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -16,14 +17,19 @@ from app.modules.knowledge.service import KnowledgeSourceService
 from app.modules.knowledge.sync import SyncResult, drive_sync_job_key
 from app.modules.knowledge.tasks import (
     _consume_drive_sync_intent,
+    _dispatch_document_cleanup_outbox_event,
     _dispatch_drive_sync_outbox_event,
+    _dispatch_pending_document_cleanup_outbox_events,
     _dispatch_pending_drive_sync_outbox_events,
+    dispatch_document_cleanup_outbox_event,
     dispatch_document_parse_outbox_event,
     dispatch_drive_sync_outbox_event,
+    dispatch_pending_document_cleanup_outbox_events,
     dispatch_pending_drive_sync_outbox_events,
+    document_cleanup,
     drive_source_sync,
 )
-from app.modules.outbox.models import OutboxEvent
+from app.modules.outbox.models import OutboxEvent, ProcessedEvent
 
 
 @pytest.mark.asyncio
@@ -47,7 +53,9 @@ async def test_duplicate_manual_retries_preserve_one_durable_intent(db_session) 
     await db_session.commit()
 
     assert first.id == second.id
-    assert await db_session.scalar(select(func.count(JobIntent.id))) == 1
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(JobIntent.idempotency_key == key)
+    ) == 1
 
 
 def test_manual_and_scheduled_sync_share_one_durable_intent_key() -> None:
@@ -70,6 +78,58 @@ def test_pending_outbox_sweeper_is_registered_for_restart_recovery() -> None:
         dispatch_pending_drive_sync_outbox_events.name
         == "app.modules.knowledge.tasks.dispatch_pending_drive_sync_outbox_events"
     )
+
+
+def test_document_cleanup_tasks_are_registered() -> None:
+    assert document_cleanup.name == "app.modules.knowledge.tasks.document_cleanup"
+    assert (
+        dispatch_document_cleanup_outbox_event.name
+        == "app.modules.knowledge.tasks.dispatch_document_cleanup_outbox_event"
+    )
+    assert (
+        dispatch_pending_document_cleanup_outbox_events.name
+        == "app.modules.knowledge.tasks.dispatch_pending_document_cleanup_outbox_events"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_outbox_dispatch_and_pending_recovery(db_session, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    first = OutboxEvent(
+        event_type="knowledge.document.cleanup.requested",
+        aggregate_type="document",
+        aggregate_id=uuid4(),
+        payload={"version_ids": [str(uuid4())]},
+    )
+    second = OutboxEvent(
+        event_type="knowledge.document.cleanup.requested",
+        aggregate_type="document",
+        aggregate_id=uuid4(),
+        payload={"version_ids": [str(uuid4())]},
+    )
+    db_session.add_all((first, second))
+    await db_session.commit()
+    second.published_at = datetime.now(UTC)
+    await db_session.commit()
+    delivered: list[str] = []
+    monkeypatch.setattr(document_cleanup, "delay", delivered.append)
+
+    assert await _dispatch_document_cleanup_outbox_event(
+        first.event_id, db_session=db_session
+    ) is True
+    db_session.add(
+        ProcessedEvent(
+            consumer_name="knowledge-document-cleanup-v1",
+            event_id=first.event_id,
+        )
+    )
+    await db_session.commit()
+    assert await _dispatch_document_cleanup_outbox_event(
+        first.event_id, db_session=db_session
+    ) is False
+    await _dispatch_pending_document_cleanup_outbox_events(db_session=db_session)
+
+    assert delivered[0] == str(first.event_id)
+    assert delivered.count(str(second.event_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -130,7 +190,7 @@ async def test_broker_failure_leaves_outbox_event_pending_for_safe_redelivery(
     delivered: list[str] = []
     monkeypatch.setattr(drive_source_sync, "delay", delivered.append)
     assert await _dispatch_drive_sync_outbox_event(event_id, db_session=db_session) is True
-    assert delivered == [str(job_id)]
+    assert delivered.count(str(job_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -157,7 +217,7 @@ async def test_pending_outbox_sweeper_redelivers_after_post_commit_wakeup_loss(
     db_session.expire_all()
     persisted = await db_session.get(OutboxEvent, event_id)
 
-    assert delivered == [str(job_id)]
+    assert delivered.count(str(job_id)) == 1
     assert persisted is not None
     assert persisted.published_at is not None
     assert persisted.publish_attempts == 1
@@ -197,10 +257,18 @@ async def test_completed_drive_sync_wakes_each_committed_document_parse_event(
             payload={"document_id": str(uuid4())},
         )
         setup_session.add(parse_event)
+        cleanup_event = OutboxEvent(
+            event_type="knowledge.document.cleanup.requested",
+            aggregate_type="document",
+            aggregate_id=uuid4(),
+            payload={"version_ids": [str(uuid4())]},
+        )
+        setup_session.add(cleanup_event)
         await setup_session.commit()
         job_id = job.id
         source_id = source.id
         event_id = parse_event.event_id
+        cleanup_event_id = cleanup_event.event_id
 
     async def completed_sync(  # type: ignore[no-untyped-def]
         _self, source_id_value, _page_token, *, parent_sync_job_id
@@ -213,9 +281,11 @@ async def test_completed_drive_sync_wakes_each_committed_document_parse_event(
             0,
             0,
             parse_outbox_event_ids=(event_id,),
+            cleanup_outbox_event_ids=(cleanup_event_id,),
         )
 
-    dispatched: list[str] = []
+    dispatched_parse: list[str] = []
+    dispatched_cleanup: list[str] = []
     monkeypatch.setattr("app.modules.knowledge.tasks.DriveSyncService.sync", completed_sync)
     monkeypatch.setattr(
         "app.modules.knowledge.tasks.ConnectorService.from_settings",
@@ -225,7 +295,12 @@ async def test_completed_drive_sync_wakes_each_committed_document_parse_event(
         "app.modules.knowledge.tasks.GoogleDriveGatewayFactory.from_settings",
         classmethod(lambda _cls, _settings: object()),
     )
-    monkeypatch.setattr(dispatch_document_parse_outbox_event, "delay", dispatched.append)
+    monkeypatch.setattr(
+        dispatch_document_parse_outbox_event, "delay", dispatched_parse.append
+    )
+    monkeypatch.setattr(
+        dispatch_document_cleanup_outbox_event, "delay", dispatched_cleanup.append
+    )
 
     try:
         await _consume_drive_sync_intent(job_id)
@@ -235,7 +310,8 @@ async def test_completed_drive_sync_wakes_each_committed_document_parse_event(
             assert persisted_job.state is JobState.SUCCEEDED
             persisted_source = await inspection_session.get(DriveSource, source_id)
             assert persisted_source is not None
-        assert dispatched == [str(event_id)]
+        assert dispatched_parse == [str(event_id)]
+        assert dispatched_cleanup == [str(cleanup_event_id)]
     finally:
         await engine.dispose()
 

@@ -10,7 +10,7 @@ history, tickets, dashboards, or support messages.
 
 Use a KMS resource identifier in `GOOGLE_KMS_KEY_NAME`, for example a customer-owned
 key reference, not a key value. Use environment references such as `DATABASE_URL`,
-`PGBACKREST_REPO1_S3_KEY_SECRET`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY`; never
+`PGBACKREST_REPO1_S3_KEY_SECRET` and `OPENAI_API_KEY`; never
 replace them with real credentials in this document.
 
 ## Reproducible release procedure
@@ -54,3 +54,9 @@ roll back application images when the migration compatibility plan permits it;
 published migrations are append-only. For data restore, use the guarded procedure in
 [backup recovery](../runbooks/backup-recovery.md), a new empty target and a new
 `RESTORE_GENERATION`; never overwrite a live data directory.
+
+This AI framework migration has no database migration and does not require
+re-embedding while `OPENAI_EMBEDDING_MODEL` remains unchanged. Rollback uses the
+previous application image and its previous provider configuration as one reviewed
+release unit; never mix old runtime settings with the new image. There is no automatic
+provider fallback. Verify rollback with local fake providers before restoring traffic.

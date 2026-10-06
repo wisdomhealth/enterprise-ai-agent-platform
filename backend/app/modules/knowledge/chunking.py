@@ -5,6 +5,7 @@ from typing import Protocol, cast
 from uuid import UUID, uuid5
 
 import tiktoken
+from llama_index.core.node_parser import SentenceSplitter
 
 from app.modules.knowledge.parsers import ParsedSection
 
@@ -32,14 +33,14 @@ class _SemanticSection:
     page_number: int | None
     title: str | None
     path: tuple[str, ...]
+    metadata: dict[str, object]
 
 
 class DeterministicChunker:
     """Deterministic, structure-aware chunks without crossing semantic sections."""
 
-    target_tokens = 500
-    max_tokens = 800
-    overlap_tokens = 64
+    default_chunk_size = 500
+    default_chunk_overlap = 64
 
     _chinese_heading = re.compile(
         r"^第[一二三四五六七八九十百千万零〇0-9]+[章节条](?:\s*.*)?$"
@@ -51,14 +52,25 @@ class DeterministicChunker:
     _numbered_heading = re.compile(
         r"^(?:\d+(?:\.\d+)+(?:\s+.*)?|\d+[.)、](?:\s*.*)?)$"
     )
-    _sentence_boundary = re.compile(r"(?<=[。！？!?])\s*")
-
-    def __init__(self, tokenizer: Tokenizer | None = None) -> None:
+    def __init__(
+        self,
+        tokenizer: Tokenizer | None = None,
+        *,
+        chunk_size: int = default_chunk_size,
+        chunk_overlap: int = default_chunk_overlap,
+    ) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be non-negative and smaller than chunk_size")
         self._tokenizer: Tokenizer = (
             tokenizer
             if tokenizer is not None
             else cast(Tokenizer, tiktoken.encoding_for_model("text-embedding-3-small"))
         )
+        self.target_tokens = chunk_size
+        self.max_tokens = chunk_size
+        self.overlap_tokens = chunk_overlap
 
     def chunk(self, *, document_version_id: UUID, sections: list[ParsedSection]) -> list[Chunk]:
         chunks: list[Chunk] = []
@@ -76,7 +88,12 @@ class DeterministicChunker:
                             section=self._database_section(semantic_section.title),
                             token_count=len(self._tokenizer.encode(text)),
                             metadata={
-                                "chunking_version": "structural-v1",
+                                "parser": "application-parser",
+                                "parser_version": "application-parser-v1",
+                                **semantic_section.metadata,
+                                "chunking_version": "llama-index-sentence-v1",
+                                "chunk_size": self.target_tokens,
+                                "chunk_overlap": self.overlap_tokens,
                                 "section_title": semantic_section.title,
                                 "section_path": " > ".join(semantic_section.path)
                                 if semantic_section.path
@@ -111,6 +128,7 @@ class DeterministicChunker:
                         page_number=parsed_section.page_number,
                         title=current_title,
                         path=current_path,
+                        metadata=dict(parsed_section.metadata),
                     )
                 )
 
@@ -132,66 +150,15 @@ class DeterministicChunker:
     def _chunk_section(self, section: _SemanticSection) -> list[str]:
         prefix_tokens = len(self._tokenizer.encode(self._prefix(section)))
         target_body_tokens = max(1, self.target_tokens - prefix_tokens)
-        max_body_tokens = max(1, self.max_tokens - prefix_tokens)
-        units = self._section_units(section.text, target_body_tokens)
-        bodies: list[str] = []
-        current = ""
-
-        for unit in units:
-            candidate = self._join(current, unit)
-            if current and len(self._tokenizer.encode(candidate)) > target_body_tokens:
-                bodies.append(current)
-                current = unit
-            else:
-                current = candidate
-            if len(self._tokenizer.encode(current)) > max_body_tokens:
-                bodies.extend(self._token_windows(current, target_body_tokens))
-                current = ""
-        if current:
-            bodies.append(current)
-
-        return self._with_overlap(bodies, max_body_tokens)
-
-    def _section_units(self, text: str, target_body_tokens: int) -> list[str]:
-        units: list[str] = []
-        for paragraph in (part.strip() for part in re.split(r"\n\s*\n", text)):
-            if not paragraph:
-                continue
-            if len(self._tokenizer.encode(paragraph)) <= target_body_tokens:
-                units.append(paragraph)
-                continue
-            for sentence in self._sentences(paragraph):
-                if len(self._tokenizer.encode(sentence)) <= target_body_tokens:
-                    units.append(sentence)
-                else:
-                    units.extend(self._token_windows(sentence, target_body_tokens))
-        return units
-
-    def _with_overlap(self, bodies: list[str], max_body_tokens: int) -> list[str]:
-        if not bodies:
-            return []
-        overlapped = [bodies[0]]
-        for previous, current in zip(bodies, bodies[1:]):
-            overlap = self._tail(previous, self.overlap_tokens)
-            candidate = self._join(overlap, current)
-            if len(self._tokenizer.encode(candidate)) <= max_body_tokens:
-                overlapped.append(candidate)
-            else:
-                allowed = max(0, max_body_tokens - len(self._tokenizer.encode(current)))
-                overlapped.append(self._join(self._tail(previous, allowed), current))
-        return overlapped
-
-    def _token_windows(self, text: str, size: int) -> list[str]:
-        tokens = self._tokenizer.encode(text)
-        return [
-            self._tokenizer.decode(tokens[start : start + size])
-            for start in range(0, len(tokens), size)
-        ]
-
-    def _tail(self, text: str, count: int) -> str:
-        if count <= 0:
-            return ""
-        return self._tokenizer.decode(self._tokenizer.encode(text)[-count:])
+        splitter = SentenceSplitter(
+            chunk_size=target_body_tokens,
+            chunk_overlap=min(self.overlap_tokens, target_body_tokens - 1),
+            tokenizer=self._tokenizer.encode,
+            paragraph_separator="\n\n",
+            include_metadata=False,
+            include_prev_next_rel=False,
+        )
+        return splitter.split_text(section.text)
 
     def _render(self, section: _SemanticSection, body: str) -> str:
         prefix = self._prefix(section)
@@ -239,7 +206,8 @@ class DeterministicChunker:
         if not section.path:
             return ""
         tokens = self._tokenizer.encode(" > ".join(section.path))
-        return self._tokenizer.decode(tokens[: self.max_tokens - 1])
+        body_reserve = min(64, max(1, self.max_tokens // 4))
+        return self._tokenizer.decode(tokens[: self.max_tokens - body_reserve])
 
     def _is_heading(self, line: str) -> bool:
         return bool(
@@ -260,6 +228,3 @@ class DeterministicChunker:
             return 4
         numbered = re.match(r"^(\d+(?:\.\d+)*)", line)
         return numbered.group(1).count(".") + 1 if numbered else 1
-
-    def _sentences(self, paragraph: str) -> list[str]:
-        return [sentence for sentence in self._sentence_boundary.split(paragraph) if sentence]

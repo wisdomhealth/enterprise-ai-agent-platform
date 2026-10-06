@@ -274,20 +274,28 @@ async def test_public_chat_excludes_inactive_and_noncurrent_or_unretrievable_sou
     )
 
     source.status = DriveSourceStatus.ACTIVE
-    version.state = DocumentVersionState.PROCESSING
-    await db_session.flush()
-    assert (
-        await VectorCandidateSource(db_session).search(
-            principal, knowledge_base.id, "policy", 10, query_embedding=[1.0] * 1536
+    for unavailable_state in (
+        DocumentVersionState.PROCESSING,
+        DocumentVersionState.REVOKED,
+    ):
+        version.state = unavailable_state
+        await db_session.flush()
+        assert (
+            await VectorCandidateSource(db_session).search(
+                principal,
+                knowledge_base.id,
+                "policy",
+                10,
+                query_embedding=[1.0] * 1536,
+            )
+            == []
         )
-        == []
-    )
-    assert (
-        await TextCandidateSource(db_session).search(
-            principal, knowledge_base.id, "policy", 10
+        assert (
+            await TextCandidateSource(db_session).search(
+                principal, knowledge_base.id, "policy", 10
+            )
+            == []
         )
-        == []
-    )
 
     version.state = DocumentVersionState.RETRIEVABLE
     replacement = DocumentVersion(

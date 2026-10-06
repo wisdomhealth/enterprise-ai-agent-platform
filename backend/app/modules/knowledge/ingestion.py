@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService
 from app.modules.knowledge.chunking import DeterministicChunker
@@ -39,7 +40,13 @@ class DocumentIngestionService:
         embedding_provider: "EmbeddingProvider | None" = None,
     ) -> None:
         self._db_session = db_session
-        self._chunker = chunker or DeterministicChunker()
+        if chunker is None:
+            settings = Settings()
+            chunker = DeterministicChunker(
+                chunk_size=settings.knowledge_chunk_size,
+                chunk_overlap=settings.knowledge_chunk_overlap,
+            )
+        self._chunker = chunker
         self._knowledge_source_service = knowledge_source_service
         self._worker_id = worker_id
         self._job_lease_seconds = job_lease_seconds
@@ -142,7 +149,6 @@ class DocumentIngestionService:
         version: DocumentVersion,
     ) -> DocumentVersion:
         """Embed a durable checkpoint, retaining the Task 8 lease fence at publication."""
-        from app.core.config import Settings
         from app.modules.rag.embeddings import EmbeddingPublicationService, OpenAIEmbeddingProvider
 
         provider = self._embedding_provider or OpenAIEmbeddingProvider.from_settings(Settings())

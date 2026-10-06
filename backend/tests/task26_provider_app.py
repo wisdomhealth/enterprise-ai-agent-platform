@@ -27,14 +27,15 @@ async def embeddings(request: Request) -> dict[str, object]:
     }
 
 
-@app.post("/v1/messages")
-async def messages(request: Request) -> dict[str, object]:
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request) -> dict[str, object]:
     payload = await request.json()
-    system = payload.get("system")
+    messages = payload.get("messages", [])
+    system = messages[0]["content"] if messages else ""
     if isinstance(system, str) and system.startswith("Classify the untrusted customer message"):
         text = '{"sensitive_topic":null}'
     else:
-        message = payload["messages"][0]["content"]
+        message = messages[-1]["content"]
         chunk_id = _CHUNK_ID.search(message)
         assert chunk_id is not None
         answer = "Regenerated grounded reply."
@@ -42,13 +43,12 @@ async def messages(request: Request) -> dict[str, object]:
             {"text": answer, "claims": [{"text": answer, "citation_ids": [chunk_id.group(1)]}]}
         )
     return {
-        "id": "task26-local-message",
-        "model": "task26-local-anthropic",
-        "content": [
-            {
-                "type": "text",
-                "text": text,
-            }
+        "id": "task26-local-chat-completion",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "task26-local-openai",
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
         ],
-        "usage": {"input_tokens": 10, "output_tokens": 4},
+        "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
     }

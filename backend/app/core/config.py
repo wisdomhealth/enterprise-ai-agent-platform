@@ -1,6 +1,7 @@
 from pathlib import Path
+from typing import Self
 
-from pydantic import AnyUrl, Field, PostgresDsn, SecretStr
+from pydantic import AnyUrl, Field, PostgresDsn, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -67,11 +68,6 @@ class Settings(BaseSettings):
         validation_alias="MIGRATION_DATABASE_URL",
     )
     redis_url: AnyUrl | None = Field(default=None, validation_alias="REDIS_URL")
-    anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(
-        default="claude-3-5-sonnet-latest", validation_alias="ANTHROPIC_MODEL"
-    )
-    anthropic_base_url: AnyUrl | None = Field(default=None, validation_alias="ANTHROPIC_BASE_URL")
     safety_classifier_model: str | None = Field(
         default=None,
         validation_alias="SAFETY_CLASSIFIER_MODEL",
@@ -91,6 +87,73 @@ class Settings(BaseSettings):
     )
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     openai_base_url: AnyUrl | None = Field(default=None, validation_alias="OPENAI_BASE_URL")
+    openai_generation_model: str = Field(
+        default="gpt-4.1-mini", validation_alias="OPENAI_GENERATION_MODEL"
+    )
+    openai_classifier_model: str = Field(
+        default="gpt-4.1-mini", validation_alias="OPENAI_CLASSIFIER_MODEL"
+    )
+    openai_embedding_model: str = Field(
+        default="text-embedding-3-small", validation_alias="OPENAI_EMBEDDING_MODEL"
+    )
+    openai_embedding_dimensions: int = Field(
+        default=1536,
+        ge=1536,
+        le=1536,
+        validation_alias="OPENAI_EMBEDDING_DIMENSIONS",
+    )
+    openai_embedding_batch_size: int = Field(
+        default=100,
+        ge=1,
+        le=2048,
+        validation_alias="OPENAI_EMBEDDING_BATCH_SIZE",
+    )
+    openai_embedding_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        validation_alias="OPENAI_EMBEDDING_MAX_RETRIES",
+    )
+    knowledge_chunk_size: int = Field(
+        default=500,
+        ge=2,
+        le=8192,
+        validation_alias="KNOWLEDGE_CHUNK_SIZE",
+    )
+    knowledge_chunk_overlap: int = Field(
+        default=64,
+        ge=0,
+        le=499,
+        validation_alias="KNOWLEDGE_CHUNK_OVERLAP",
+    )
+    openai_request_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=120,
+        validation_alias="OPENAI_REQUEST_TIMEOUT_SECONDS",
+    )
+    rag_execution_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=300,
+        validation_alias="RAG_EXECUTION_TIMEOUT_SECONDS",
+    )
+    rag_max_generation_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        validation_alias="RAG_MAX_GENERATION_ATTEMPTS",
+    )
+    openai_input_cost_per_million: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias="OPENAI_INPUT_COST_PER_MILLION",
+    )
+    openai_output_cost_per_million: float = Field(
+        default=0.0,
+        ge=0,
+        validation_alias="OPENAI_OUTPUT_COST_PER_MILLION",
+    )
     reranker_enabled: bool = Field(default=False, validation_alias="RERANKER_ENABLED")
     google_oidc_client_id: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_OIDC_CLIENT_ID"
@@ -138,3 +201,9 @@ class Settings(BaseSettings):
     )
     public_base_url: AnyUrl | None = Field(default=None, validation_alias="PUBLIC_BASE_URL")
     internal_base_url: AnyUrl | None = Field(default=None, validation_alias="INTERNAL_BASE_URL")
+
+    @model_validator(mode="after")
+    def validate_chunk_overlap(self) -> Self:
+        if self.knowledge_chunk_overlap >= self.knowledge_chunk_size:
+            raise ValueError("KNOWLEDGE_CHUNK_OVERLAP must be smaller than KNOWLEDGE_CHUNK_SIZE")
+        return self

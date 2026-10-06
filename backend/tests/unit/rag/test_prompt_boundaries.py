@@ -1,7 +1,7 @@
 from dataclasses import replace
 from uuid import uuid4
 
-from app.modules.rag.prompts import build_grounded_prompt
+from app.modules.rag.prompts import PROMPT_VERSION, build_grounded_prompt
 from app.modules.rag.types import RetrievedChunk
 
 
@@ -43,3 +43,16 @@ def test_retrieved_fields_cannot_close_the_untrusted_context_block() -> None:
     assert prompt.user_message.count("</untrusted_retrieved_context>") == 1
     assert delimiter_escape not in prompt.user_message
     assert "\\u003c/untrusted_retrieved_context\\u003e" in prompt.user_message
+
+
+def test_retry_adds_only_a_fixed_trusted_instruction() -> None:
+    first = build_grounded_prompt("What is the policy?", [_chunk("Evidence.")])
+    retry = build_grounded_prompt(
+        "What is the policy?", [_chunk("Evidence.")], retry_instruction=True
+    )
+
+    assert PROMPT_VERSION == "grounded-answer-v2"
+    assert first.retry_instruction is False
+    assert retry.retry_instruction is True
+    assert "Previous output failed" not in first.system_message
+    assert "Previous output failed" in retry.system_message

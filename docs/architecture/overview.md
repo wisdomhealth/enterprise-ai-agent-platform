@@ -12,7 +12,7 @@ business state.
 |---|---|---|
 | Identity and authorization | Staff sessions, organization/resource grants, audit | Google OIDC and signed server session |
 | Connectors and knowledge | Encrypted OAuth connector records, Drive sync, parse jobs, chunks and vectors | Google Drive read-only API |
-| RAG | Permission-filtered retrieval, grounded answer and citation projection | Embedding and model providers |
+| RAG | SQL authorization, LlamaIndex fusion, LangGraph orchestration, grounded answer and citation projection | LangChain OpenAI boundary |
 | Public chat and support | Per-session credential, message stream, durable handoff | Browser customer channel and staff queue |
 | Email | Gmail intake, draft versions/review, fenced delivery and reconciliation | Gmail API |
 | Retention and operations | JobIntent, Outbox, erasure ledger, health, metrics and recovery | PostgreSQL, alerting and runbooks |
@@ -39,6 +39,17 @@ business state.
 6. Retention redacts expired content and erasure replay runs after restore before
    readiness reopens. Audit/Outbox records keep identifiers and safe metadata, not
    bodies, OAuth values, prompts, or credentials.
+
+## AI framework ownership
+
+The two PostgreSQL retrieval branches enforce tenant/resource authorization before
+returning candidates. LlamaIndex converts only those authorized candidates to nodes
+and performs reciprocal-rank fusion; strict metadata and scope checks run again after
+optional postprocessing. LangChain provides the single structured OpenAI boundary for
+generation and classification. A checkpointer-free LangGraph coordinates scope,
+retrieval, evidence, circuit, generation and citation-validation nodes with a total
+timeout and at most the configured number of calls. Durable retries remain owned by
+PostgreSQL `JobIntent`, not the in-memory graph.
 
 ## Operational flow
 

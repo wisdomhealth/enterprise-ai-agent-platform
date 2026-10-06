@@ -3,7 +3,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol, cast
 from uuid import UUID
 
-from openai import AsyncOpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding  # type: ignore[import-untyped]
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,62 +20,47 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMENSIONS = 1536
 
 
-class _EmbeddingResponseItem(Protocol):
-    index: int
-    embedding: Sequence[float]
-
-
-class _EmbeddingResponse(Protocol):
-    data: Sequence[_EmbeddingResponseItem]
-
-
-class _EmbeddingsAPI(Protocol):
-    async def create(
-        self, *, input: list[str], model: str, dimensions: int
-    ) -> _EmbeddingResponse: ...
-
-
-class _OpenAIClient(Protocol):
-    embeddings: _EmbeddingsAPI
+class _LlamaIndexEmbedding(Protocol):
+    async def aget_text_embedding_batch(self, texts: list[str]) -> list[list[float]]: ...
 
 
 class OpenAIEmbeddingProvider:
-    """Small adapter boundary for the configured OpenAI embedding model."""
+    """LlamaIndex OpenAI adapter behind the application's async batch protocol."""
 
-    def __init__(self, client: object, *, model: str = EMBEDDING_MODEL) -> None:
-        self._client = cast(_OpenAIClient, client)
-        self._model = model
+    def __init__(self, embed_model: object, *, dimensions: int = EMBEDDING_DIMENSIONS) -> None:
+        self._embed_model = cast(_LlamaIndexEmbedding, embed_model)
+        self._dimensions = dimensions
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "OpenAIEmbeddingProvider":
         if settings.openai_api_key is None:
             raise RuntimeError("OPENAI_API_KEY is required for embeddings")
-        api_key = settings.openai_api_key.get_secret_value()
-        if settings.openai_base_url is None:
-            return cls(AsyncOpenAI(api_key=api_key))
+        kwargs: dict[str, object] = {
+            "api_key": settings.openai_api_key.get_secret_value(),
+            "model": settings.openai_embedding_model,
+            "dimensions": settings.openai_embedding_dimensions,
+            "embed_batch_size": settings.openai_embedding_batch_size,
+            "max_retries": settings.openai_embedding_max_retries,
+            "timeout": settings.openai_request_timeout_seconds,
+        }
+        if settings.openai_base_url is not None:
+            kwargs["api_base"] = settings.openai_base_url.unicode_string().rstrip("/")
         return cls(
-            AsyncOpenAI(
-                api_key=api_key,
-                base_url=settings.openai_base_url.unicode_string(),
-            )
+            OpenAIEmbedding(**kwargs),
+            dimensions=settings.openai_embedding_dimensions,
         )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        response = await self._client.embeddings.create(
-            input=texts,
-            model=self._model,
-            dimensions=EMBEDDING_DIMENSIONS,
-        )
-        vectors: list[list[float] | None] = [None] * len(texts)
-        for item in response.data:
-            if item.index < 0 or item.index >= len(texts):
-                raise ValueError("embedding response index is outside the submitted batch")
-            vectors[item.index] = [float(value) for value in item.embedding]
-        if any(vector is None for vector in vectors):
-            raise ValueError("embedding response does not contain every submitted text")
-        return [vector for vector in vectors if vector is not None]
+        raw_vectors = await self._embed_model.aget_text_embedding_batch(texts)
+        vectors = [[float(value) for value in vector] for vector in raw_vectors]
+        if len(vectors) != len(texts) or not all(
+            len(vector) == self._dimensions and all(math.isfinite(value) for value in vector)
+            for vector in vectors
+        ):
+            raise ValueError("embedding provider returned an invalid vector batch")
+        return vectors
 
 
 class EmbeddingPublicationService:

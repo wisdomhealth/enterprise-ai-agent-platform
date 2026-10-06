@@ -164,7 +164,6 @@ services:
       MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       APP_ENV: test
-      ANTHROPIC_API_KEY: ""
       OPENAI_API_KEY: ""
       GOOGLE_DRIVE_CLIENT_ID: ""
       GOOGLE_DRIVE_CLIENT_SECRET: ""
@@ -200,7 +199,6 @@ services:
       MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       APP_ENV: test
-      ANTHROPIC_API_KEY: ""
       OPENAI_API_KEY: ""
       GOOGLE_DRIVE_CLIENT_ID: ""
       GOOGLE_DRIVE_CLIENT_SECRET: ""

@@ -14,9 +14,9 @@ from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSta
 from app.modules.connectors.service import ConnectorService
 from app.modules.email.actors import email_worker_principal
 from app.modules.email.classification import (
-    AnthropicEmailClassifier,
     EmailClassifier,
     EmailClassifierUnavailable,
+    OpenAIEmailClassifier,
 )
 from app.modules.email.delivery import EMAIL_DELIVERY_KIND, EmailDeliveryService
 from app.modules.email.drafting import EmailDraftingService
@@ -45,7 +45,7 @@ EMAIL_LEASE_SECONDS = 300
 
 class _UnavailableEmailClassifier:
     async def classify(self, _subject: str, _body: str):  # type: ignore[no-untyped-def]
-        raise EmailClassifierUnavailable("ANTHROPIC_API_KEY is not configured")
+        raise EmailClassifierUnavailable("OPENAI_API_KEY is not configured")
 
 
 @shared_task(name=EMAIL_JOB_TASK_NAME)  # type: ignore[untyped-decorator]
@@ -537,8 +537,6 @@ async def _consume_draft(
 
 
 def _build_classifier(settings: Settings) -> EmailClassifier:
-    if settings.anthropic_api_key is None:
+    if settings.openai_api_key is None:
         return _UnavailableEmailClassifier()
-    return AnthropicEmailClassifier(
-        settings.anthropic_api_key.get_secret_value(), model=settings.anthropic_model
-    )
+    return OpenAIEmailClassifier.from_settings(settings)

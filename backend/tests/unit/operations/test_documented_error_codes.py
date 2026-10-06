@@ -87,9 +87,9 @@ def test_documentation_check_requires_settings_alias_ownership() -> None:
     """Ownership coverage follows Settings aliases, including non-example values."""
     path = ROOT / "docs/deployment/credential-ownership.md"
     rows = CHECK_DOCUMENTATION["_environment_rows"](path.read_text(encoding="utf-8"))
-    del rows["ANTHROPIC_BASE_URL"]
+    del rows["OPENAI_BASE_URL"]
     failures: list[str] = []
 
     CHECK_DOCUMENTATION["_check_environment_rows"](rows, failures)
 
-    assert any("ANTHROPIC_BASE_URL" in failure for failure in failures)
+    assert any("OPENAI_BASE_URL" in failure for failure in failures)

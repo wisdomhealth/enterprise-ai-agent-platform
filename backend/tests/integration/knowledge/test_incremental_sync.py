@@ -59,10 +59,10 @@ async def _source(db_session, *, cursor: str | None = "cursor-1") -> DriveSource
     return source
 
 
-def _authorized_file() -> DriveFile:
+def _authorized_file(*, file_id: str = "file-1", name: str = "guide.pdf") -> DriveFile:
     return DriveFile(
-        id="file-1",
-        name="guide.pdf",
+        id=file_id,
+        name=name,
         mime_type="application/pdf",
         modified_time=datetime(2026, 8, 22, tzinfo=UTC),
         parent_ids=("root",),
@@ -90,12 +90,20 @@ async def test_cursor_advances_only_after_page_is_persisted(db_session) -> None:
     assert result.cursor == "cursor-2"
     assert persisted is not None
     assert persisted.sync_cursor == "cursor-2"
-    assert await db_session.scalar(select(func.count(Document.id))) == 1
-    assert await db_session.scalar(select(func.count(JobIntent.id))) == 1
+    assert await db_session.scalar(
+        select(func.count(Document.id)).where(Document.source_id == source_id)
+    ) == 1
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["source_id"].astext == str(source_id),
+        )
+    ) == 1
     parse_events = (
         await db_session.scalars(
             select(OutboxEvent).where(
-                OutboxEvent.event_type == "knowledge.document.parse.requested"
+                OutboxEvent.event_type == "knowledge.document.parse.requested",
+                OutboxEvent.event_id.in_(result.parse_outbox_event_ids),
             )
         )
     ).all()
@@ -107,13 +115,58 @@ async def test_cursor_advances_only_after_page_is_persisted(db_session) -> None:
 @pytest.mark.asyncio
 async def test_duplicate_change_page_creates_one_parse_intent(db_session) -> None:  # type: ignore[no-untyped-def]
     source = await _source(db_session)
+    source_id = source.id
     boundary = FakeDriveChangeBoundary([_authorized_file()], "cursor-2")
     service = DriveSyncService(db_session, page_gateway=boundary)
 
     await service.sync(source.id, "cursor-1")
     await service.sync(source.id, "cursor-1")
 
-    assert await db_session.scalar(select(func.count(JobIntent.id))) == 1
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["source_id"].astext == str(source_id),
+        )
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_filename_with_new_drive_id_enqueues_a_new_document(db_session) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session)
+    source_id = source.id
+
+    await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [_authorized_file(file_id="old-drive-id", name="policy.pdf")], "cursor-2"
+        ),
+    ).sync(source.id, "cursor-1")
+    await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [_authorized_file(file_id="new-drive-id", name="policy.pdf")], "cursor-3"
+        ),
+    ).sync(source.id, "cursor-2")
+
+    documents = list(
+        (
+            await db_session.scalars(
+                select(Document)
+                .where(Document.source_id == source_id)
+                .order_by(Document.external_id)
+            )
+        ).all()
+    )
+    assert [(document.external_id, document.title) for document in documents] == [
+        ("new-drive-id", "policy.pdf"),
+        ("old-drive-id", "policy.pdf"),
+    ]
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["source_id"].astext == str(source_id),
+        )
+    ) == 2
 
 
 @pytest.mark.asyncio

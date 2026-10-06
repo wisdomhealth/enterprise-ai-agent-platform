@@ -66,13 +66,13 @@ def _context() -> tuple[Principal, RetrievedChunk]:
 @pytest.mark.asyncio
 async def test_customer_never_receives_unvalidated_or_internal_source_data(provider_stack) -> None:  # type: ignore[no-untyped-def]
     principal, chunk = _context()
-    provider_stack.queue_anthropic_answer(
+    provider_stack.queue_openai_answer(
         text="Refunds take five business days.",
         claims=[
             {"text": "Refunds take five business days.", "citation_ids": [str(chunk.chunk_id)]}
         ],
     )
-    async with provider_stack.client("anthropic") as client:
+    async with provider_stack.client("openai") as client:
         service = GroundedAnswerService(
             FixedRetriever(chunk),
             HttpStructuredAnswerProvider(client),  # type: ignore[arg-type]
@@ -97,11 +97,11 @@ async def test_customer_never_receives_unvalidated_or_internal_source_data(provi
 @pytest.mark.asyncio
 async def test_unsupported_provider_claim_is_blocked_before_customer_output(provider_stack) -> None:  # type: ignore[no-untyped-def]
     principal, chunk = _context()
-    provider_stack.queue_anthropic_answer(
+    provider_stack.queue_openai_answer(
         text="Refunds take one hour.",
         claims=[{"text": "Refunds take one hour.", "citation_ids": [str(chunk.chunk_id)]}],
     )
-    async with provider_stack.client("anthropic") as client:
+    async with provider_stack.client("openai") as client:
         answer = await GroundedAnswerService(
             FixedRetriever(chunk),
             HttpStructuredAnswerProvider(client),  # type: ignore[arg-type]

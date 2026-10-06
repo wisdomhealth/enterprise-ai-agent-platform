@@ -47,6 +47,11 @@ RAG_ANSWER_ESTIMATED_COST = Counter(
     "Estimated provider cost without prompt or answer content.",
     ("model",),
 )
+RAG_ANSWER_USAGE_MISSING = Counter(
+    "platform_rag_answer_usage_missing_total",
+    "Answer executions with absent or incomplete provider usage metadata.",
+    ("model", "outcome"),
+)
 RAG_RETRIEVED_CHUNKS = Histogram(
     "platform_rag_retrieved_chunks",
     "Authorized retrieved chunk count without document or prompt content.",
@@ -208,6 +213,7 @@ def record_grounded_answer(
     input_tokens: int,
     output_tokens: int,
     estimated_cost: float,
+    usage_complete: bool = False,
 ) -> None:
     """Record only operational metadata; prompts and generated text are intentionally omitted."""
 
@@ -225,6 +231,8 @@ def record_grounded_answer(
     RAG_ANSWER_TOKENS.labels(model=model, direction="input").inc(input_tokens)
     RAG_ANSWER_TOKENS.labels(model=model, direction="output").inc(output_tokens)
     RAG_ANSWER_ESTIMATED_COST.labels(model=model).inc(estimated_cost)
+    if not usage_complete:
+        RAG_ANSWER_USAGE_MISSING.labels(model=model, outcome=outcome).inc()
 
 
 def record_retrieval_latency(latency_ms: int) -> None:

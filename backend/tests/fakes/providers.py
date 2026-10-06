@@ -51,21 +51,21 @@ class DeterministicProviderState:
     gmail_history: dict[str, tuple[list[str], str | None]] = field(default_factory=dict)
     gmail_messages: dict[str, GmailFixture] = field(default_factory=dict)
     gmail_sent: dict[str, GmailFixture] = field(default_factory=dict)
-    anthropic_answers: deque[dict[str, object]] = field(default_factory=deque)
+    openai_answers: deque[dict[str, object]] = field(default_factory=deque)
     fail_next: dict[str, str] = field(default_factory=dict)
     calls: list[ProviderCall] = field(default_factory=list)
     start_page_token: str = "drive-start-1"
 
 
 class DeterministicProviderStack:
-    """Local fake Drive, Gmail, Anthropic and OpenAI HTTP endpoints."""
+    """Local fake Drive, Gmail and OpenAI HTTP endpoints."""
 
     def __init__(self) -> None:
         self.state = DeterministicProviderState()
         self._transport = httpx.MockTransport(self._dispatch)
 
     def client(self, provider: str) -> httpx.AsyncClient:
-        if provider not in {"drive", "gmail", "anthropic", "openai"}:
+        if provider not in {"drive", "gmail", "openai"}:
             raise ValueError(f"unsupported fake provider: {provider}")
         return httpx.AsyncClient(
             transport=self._transport,
@@ -81,10 +81,10 @@ class DeterministicProviderStack:
         fixture.authorized = False
         fixture.removed = True
 
-    def queue_anthropic_answer(
+    def queue_openai_answer(
         self, *, text: str, claims: list[dict[str, object]] | None = None
     ) -> None:
-        self.state.anthropic_answers.append({"text": text, "claims": claims or []})
+        self.state.openai_answers.append({"text": text, "claims": claims or []})
 
     def fail_once(self, provider: str, error_code: str) -> None:
         self.state.fail_next[provider] = error_code
@@ -114,7 +114,6 @@ class DeterministicProviderStack:
         handlers = {
             "drive": self._drive,
             "gmail": self._gmail,
-            "anthropic": self._anthropic,
             "openai": self._openai,
         }
         return handlers[provider](request)
@@ -215,30 +214,24 @@ class DeterministicProviderStack:
             return httpx.Response(200, json={"messages": matches})
         return httpx.Response(404)
 
-    def _anthropic(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path != "/v1/messages":
-            return httpx.Response(404)
-        answer = (
-            self.state.anthropic_answers.popleft()
-            if self.state.anthropic_answers
-            else {
-                "text": "I don't know based on the available information.",
-                "claims": [],
-            }
-        )
-        return httpx.Response(
-            200,
-            json={
-                "id": "msg_fake",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-fake-v1",
-                "content": [{"type": "text", "text": json.dumps(answer, sort_keys=True)}],
-                "usage": {"input_tokens": 12, "output_tokens": 8},
-            },
-        )
-
     def _openai(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            answer = (
+                self.state.openai_answers.popleft()
+                if self.state.openai_answers
+                else {
+                    "text": "I don't know based on the available information.",
+                    "claims": [],
+                }
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "model": "gpt-fake-v1",
+                    "answer": answer,
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 8},
+                },
+            )
         if request.url.path != "/v1/embeddings":
             return httpx.Response(404)
         payload = json.loads(request.content)
@@ -332,20 +325,21 @@ class HttpStructuredAnswerProvider:
         from app.modules.rag.llm import GeneratedAnswer, ProviderResponseError
 
         response = await self._client.post(
-            "/v1/messages",
-            json={"model": "claude-fake-v1", "prompt": str(prompt)},
+            "/v1/chat/completions",
+            json={"model": "gpt-fake-v1", "prompt": str(prompt)},
         )
         response.raise_for_status()
         payload = response.json()
         try:
-            content = json.loads(payload["content"][0]["text"])
+            content = payload["answer"]
             usage = payload["usage"]
             return GeneratedAnswer(
                 text=content["text"],
                 claims=content["claims"],
                 model=payload["model"],
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
+                input_tokens=usage["prompt_tokens"],
+                output_tokens=usage["completion_tokens"],
+                usage_complete=True,
             )
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ProviderResponseError(

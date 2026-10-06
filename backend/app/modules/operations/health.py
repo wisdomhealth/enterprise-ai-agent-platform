@@ -55,7 +55,7 @@ class HealthService:
         "erasure_replay": ("post-restore customer access",),
         "key_wrapping": ("connector and webhook credentials",),
         "redis": ("live notifications",),
-        "claude": ("AI answers", "email drafting"),
+        "openai": ("AI answers", "email classification", "email drafting"),
         "drive": ("knowledge synchronization",),
         "gmail": ("email synchronization and delivery",),
     }
@@ -68,7 +68,7 @@ class HealthService:
         erasure_replay: DependencyStatus,
         key_wrapping: DependencyStatus,
         redis: DependencyStatus,
-        claude: DependencyStatus,
+        openai: DependencyStatus,
         drive: DependencyStatus,
         gmail: DependencyStatus,
     ) -> HealthReport:
@@ -78,7 +78,7 @@ class HealthService:
             "erasure_replay": erasure_replay,
             "key_wrapping": key_wrapping,
             "redis": redis,
-            "claude": claude,
+            "openai": openai,
             "drive": drive,
             "gmail": gmail,
         }
@@ -135,7 +135,7 @@ class ConfiguredHealthReporter:
             erasure_replay=erasure_replay,
             key_wrapping=await self._key_wrapping_status(),
             redis=await self._redis_status(),
-            claude=_configured(self._settings.anthropic_api_key is not None),
+            openai=_configured(self._settings.openai_api_key is not None),
             drive=_configured(
                 self._settings.google_drive_client_id is not None
                 and self._settings.google_drive_client_secret is not None
