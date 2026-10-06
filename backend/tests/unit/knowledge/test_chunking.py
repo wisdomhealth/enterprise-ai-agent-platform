@@ -27,6 +27,7 @@ def test_chunker_uses_target_and_overlap_without_crossing_sections() -> None:
     assert all(chunk.text.startswith("Eligibility") for chunk in chunks)
     assert all(chunk.metadata["section_path"] == "Eligibility" for chunk in chunks)
     assert all(chunk.metadata["page_range"] == {"start": 3, "end": 3} for chunk in chunks)
+    assert all(chunk.metadata["parser_version"] == "application-parser-v1" for chunk in chunks)
     assert chunks[0].text.split()[-64:] == chunks[1].text.split()[1:65]
     assert all(chunk.token_count <= 800 for chunk in chunks)
 
@@ -79,7 +80,9 @@ def test_chunker_keeps_chinese_policy_articles_as_separate_semantic_sections() -
         "第三条 职责",
         "第四条 生效",
     ]
-    assert all(chunk.metadata["chunking_version"] == "structural-v1" for chunk in chunks)
+    assert all(
+        chunk.metadata["chunking_version"] == "llama-index-sentence-v1" for chunk in chunks
+    )
     assert all(chunk.token_count <= 800 for chunk in chunks)
     assert all("\n\n第二条" not in chunk.text for chunk in chunks)
     assert all("\n\n第三条" not in chunk.text for chunk in chunks)
@@ -174,7 +177,7 @@ def test_chunker_keeps_a_short_document_in_one_chunk() -> None:
 
     assert len(chunks) == 1
     assert chunks[0].text == "A short document."
-    assert chunks[0].metadata["chunking_version"] == "structural-v1"
+    assert chunks[0].metadata["chunking_version"] == "llama-index-sentence-v1"
 
 
 def test_chunker_keeps_an_oversized_heading_within_the_token_ceiling() -> None:
@@ -235,3 +238,29 @@ def test_chunker_recognizes_common_heading_forms(heading: str) -> None:
 
     assert [chunk.metadata["section_title"] for chunk in chunks] == [heading]
     assert chunks[0].text.startswith(heading)
+
+
+def test_chunker_exposes_sentence_splitter_size_and_overlap() -> None:
+    text = " ".join(f"token-{index}" for index in range(18))
+    chunks = DeterministicChunker(
+        tokenizer=WhitespaceTokenizer(), chunk_size=8, chunk_overlap=2
+    ).chunk(
+        document_version_id=UUID("9b652e7c-c891-4e53-9152-0d8079276c8a"),
+        sections=[
+            ParsedSection(
+                text=text,
+                page_number=7,
+                section="Scope",
+                metadata={"parser": "llama-index-pdf-reader", "parser_version": "pdf-reader-v1"},
+            )
+        ],
+    )
+
+    assert len(chunks) == 4
+    assert all(chunk.token_count <= 8 for chunk in chunks)
+    assert chunks[0].text.split()[-2:] == chunks[1].text.split()[1:3]
+    assert chunks[1].text.split()[-2:] == chunks[2].text.split()[1:3]
+    assert chunks[0].metadata["chunk_size"] == 8
+    assert chunks[0].metadata["chunk_overlap"] == 2
+    assert chunks[0].metadata["parser"] == "llama-index-pdf-reader"
+    assert chunks[0].metadata["parser_version"] == "pdf-reader-v1"

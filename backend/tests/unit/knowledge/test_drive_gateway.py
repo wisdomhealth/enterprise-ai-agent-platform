@@ -2,7 +2,11 @@ import pytest
 
 from app.core.config import Settings
 from app.main import create_app
-from app.modules.knowledge.drive_gateway import DriveGateway, GoogleDriveGatewayFactory
+from app.modules.knowledge.drive_gateway import (
+    DriveGateway,
+    GoogleDriveGatewayFactory,
+    GoogleDriveReadClient,
+)
 
 
 def test_drive_gateway_declares_read_only_scope() -> None:
@@ -75,3 +79,62 @@ def test_app_installs_google_drive_factory_when_oauth_client_is_configured() -> 
     )
 
     assert isinstance(app.state.drive_gateway_factory, GoogleDriveGatewayFactory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected_removed"),
+    (
+        ({"fileId": "trashed", "removed": False, "file": {"id": "trashed", "trashed": True}}, True),
+        ({"fileId": "deleted", "removed": True}, True),
+        (
+            {
+                "fileId": "active",
+                "removed": False,
+                "file": {"id": "active", "name": "active.pdf", "trashed": False},
+            },
+            False,
+        ),
+    ),
+)
+async def test_change_list_treats_trash_and_removal_as_deletion(
+    change: dict[str, object], expected_removed: bool
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRequest:
+        def execute(self) -> dict[str, object]:
+            return {"changes": [change], "newStartPageToken": "next"}
+
+    class FakeChanges:
+        def list(self, **kwargs: object) -> FakeRequest:
+            captured.update(kwargs)
+            return FakeRequest()
+
+    class FakeDriveApi:
+        def changes(self) -> FakeChanges:
+            return FakeChanges()
+
+    files, cursor = await GoogleDriveReadClient(FakeDriveApi()).list_changes("cursor")
+
+    assert cursor == "next"
+    assert files[0].removed is expected_removed
+    assert "trashed" in str(captured["fields"])
+
+
+@pytest.mark.asyncio
+async def test_change_list_does_not_turn_api_failure_into_deletion() -> None:
+    class FakeRequest:
+        def execute(self) -> dict[str, object]:
+            raise RuntimeError("temporary Drive failure")
+
+    class FakeChanges:
+        def list(self, **_kwargs: object) -> FakeRequest:
+            return FakeRequest()
+
+    class FakeDriveApi:
+        def changes(self) -> FakeChanges:
+            return FakeChanges()
+
+    with pytest.raises(RuntimeError, match="temporary Drive failure"):
+        await GoogleDriveReadClient(FakeDriveApi()).list_changes("cursor")

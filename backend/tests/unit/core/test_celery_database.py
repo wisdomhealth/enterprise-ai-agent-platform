@@ -79,6 +79,20 @@ def test_celery_concurrency_matches_the_connection_budget_configuration() -> Non
     assert create_celery(settings).conf.worker_concurrency == 7
 
 
+def test_celery_recovers_pending_document_cleanup_events_each_minute() -> None:
+    schedule = create_celery(Settings()).conf.beat_schedule[
+        "knowledge-document-cleanup-outbox-dispatch"
+    ]
+
+    assert schedule == {
+        "task": (
+            "app.modules.knowledge.tasks."
+            "dispatch_pending_document_cleanup_outbox_events"
+        ),
+        "schedule": 60,
+    }
+
+
 def test_worker_rag_assembly_accepts_the_celery_safe_session_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

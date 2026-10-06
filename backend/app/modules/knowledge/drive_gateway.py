@@ -81,7 +81,7 @@ class DriveGateway:
 class GoogleDriveReadClient:
     """Google Drive v3 adapter with no mutating API surface."""
 
-    _FILE_FIELDS = "id,name,mimeType,modifiedTime,parents,webViewLink"
+    _FILE_FIELDS = "id,name,mimeType,modifiedTime,parents,webViewLink,trashed"
 
     def __init__(self, drive_api: Any) -> None:
         self._drive_api = drive_api
@@ -208,7 +208,7 @@ class GoogleDriveReadClient:
             modified_time=modified_time,
             parent_ids=tuple(parent for parent in parents if isinstance(parent, str)),
             web_view_link=raw_web_view_link if isinstance(raw_web_view_link, str) else None,
-            removed=removed,
+            removed=removed or payload.get("trashed") is True,
         )
 
     @staticmethod

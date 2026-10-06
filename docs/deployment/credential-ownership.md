@@ -41,7 +41,12 @@ not a developer account.
 | `OPENAI_GENERATION_MODEL` | AI platform | Approved structured answer-generation model. |
 | `OPENAI_CLASSIFIER_MODEL` | AI platform | Approved email and safety classification model. |
 | `OPENAI_EMBEDDING_MODEL` | AI platform | Approved embedding model; changing vector compatibility requires a migration and re-embedding. |
+| `OPENAI_EMBEDDING_DIMENSIONS` | AI platform | Embedding vector size, fixed at 1536 to match the pgvector column. |
+| `OPENAI_EMBEDDING_BATCH_SIZE` | AI platform | Maximum texts submitted by each LlamaIndex embedding batch. |
+| `OPENAI_EMBEDDING_MAX_RETRIES` | AI platform | Bounded provider-level embedding retries before the durable job retry path takes over. |
 | `OPENAI_REQUEST_TIMEOUT_SECONDS` | AI platform | Per-request provider timeout. |
+| `KNOWLEDGE_CHUNK_SIZE` | AI platform | LlamaIndex sentence-splitter token ceiling for new document chunks. |
+| `KNOWLEDGE_CHUNK_OVERLAP` | AI platform | Token overlap between adjacent chunks within one page and semantic section. |
 | `RAG_EXECUTION_TIMEOUT_SECONDS` | AI platform | Total bounded LangGraph execution timeout. |
 | `RAG_MAX_GENERATION_ATTEMPTS` | AI platform | Maximum model calls per graph execution (bounded to 1-3). |
 | `OPENAI_INPUT_COST_PER_MILLION` | FinOps | Input-token rate used for estimated cost metadata. |

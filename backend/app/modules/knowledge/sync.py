@@ -10,11 +10,12 @@ from datetime import UTC
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobService
 from app.modules.knowledge.drive_gateway import DriveFile, DriveGatewayFactory
 from app.modules.knowledge.models import (
@@ -50,6 +51,7 @@ class SyncResult:
     isolated_files: int
     reauth_required: bool = False
     parse_outbox_event_ids: tuple[UUID, ...] = ()
+    cleanup_outbox_event_ids: tuple[UUID, ...] = ()
 
 
 def drive_sync_job_key(source_id: UUID | str, cursor: str | None) -> str:
@@ -128,10 +130,13 @@ class DriveSyncService:
 
         enqueued = revoked = isolated = 0
         parse_outbox_event_ids: list[UUID] = []
+        cleanup_outbox_event_ids: list[UUID] = []
         for drive_file in files:
             if drive_file.removed or not self._is_file_authorized(source, drive_file):
-                did_revoke = await self._revoke_file(source, drive_file.id)
-                revoked += int(did_revoke)
+                cleanup_event_id = await self._revoke_file(source, drive_file.id)
+                if cleanup_event_id is not None:
+                    cleanup_outbox_event_ids.append(cleanup_event_id)
+                    revoked += 1
                 isolated += int(not drive_file.removed)
                 continue
             if drive_file.mime_type not in SUPPORTED_DOCUMENT_MIME_TYPES:
@@ -159,6 +164,7 @@ class DriveSyncService:
             revoked,
             isolated,
             parse_outbox_event_ids=tuple(parse_outbox_event_ids),
+            cleanup_outbox_event_ids=tuple(cleanup_outbox_event_ids),
         )
 
     async def _list_changes(
@@ -286,13 +292,35 @@ class DriveSyncService:
         )
         return event.event_id
 
-    async def _revoke_file(self, source: DriveSource, file_id: str) -> bool:
+    async def _revoke_file(self, source: DriveSource, file_id: str) -> UUID | None:
         assert self._db_session is not None
         document = await self._db_session.scalar(
             select(Document).where(Document.source_id == source.id, Document.external_id == file_id)
         )
         if document is None:
-            return False
+            return None
+        # Fence parse jobs first. If a worker is committing its processing
+        # checkpoint concurrently, this UPDATE waits for that job row and the
+        # version query below then sees the newly committed version.
+        await self._db_session.execute(
+            update(JobIntent)
+            .where(
+                JobIntent.kind == "knowledge.document.parse",
+                JobIntent.state.in_((JobState.PENDING, JobState.RUNNING)),
+                JobIntent.payload["source_id"].as_string() == str(source.id),
+                JobIntent.payload["document_id"].as_string() == str(document.id),
+            )
+            .values(
+                state=JobState.FAILED,
+                lease_owner=None,
+                lease_expires_at=None,
+                next_attempt_at=None,
+                last_error_code="DOCUMENT_REVOKED",
+                error_class=ErrorClass.NON_RETRYABLE,
+                version=JobIntent.version + 1,
+                updated_at=func.clock_timestamp(),
+            )
+        )
         revoked_ids = list(
             (
                 await self._db_session.scalars(
@@ -310,8 +338,8 @@ class DriveSyncService:
         )
         document.current_version_id = None
         if not revoked_ids:
-            return False
-        await self._outbox_service.add(
+            return None
+        event = await self._outbox_service.add(
             self._db_session,
             "knowledge.document.cleanup.requested",
             "document",
@@ -320,9 +348,10 @@ class DriveSyncService:
                 "organization_id": str(source.organization_id),
                 "source_id": str(source.id),
                 "document_id": str(document.id),
+                "version_ids": [str(version_id) for version_id in sorted(revoked_ids, key=str)],
             },
         )
-        return True
+        return event.event_id
 
     async def _mark_reauth_required(self, source: DriveSource) -> None:
         assert self._db_session is not None

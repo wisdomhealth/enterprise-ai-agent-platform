@@ -22,9 +22,12 @@ OIDC authenticates staff members.
 ### Knowledge ingestion
 
 - Administrator-authorized, read-only Google Drive sources.
-- PDF and DOCX parsing, deterministic structural chunking, and embedding generation.
+- Local LlamaIndex PDF parsing, structure-aware LlamaIndex sentence chunking,
+  LlamaIndex OpenAI embeddings, and unchanged DOCX support.
 - Versioned documents with a retrievable lifecycle and current-version publication.
 - Durable synchronization, parsing, and indexing jobs with lease-based recovery.
+- Version-scoped physical chunk cleanup after a Drive file is trashed, permanently
+  deleted, or moved outside the authorized folder tree.
 
 ### Retrieval-augmented generation
 
@@ -96,9 +99,9 @@ state.
 ```mermaid
 flowchart LR
     drive[Authorized Google Drive] --> sync[Sync]
-    sync --> parse[Parse PDF or DOCX]
-    parse --> chunk[Chunk]
-    chunk --> embed[Generate embeddings]
+    sync --> parse[LlamaIndex local PDF reader or DOCX parser]
+    parse --> chunk[LlamaIndex SentenceSplitter per page or section]
+    chunk --> embed[LlamaIndex OpenAI embedding adapter]
     embed --> pg[(PostgreSQL)]
 
     query[User query] --> queryembed[Query embedding]
@@ -215,11 +218,14 @@ The environment example contains empty placeholders only. Supply customer-owned
 credentials through the environment; do not commit `.env`.
 
 The AI runtime is configured with `OPENAI_API_KEY`, `OPENAI_GENERATION_MODEL`,
-`OPENAI_CLASSIFIER_MODEL`, `OPENAI_EMBEDDING_MODEL`, request/workflow timeouts,
-`RAG_MAX_GENERATION_ATTEMPTS`, and per-million-token cost rates. This framework
-migration changes no database schema and requires no re-embedding when the existing
-embedding model remains selected. Local verification uses deterministic fakes and
-makes no paid provider calls.
+`OPENAI_CLASSIFIER_MODEL`, `OPENAI_EMBEDDING_MODEL`,
+`OPENAI_EMBEDDING_DIMENSIONS`, `OPENAI_EMBEDDING_BATCH_SIZE`,
+`OPENAI_EMBEDDING_MAX_RETRIES`, `KNOWLEDGE_CHUNK_SIZE`,
+`KNOWLEDGE_CHUNK_OVERLAP`, request/workflow timeouts,
+`RAG_MAX_GENERATION_ATTEMPTS`, and per-million-token cost rates. Embedding dimensions
+remain 1536 because the existing pgvector column is fixed at that size. Local
+verification uses synthetic documents and deterministic fakes and makes no paid
+provider calls.
 
 Run the container baseline with `docker compose up --build`. The backend exposes
 `GET /health/live` on port 8000 and the frontend runs on port 3000. Liveness never
@@ -228,6 +234,11 @@ connects to PostgreSQL, Redis, or external APIs.
 See [the platform baseline runbook](docs/runbooks/platform-baseline.md) for
 operating commands and [the readiness checklist](docs/readiness/checklist.md) for
 the explicit not-ready delivery gates.
+
+See [knowledge ingestion](docs/architecture/knowledge-ingestion.md) for PDF page
+semantics, chunk/embedding configuration, OCR limitations, atomic publication,
+safe replacement, and rollback. See the [Drive sync runbook](docs/runbooks/drive-sync.md)
+for the administrator cleanup workflow.
 
 ## Documentation and Production Handoff
 
