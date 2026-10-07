@@ -136,6 +136,7 @@ export class StaffApiError extends Error {
     message: string,
     readonly status: number,
     readonly handoff?: SupportHandoff,
+    readonly code?: string,
   ) {
     super(message);
   }
@@ -165,6 +166,20 @@ async function requestAt<T>(prefix: "/api/v1/staff" | "/api/v1/admin", path: str
   if (!response.ok) {
     const payload: unknown = await response.json().catch(() => null);
     const detail = typeof payload === "object" && payload !== null ? (payload as { detail?: unknown }).detail : null;
+    const businessCode =
+      typeof detail === "object" &&
+      detail !== null &&
+      "code" in detail &&
+      typeof detail.code === "string"
+        ? detail.code
+        : undefined;
+    const businessMessage =
+      typeof detail === "object" &&
+      detail !== null &&
+      "message" in detail &&
+      typeof detail.message === "string"
+        ? detail.message
+        : undefined;
     const handoff =
       path.startsWith("/support") &&
       typeof detail === "object" &&
@@ -183,11 +198,14 @@ async function requestAt<T>(prefix: "/api/v1/staff" | "/api/v1/admin", path: str
     throw new StaffApiError(
       response.status === 409 && handoff
         ? "Already claimed"
-        : response.status === 409
-          ? "The resource changed"
-          : "Unable to complete the staff action.",
+        : businessMessage !== undefined
+          ? businessMessage
+          : response.status === 409
+            ? "The resource changed"
+            : "Unable to complete the staff action.",
       response.status,
       handoff,
+      businessCode,
     );
   }
   return (await response.json()) as T;

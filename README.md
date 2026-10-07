@@ -204,18 +204,33 @@ For detailed boundaries and operating guidance, see the
 
 ## Quick Start
 
-Requirements: Python 3.12 or 3.13, Node.js 20.9+, and Docker Compose.
+Requirement: Docker Compose.
 
 ```bash
+# Create the local environment file.
 cp .env.example .env
-make install
-make test
-make lint
-make typecheck
+
+# Build and start the application stack in the background.
+docker compose up -d --build
+
+# Show container status and health.
+docker compose ps
 ```
 
 The environment example contains empty placeholders only. Supply customer-owned
 credentials through the environment; do not commit `.env`.
+
+The command above starts the application stack in the background; it does not run
+pytest. To build and start the backend test container in the background, where the
+container command runs pytest automatically, use:
+
+```bash
+# Build and start the backend pytest container in the background.
+POSTGRES_DATA_SOURCE=postgres-source-data docker compose -f compose.test.yaml up -d --build backend-test
+
+# Follow pytest output until the test container exits.
+POSTGRES_DATA_SOURCE=postgres-source-data docker compose -f compose.test.yaml logs -f backend-test
+```
 
 The AI runtime is configured with `OPENAI_API_KEY`, `OPENAI_GENERATION_MODEL`,
 `OPENAI_CLASSIFIER_MODEL`, `OPENAI_EMBEDDING_MODEL`,
@@ -227,9 +242,24 @@ remain 1536 because the existing pgvector column is fixed at that size. Local
 verification uses synthetic documents and deterministic fakes and makes no paid
 provider calls.
 
-Run the container baseline with `docker compose up --build`. The backend exposes
-`GET /health/live` on port 8000 and the frontend runs on port 3000. Liveness never
-connects to PostgreSQL, Redis, or external APIs.
+Nginx publishes the application on ports 80 and 443. Backend port 8000 and
+frontend port 3000 are internal container ports and are not published directly.
+The local TLS certificate may require browser approval.
+
+| URL | Description | Access |
+| --- | --- | --- |
+| `https://localhost/` | Public landing page | Public |
+| `https://localhost/chat/{publicKey}` | Customer chat page | Valid public chat key required |
+| `https://localhost/staff/email` | Staff email review queue and assistant | Staff authentication required |
+| `https://localhost/staff/email/{id}` | Individual email review page | Staff authentication required |
+| `https://localhost/staff/support` | Staff support and handoff console | Staff authentication required |
+| `https://localhost/staff/admin` | Administrator operations dashboard | Administrator access required |
+| `https://localhost/staff/admin/authorization` | Connector authorization management | Administrator access required |
+| `http://localhost/health/live` | Process liveness endpoint | Public health check |
+| `https://localhost/health/ready` | Dependency readiness endpoint | Public health check |
+
+All other HTTP page requests redirect to HTTPS. The liveness check intentionally
+does not connect to PostgreSQL, Redis, or external APIs.
 
 See [the platform baseline runbook](docs/runbooks/platform-baseline.md) for
 operating commands and [the readiness checklist](docs/readiness/checklist.md) for

@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import {
   approveEmail,
+  configureAdminDriveScope,
   listEmailQueue,
   StaffApiError,
 } from "../lib/staff-api";
@@ -9,6 +10,36 @@ import {
 afterEach(() => {
   vi.unstubAllGlobals();
   document.cookie = "staff_csrf=; Max-Age=0; path=/";
+});
+
+it("preserves the Drive reauthorization business error", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail: {
+            code: "GOOGLE_DRIVE_REAUTH_REQUIRED",
+            message:
+              "Google Drive authorization has expired or been revoked. Please reconnect Google Drive.",
+          },
+        }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      ),
+    ),
+  );
+
+  const error = await configureAdminDriveScope("draft-root", true).catch(
+    (value: unknown) => value,
+  );
+
+  expect(error).toBeInstanceOf(StaffApiError);
+  expect(error).toMatchObject({
+    status: 409,
+    code: "GOOGLE_DRIVE_REAUTH_REQUIRED",
+    message:
+      "Google Drive authorization has expired or been revoked. Please reconnect Google Drive.",
+  });
 });
 
 it("reads the email queue through the state-filtered staff endpoint", async () => {

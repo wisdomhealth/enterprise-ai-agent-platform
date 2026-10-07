@@ -1,6 +1,6 @@
 x-task25-backend-environment: &task25-backend-environment
   DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://platform_app@postgres:5432/platform_test}
-  MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://postgres@postgres:5432/platform_test}
+  MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql+asyncpg://platform_app@postgres:5432/platform_test}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
   APP_ENV: test
   SELF_HOSTED_FILE_KEY_ALLOWED: "true"

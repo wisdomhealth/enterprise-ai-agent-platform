@@ -24,6 +24,7 @@ import {
   listAdminUsers,
   requestAdminDriveSync,
   retryAdminJob,
+  StaffApiError,
   updateAdminUser,
   updateAdminRetentionPolicy,
 } from "../../../lib/staff-api";
@@ -65,15 +66,39 @@ export default function AdminOperationsPage() {
       <p aria-live="polite">{notice}</p>
       <p>Queue depth {summary.jobs.queue_depth} · Failed {summary.jobs.failed} · Support backlog {summary.support.backlog}</p>
       <ConnectorStatus connectors={summary.connectors} authorizations={authorizations} onReauthorize={async (id) => {
-        const result = await beginConnectorReauthorization(id);
-        window.location.assign(result.authorization_url);
+        try {
+          const result = await beginConnectorReauthorization(id);
+          window.location.assign(result.authorization_url);
+        } catch (error) {
+          setNotice(
+            error instanceof StaffApiError
+              ? error.message
+              : "Unable to start Google Drive reauthorization.",
+          );
+        }
       }} />
       <KnowledgeStatus
         sources={summary.knowledge_sources}
         onSync={async (id) => { await requestAdminDriveSync(id); await refresh(); }}
         onConfigure={async (rootFolderId, includeDescendants) => {
-          await configureAdminDriveScope(rootFolderId, includeDescendants);
-          await refresh();
+          try {
+            await configureAdminDriveScope(rootFolderId, includeDescendants);
+            await refresh();
+          } catch (error) {
+            if (
+              error instanceof StaffApiError &&
+              error.code === "GOOGLE_DRIVE_REAUTH_REQUIRED"
+            ) {
+              await refresh();
+              setNotice(error.message);
+              return;
+            }
+            setNotice(
+              error instanceof StaffApiError
+                ? error.message
+                : "Unable to save the Google Drive scope.",
+            );
+          }
         }}
       />
       <JobFailures jobs={jobs} onRetry={async (id) => { await retryAdminJob(id); await refresh(); }} onReconcile={(id) => window.location.assign(`/staff/email/${id}`)} />

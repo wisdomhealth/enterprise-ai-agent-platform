@@ -2,11 +2,13 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from google.auth.exceptions import RefreshError, TransportError
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.models import AuditEvent
 from app.modules.authorization.models import ResourceGrant
-from app.modules.connectors.models import ConnectorStatus
+from app.modules.connectors.models import Connector, ConnectorStatus
 from app.modules.email.models import (
     DeliveryIntent,
     EmailApproval,
@@ -15,6 +17,7 @@ from app.modules.email.models import (
     EmailWorkItem,
 )
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
+from app.modules.knowledge.models import DriveSource
 from app.modules.outbox.models import OutboxEvent
 
 
@@ -66,6 +69,149 @@ async def test_drive_scope_configuration_uses_existing_connector_and_emits_outbo
             OutboxEvent.aggregate_id == UUID(response.json()["id"]),
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_invalid_grant_marks_exact_drive_connector_and_preserves_scope(
+    db_session, operations_context
+) -> None:  # type: ignore[no-untyped-def]
+    connector = operations_context["connector"]
+    source = operations_context["source"]
+    connector.status = ConnectorStatus.ACTIVE
+    await db_session.commit()
+    connector_id = connector.id
+    source_id = source.id
+    organization_id = connector.organization_id
+    operations_context["drive_factory"].error = RefreshError(
+        "invalid_grant: Token has been expired or revoked.",
+        {"error": "invalid_grant", "error_description": "Token has been expired or revoked."},
+    )
+
+    async with operations_context["client_for"](operations_context["admin"]) as client:
+        response = await client.put(
+            "/api/v1/admin/knowledge-sources/drive",
+            json={"root_folder_id": "unsaved-root", "include_descendants": False},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "GOOGLE_DRIVE_REAUTH_REQUIRED",
+            "message": (
+                "Google Drive authorization has expired or been revoked. "
+                "Please reconnect Google Drive."
+            ),
+        }
+    }
+    bind = db_session.bind
+    assert bind is not None
+    async with AsyncSession(
+        bind=bind,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    ) as verification:
+        persisted_connector = await verification.get(Connector, connector_id)
+        persisted_source = await verification.get(DriveSource, source_id)
+        audit = await verification.scalar(
+            select(AuditEvent).where(
+                AuditEvent.organization_id == organization_id,
+                AuditEvent.object_id == connector_id,
+                AuditEvent.action == "connector.reauthorization.required",
+            )
+        )
+        assert persisted_connector is not None
+        assert persisted_connector.status is ConnectorStatus.REAUTH_REQUIRED
+        assert persisted_source is not None
+        assert persisted_source.root_folder_id == "approved-root"
+        assert persisted_source.include_descendants is True
+        assert persisted_source.allowed_descendant_ids == ["approved-child"]
+        assert persisted_source.sync_cursor == "drive-cursor-9"
+        assert audit is not None
+        assert audit.details == {
+            "kind": "DRIVE",
+            "error_code": "GOOGLE_DRIVE_REAUTH_REQUIRED",
+        }
+
+
+@pytest.mark.asyncio
+async def test_temporary_drive_error_does_not_require_reauthorization(
+    db_session, operations_context
+) -> None:  # type: ignore[no-untyped-def]
+    connector = operations_context["connector"]
+    connector.status = ConnectorStatus.ACTIVE
+    await db_session.commit()
+    connector_id = connector.id
+    operations_context["drive_factory"].error = TransportError("temporary network failure")
+
+    async with operations_context["client_for"](operations_context["admin"]) as client:
+        with pytest.raises(TransportError, match="temporary network failure"):
+            await client.put(
+                "/api/v1/admin/knowledge-sources/drive",
+                json={"root_folder_id": "unsaved-root", "include_descendants": False},
+            )
+
+    db_session.expire_all()
+    persisted = await db_session.get(Connector, connector_id)
+    assert persisted is not None
+    assert persisted.status is ConnectorStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_stale_drive_failure_cannot_overwrite_concurrent_reauthorization(
+    db_session, operations_context
+) -> None:  # type: ignore[no-untyped-def]
+    connector = operations_context["connector"]
+    connector_service = operations_context["connector_service"]
+    admin = operations_context["admin"]
+    connector.status = ConnectorStatus.ACTIVE
+    old_secret_id = connector.secret_id
+    replacement = await connector_service.store_refresh_token(
+        db_session,
+        organization_id=connector.organization_id,
+        refresh_token="concurrent-reauthorization-token",
+    )
+    connector.secret_id = replacement.id
+    connector_id = connector.id
+    replacement_id = replacement.id
+    await db_session.commit()
+
+    changed = await connector_service.mark_drive_reauthorization_required(
+        db_session,
+        principal=operations_context["principal"](admin),
+        connector_id=connector_id,
+        expected_secret_id=old_secret_id,
+    )
+    await db_session.commit()
+
+    db_session.expire_all()
+    persisted = await db_session.get(Connector, connector_id)
+    assert changed is False
+    assert persisted is not None
+    assert persisted.status is ConnectorStatus.ACTIVE
+    assert persisted.secret_id == replacement_id
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_scope_save_cannot_change_drive_connector_status(
+    db_session, operations_context
+) -> None:  # type: ignore[no-untyped-def]
+    connector = operations_context["connector"]
+    connector.status = ConnectorStatus.ACTIVE
+    await db_session.commit()
+    connector_id = connector.id
+
+    for user in (operations_context["reviewer"], operations_context["foreign_admin"]):
+        async with operations_context["client_for"](user) as client:
+            response = await client.put(
+                "/api/v1/admin/knowledge-sources/drive",
+                json={"root_folder_id": "unauthorized-root", "include_descendants": True},
+            )
+        assert response.status_code in {403, 404}
+
+    db_session.expire_all()
+    persisted = await db_session.get(Connector, connector_id)
+    assert persisted is not None
+    assert persisted.status is ConnectorStatus.ACTIVE
 
 
 @pytest.mark.asyncio

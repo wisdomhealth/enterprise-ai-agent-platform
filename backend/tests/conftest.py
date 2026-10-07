@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 os.environ.setdefault(
     "DATABASE_URL",
-    "postgresql+asyncpg://postgres@localhost:5432/platform_test",
+    "postgresql+asyncpg://postgres:%40WSX3edc@postgres:5432/platform_test",
 )
 
 from app.core.database import engine  # noqa: E402

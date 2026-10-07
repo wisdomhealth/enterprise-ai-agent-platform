@@ -12,7 +12,7 @@ from app.modules.knowledge.schemas import (
     DriveSyncEnqueued,
     DriveSyncStatusRead,
 )
-from app.modules.knowledge.service import KnowledgeSourceService
+from app.modules.knowledge.service import DriveReauthorizationRequired, KnowledgeSourceService
 from app.modules.outbox.service import OutboxService
 
 router = APIRouter(prefix="/api/v1/admin/knowledge-sources", tags=["knowledge-sources"])
@@ -56,6 +56,24 @@ async def configure_drive_source(
             root_folder_id=payload.root_folder_id,
             include_descendants=payload.include_descendants,
         )
+    except DriveReauthorizationRequired as error:
+        await db_session.rollback()
+        await service.mark_drive_reauthorization_required(
+            db_session,
+            principal=principal,
+            error=error,
+        )
+        await db_session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "GOOGLE_DRIVE_REAUTH_REQUIRED",
+                "message": (
+                    "Google Drive authorization has expired or been revoked. "
+                    "Please reconnect Google Drive."
+                ),
+            },
+        ) from None
     except HTTPException as error:
         await db_session.rollback()
         _raise_nondisclosing(error)

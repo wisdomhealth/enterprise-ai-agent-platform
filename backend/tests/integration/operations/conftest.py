@@ -31,8 +31,13 @@ class _ConfigurationDriveClient:
 
 
 class _ConfigurationDriveFactory:
+    def __init__(self) -> None:
+        self.error: Exception | None = None
+
     async def create(self, *, refresh_token: str) -> DriveConnection:
         assert refresh_token == "task21-refresh-token"
+        if self.error is not None:
+            raise self.error
         return DriveConnection(
             gateway=DriveGateway(_ConfigurationDriveClient()),  # type: ignore[arg-type]
             connection_identity="drive-reader@example.test",
@@ -135,11 +140,13 @@ async def operations_context(db_session: AsyncSession, tmp_path: Path) -> dict[s
             csrf_hash="csrf",
         )
 
+    drive_factory = _ConfigurationDriveFactory()
+
     @asynccontextmanager
     async def client_for(user: StaffUser) -> AsyncIterator[httpx.AsyncClient]:
         application = create_app(Settings.model_validate({"SESSION_SECRET": "task21-secret"}))
         application.state.connector_service = connector_service
-        application.state.drive_gateway_factory = _ConfigurationDriveFactory()
+        application.state.drive_gateway_factory = drive_factory
         resolved_principal = principal(user)
 
         async def override_db() -> AsyncIterator[AsyncSession]:
@@ -169,6 +176,8 @@ async def operations_context(db_session: AsyncSession, tmp_path: Path) -> dict[s
         "foreign_admin": foreign_admin,
         "source": source,
         "connector": connector,
+        "connector_service": connector_service,
+        "drive_factory": drive_factory,
         "session": session,
         "principal": principal,
         "client_for": client_for,

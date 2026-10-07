@@ -1,8 +1,10 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException, status
+from google.auth.exceptions import RefreshError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +25,14 @@ from app.modules.knowledge.scope import DriveScope
 class _ActiveDriveConnection:
     connection: DriveConnection
     connector_id: UUID
+    secret_id: UUID
+
+
+class DriveReauthorizationRequired(Exception):
+    def __init__(self, *, connector_id: UUID, secret_id: UUID) -> None:
+        super().__init__("Google Drive reauthorization is required")
+        self.connector_id = connector_id
+        self.secret_id = secret_id
 
 
 class KnowledgeSourceService:
@@ -69,11 +79,21 @@ class KnowledgeSourceService:
         previous_include_descendants = source.include_descendants if source else None
         previous_connector_id = await self._previous_connector_id(db_session, source)
         active_connection = await self._load_drive_connection(db_session, principal.organization_id)
-        descendant_ids = (
-            await active_connection.connection.gateway.resolve_descendant_folder_ids(root_folder_id)
-            if include_descendants
-            else set()
-        )
+        try:
+            descendant_ids = (
+                await active_connection.connection.gateway.resolve_descendant_folder_ids(
+                    root_folder_id
+                )
+                if include_descendants
+                else set()
+            )
+        except Exception as error:
+            self._raise_drive_reauthorization(
+                error,
+                active_connection.connector_id,
+                active_connection.secret_id,
+            )
+            raise
         if source is None:
             source = DriveSource(
                 organization_id=principal.organization_id,
@@ -190,10 +210,52 @@ class KnowledgeSourceService:
                 detail="an active Google Drive connector is required",
             )
         refresh_token = await self._connector_service.load_refresh_token(db_session, connector)
-        return _ActiveDriveConnection(
-            connection=await self._drive_gateway_factory.create(refresh_token=refresh_token),
-            connector_id=connector.id,
+        try:
+            connection = await self._drive_gateway_factory.create(refresh_token=refresh_token)
+        except Exception as error:
+            self._raise_drive_reauthorization(
+                error,
+                connector.id,
+                connector.secret_id,
+            )
+            raise
+        return _ActiveDriveConnection(connection, connector.id, connector.secret_id)
+
+    async def mark_drive_reauthorization_required(
+        self,
+        db_session: AsyncSession,
+        *,
+        principal: Principal,
+        error: DriveReauthorizationRequired,
+    ) -> bool:
+        return await self._connector_service.mark_drive_reauthorization_required(
+            db_session,
+            principal=principal,
+            connector_id=error.connector_id,
+            expected_secret_id=error.secret_id,
         )
+
+    @staticmethod
+    def _raise_drive_reauthorization(
+        error: Exception,
+        connector_id: UUID,
+        secret_id: UUID,
+    ) -> None:
+        http_status = getattr(getattr(error, "resp", None), "status", None)
+        invalid_grant = False
+        if isinstance(error, RefreshError):
+            response = next((arg for arg in error.args if isinstance(arg, Mapping)), None)
+            invalid_grant = (
+                response is not None and response.get("error") == "invalid_grant"
+            ) or any(
+                isinstance(arg, str) and "invalid_grant" in arg.lower()
+                for arg in error.args
+            )
+        if http_status == 401 or invalid_grant:
+            raise DriveReauthorizationRequired(
+                connector_id=connector_id,
+                secret_id=secret_id,
+            ) from error
 
     @staticmethod
     def _safe_reference(value: str) -> str:
