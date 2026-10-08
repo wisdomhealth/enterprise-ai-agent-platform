@@ -2,7 +2,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -88,6 +88,55 @@ class ConnectorService:
     async def decrypt_refresh_token(self, secret: EncryptedSecret) -> str:
         """Decrypt an already-read secret without opening a database transaction."""
         return await self._cipher.decrypt(secret)
+
+    async def mark_drive_reauthorization_required(
+        self,
+        db_session: AsyncSession,
+        *,
+        principal: Principal,
+        connector_id: UUID,
+        expected_secret_id: UUID,
+    ) -> bool:
+        """Invalidate only the exact active authorization generation that failed."""
+        updated_id = await db_session.scalar(
+            update(Connector)
+            .where(
+                Connector.id == connector_id,
+                Connector.organization_id == principal.organization_id,
+                Connector.kind == ConnectorKind.DRIVE,
+                Connector.status == ConnectorStatus.ACTIVE,
+                Connector.secret_id == expected_secret_id,
+            )
+            .values(
+                status=ConnectorStatus.REAUTH_REQUIRED,
+                updated_at=func.clock_timestamp(),
+            )
+            .returning(Connector.id)
+        )
+        if updated_id is None:
+            return False
+        details = {
+            "kind": ConnectorKind.DRIVE.value,
+            "error_code": "GOOGLE_DRIVE_REAUTH_REQUIRED",
+        }
+        await self._audit_service.record(
+            db_session,
+            principal,
+            action="connector.reauthorization.required",
+            object_type="connector",
+            object_id=updated_id,
+            outcome="FAILURE",
+            details=details,
+            safe_detail_keys=set(details),
+        )
+        await self._outbox_service.add(
+            db_session,
+            "connector.reauthorization_required",
+            "connector",
+            updated_id,
+            {"organization_id": str(principal.organization_id), **details},
+        )
+        return True
 
     async def create_or_reauthorize(
         self,

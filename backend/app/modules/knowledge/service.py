@@ -24,6 +24,7 @@ from app.modules.knowledge.drive_gateway import (
     DriveFile,
     DriveFileUnavailable,
     DriveGatewayFactory,
+    is_drive_authorization_error,
 )
 from app.modules.knowledge.models import DriveSource, DriveSourceStatus, KnowledgeBase
 from app.modules.knowledge.scope import DriveScope
@@ -62,6 +63,13 @@ class _DriveDownloadSnapshot:
     connector_id: UUID
     connector_secret_id: UUID
     encrypted_secret: EncryptedSecret
+
+
+class DriveReauthorizationRequired(Exception):
+    def __init__(self, *, connector_id: UUID, secret_id: UUID) -> None:
+        super().__init__("Google Drive reauthorization is required")
+        self.connector_id = connector_id
+        self.secret_id = secret_id
 
 
 class KnowledgeSourceService:
@@ -122,16 +130,23 @@ class KnowledgeSourceService:
 
         # Close the assessment transaction before any credential or Drive I/O.
         await db_session.rollback()
-        refresh_token = await self._connector_service.decrypt_refresh_token(
-            credential.encrypted_secret
-        )
-        connection = await self._drive_gateway_factory.create(
-            refresh_token=refresh_token
-        )
         try:
+            refresh_token = await self._connector_service.decrypt_refresh_token(
+                credential.encrypted_secret
+            )
+            connection = await self._drive_gateway_factory.create(
+                refresh_token=refresh_token
+            )
             root = await connection.gateway.get(root_folder_id)
         except DriveFileUnavailable as error:
             raise self._root_unavailable_error(error.reason.value) from error
+        except Exception as error:
+            self._raise_drive_reauthorization(
+                error,
+                credential.connector_id,
+                credential.connector_secret_id,
+            )
+            raise
         if (
             root is None
             or root.removed
@@ -139,11 +154,19 @@ class KnowledgeSourceService:
             or root.mime_type != DRIVE_FOLDER_MIME_TYPE
         ):
             raise self._root_unavailable_error("NOT_FOUND_OR_NO_ACCESS")
-        descendant_ids = (
-            await connection.gateway.resolve_descendant_folder_ids(root_folder_id)
-            if include_descendants
-            else set()
-        )
+        try:
+            descendant_ids = (
+                await connection.gateway.resolve_descendant_folder_ids(root_folder_id)
+                if include_descendants
+                else set()
+            )
+        except Exception as error:
+            self._raise_drive_reauthorization(
+                error,
+                credential.connector_id,
+                credential.connector_secret_id,
+            )
+            raise
 
         # Apply only after revalidating ownership, the source generation, and
         # the exact authorization generation used for the Drive requests.
@@ -389,6 +412,32 @@ class KnowledgeSourceService:
                 key_version=secret.key_version,
             ),
         )
+
+    async def mark_drive_reauthorization_required(
+        self,
+        db_session: AsyncSession,
+        *,
+        principal: Principal,
+        error: DriveReauthorizationRequired,
+    ) -> bool:
+        return await self._connector_service.mark_drive_reauthorization_required(
+            db_session,
+            principal=principal,
+            connector_id=error.connector_id,
+            expected_secret_id=error.secret_id,
+        )
+
+    @staticmethod
+    def _raise_drive_reauthorization(
+        error: Exception,
+        connector_id: UUID,
+        secret_id: UUID,
+    ) -> None:
+        if is_drive_authorization_error(error):
+            raise DriveReauthorizationRequired(
+                connector_id=connector_id,
+                secret_id=secret_id,
+            ) from error
 
     @staticmethod
     def _configuration_matches_snapshot(
