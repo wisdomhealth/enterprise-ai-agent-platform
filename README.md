@@ -26,8 +26,9 @@ OIDC authenticates staff members.
   LlamaIndex OpenAI embeddings, and unchanged DOCX support.
 - Versioned documents with a retrievable lifecycle and current-version publication.
 - Durable synchronization, parsing, and indexing jobs with lease-based recovery.
-- Version-scoped physical chunk cleanup after a Drive file is trashed, permanently
-  deleted, or moved outside the authorized folder tree.
+- Version-scoped physical chunk cleanup in the same cursor transaction after a Drive
+  file is trashed, permanently deleted, loses access, or moves outside the refreshed
+  authorized folder tree.
 
 ### Retrieval-augmented generation
 

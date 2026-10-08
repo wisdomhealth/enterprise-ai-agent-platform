@@ -8,6 +8,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.audit.models import AuditEvent
 from app.modules.audit.service import AuditService
 from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
 from app.modules.authorization.types import ResourceRef, ResourceState
@@ -36,6 +37,7 @@ class DriveSyncStatus:
     isolated_files: int
     retry_count: int
     recent_error_codes: list[str]
+    disabled_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +125,9 @@ class DriveSyncOperations:
         jobs = list(
             (
                 await self._db_session.scalars(
-                    select(JobIntent).where(JobIntent.kind == "knowledge.drive_source.sync")
+                    select(JobIntent)
+                    .where(JobIntent.kind == "knowledge.drive_source.sync")
+                    .order_by(JobIntent.created_at, JobIntent.id)
                 )
             ).all()
         )
@@ -153,6 +157,7 @@ class DriveSyncOperations:
             default=None,
         )
         errors = [job.last_error_code for job in source_jobs if job.last_error_code][-5:]
+        disabled_reason = await self._source_disabled_reason(source)
         return DriveSyncStatus(
             source_id=source.id,
             cursor=source.sync_cursor,
@@ -162,7 +167,31 @@ class DriveSyncOperations:
             isolated_files=isolated,
             retry_count=sum(job.attempts for job in source_jobs),
             recent_error_codes=[error for error in errors if error is not None],
+            disabled_reason=disabled_reason,
         )
+
+    async def _source_disabled_reason(self, source: DriveSource) -> str | None:
+        if source.status.value != "DISABLED":
+            return None
+        event = await self._db_session.scalar(
+            select(AuditEvent)
+            .where(
+                AuditEvent.organization_id == source.organization_id,
+                AuditEvent.object_id == source.id,
+                AuditEvent.action.in_(
+                    (
+                        "knowledge.drive_source.root_unavailable",
+                        "knowledge.drive_source.configure",
+                    )
+                ),
+            )
+            .order_by(AuditEvent.occurred_at.desc(), AuditEvent.id.desc())
+            .limit(1)
+        )
+        if event is None or event.action != "knowledge.drive_source.root_unavailable":
+            return None
+        reason = event.details.get("reason")
+        return f"ROOT_UNAVAILABLE_{reason}" if isinstance(reason, str) else None
 
     async def retry_failed_job(self, *, principal: Principal, job_id: UUID) -> JobIntent:
         """Retry one Drive sync through its owning state transition."""

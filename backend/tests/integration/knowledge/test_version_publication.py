@@ -314,11 +314,17 @@ async def test_parse_job_embeds_authorized_file_and_publishes_complete_version(
     source = await db_session.get(DriveSource, document.source_id)
     assert source is not None
     source.allowed_descendant_ids = ["authorized-folder"]
+
+    class TransactionFreeEmbeddingProvider:
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            assert not db_session.in_transaction()
+            return [[1.0] * 1536 for _ in texts]
+
     service, gateway = await _authorized_ingestion_service(
         db_session,
         document,
         tmp_path,
-        embedding_provider=ValidEmbeddingProvider(),
+        embedding_provider=TransactionFreeEmbeddingProvider(),
     )
     job = await JobService().enqueue(
         db_session,
@@ -347,6 +353,52 @@ async def test_parse_job_embeds_authorized_file_and_publishes_complete_version(
     ).all()
     assert chunks
     assert all(chunk.embedding is not None for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_drive_download_and_parsing_run_without_open_database_transaction(
+    db_session, tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    document = await _document(db_session, current_is_retrievable=False)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    service, gateway = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        embedding_provider=ValidEmbeddingProvider(),
+    )
+    original_download = gateway.download
+
+    async def transaction_free_download(file_id: str) -> bytes:
+        assert not db_session.in_transaction()
+        return await original_download(file_id)
+
+    class TransactionFreeParser:
+        def parse(self, content: bytes):  # type: ignore[no-untyped-def]
+            assert not db_session.in_transaction()
+            return PdfParser().parse(content)
+
+    monkeypatch.setattr(gateway, "download", transaction_free_download)
+    monkeypatch.setattr(
+        DocumentIngestionService,
+        "_parser_for",
+        staticmethod(lambda _mime_type: TransactionFreeParser()),
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        f"document-parse-transaction-free-{uuid4()}",
+        {
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+
+    version = await service.parse(job.id)
+
+    assert version.state is DocumentVersionState.RETRIEVABLE
 
 
 @pytest.mark.asyncio
@@ -1092,7 +1144,8 @@ async def test_expired_worker_cannot_checkpoint_after_reclaimer_takes_over(
 
     assert first_gateway.download_calls == ["drive-file-1"]
     assert second_gateway.download_calls == ["drive-file-1"]
-    assert parser.calls == 2
+    # The expired worker is fenced before it can parse or write a checkpoint.
+    assert parser.calls == 1
 
 
 @pytest.mark.asyncio
@@ -1277,4 +1330,5 @@ async def test_stale_worker_cannot_publish_checkpoint_after_another_worker_claim
         assert versions == []
 
     assert stale_gateway.download_calls == ["drive-file-1"]
-    assert parser.calls == 1
+    # Lease takeover is revalidated after download and before parsing/writes.
+    assert parser.calls == 0

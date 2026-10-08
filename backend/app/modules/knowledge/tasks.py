@@ -336,15 +336,50 @@ async def _consume_document_cleanup_event(
         if event.aggregate_id != document_id:
             raise ValueError("cleanup event aggregate mismatch")
 
+        # Shared write order: source, parse jobs, document, versions, chunks.
+        # Inline synchronization takes the same locks in the same order.
+        source = await db_session.scalar(
+            select(DriveSource)
+            .where(
+                DriveSource.id == source_id,
+                DriveSource.organization_id == organization_id,
+            )
+            .with_for_update()
+        )
+        if source is None:
+            raise ValueError("cleanup event ownership mismatch")
+
+        parse_jobs = list(
+            (
+                await db_session.scalars(
+                    select(JobIntent)
+                    .where(
+                        JobIntent.kind == "knowledge.document.parse",
+                        JobIntent.payload["source_id"].as_string() == str(source_id),
+                        JobIntent.payload["document_id"].as_string() == str(document_id),
+                    )
+                    .order_by(JobIntent.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        for job in parse_jobs:
+            if job.state in (JobState.PENDING, JobState.RUNNING, JobState.RECONCILIATION):
+                job.state = JobState.FAILED
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.next_attempt_at = None
+                job.last_error_code = "DOCUMENT_REVOKED"
+                job.error_class = ErrorClass.NON_RETRYABLE
+                job.version += 1
+                job.updated_at = func.clock_timestamp()
+
         document = await db_session.scalar(
             select(Document)
-            .join(DriveSource, DriveSource.id == Document.source_id)
             .where(
                 Document.id == document_id,
                 Document.organization_id == organization_id,
                 Document.source_id == source_id,
-                DriveSource.id == source_id,
-                DriveSource.organization_id == organization_id,
             )
             .with_for_update()
         )
@@ -358,6 +393,7 @@ async def _consume_document_cleanup_event(
                         DocumentVersion.id.in_(version_ids),
                         DocumentVersion.document_id == document.id,
                     )
+                    .order_by(DocumentVersion.id)
                     .with_for_update()
                 )
             ).all()
@@ -592,15 +628,26 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
             )
             if result.reauth_required:
                 await lease_service.retry(
-                    job.id,
+                    job_id,
                     execution_owner,
                     error_code="DRIVE_REAUTH_REQUIRED",
                     error_class=ErrorClass.NON_RETRYABLE,
                     expected_version=expected_version,
                 )
+            elif result.root_unavailable_reason is not None:
+                await lease_service.retry(
+                    job_id,
+                    execution_owner,
+                    error_code=(
+                        "DRIVE_ROOT_UNAVAILABLE_"
+                        f"{result.root_unavailable_reason}"
+                    ),
+                    error_class=ErrorClass.NON_RETRYABLE,
+                    expected_version=expected_version,
+                )
             else:
                 await lease_service.complete(
-                    job.id,
+                    job_id,
                     execution_owner,
                     expected_version=expected_version,
                 )
@@ -612,19 +659,13 @@ async def _consume_drive_sync_intent(job_id: UUID) -> None:
                     # The committed event remains authoritative; the periodic
                     # sweep recovers this best-effort broker wakeup.
                     pass
-            for event_id in result.cleanup_outbox_event_ids:
-                try:
-                    dispatch_document_cleanup_outbox_event.delay(str(event_id))
-                except Exception:
-                    # The cleanup event is already committed; the periodic
-                    # dispatcher recovers a failed post-commit broker wakeup.
-                    pass
         except JobLeaseLost:
             await db_session.rollback()
             raise
         except Exception:
+            await db_session.rollback()
             await lease_service.retry(
-                job.id,
+                job_id,
                 execution_owner,
                 error_code="DRIVE_SYNC_TRANSIENT_FAILURE",
                 error_class=ErrorClass.RETRYABLE,

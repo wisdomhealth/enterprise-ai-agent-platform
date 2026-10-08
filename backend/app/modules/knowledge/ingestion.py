@@ -1,8 +1,9 @@
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from sqlalchemy import func, select, update
@@ -11,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService
-from app.modules.knowledge.chunking import DeterministicChunker
+from app.modules.knowledge.chunking import Chunk, DeterministicChunker
 from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import (
     Document,
@@ -19,12 +20,20 @@ from app.modules.knowledge.models import (
     DocumentVersion,
     DocumentVersionState,
     DriveSource,
+    DriveSourceStatus,
 )
 from app.modules.knowledge.parsers import DocumentParseError, DocumentParser, PdfParser, WordParser
 from app.modules.knowledge.service import KnowledgeSourceService
 
 if TYPE_CHECKING:
     from app.modules.rag.types import EmbeddingProvider
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedVersion:
+    id: UUID
+    content_sha256: str
+    chunks: tuple[Chunk, ...]
 
 
 class DocumentIngestionService:
@@ -66,7 +75,12 @@ class DocumentIngestionService:
         claimed_job_id = job.id
         claimed_job_version = job.version
         if job.kind != "knowledge.document.parse":
-            await self._fail_terminal(lease_service, job, "INVALID_DOCUMENT_PARSE_JOB")
+            await self._fail_terminal(
+                lease_service,
+                claimed_job_id,
+                claimed_job_version,
+                "INVALID_DOCUMENT_PARSE_JOB",
+            )
             raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
         # Publish the claim before external I/O so an expired lease can be taken over
         # without waiting for this worker's parse transaction to end.
@@ -95,8 +109,31 @@ class DocumentIngestionService:
                     source=source,
                     file=drive_file,
                 )
-                version = await self.parse_bytes(document, content, drive_file.mime_type)
-                await self._commit_processing_checkpoint(job, version)
+                # Drive download ends with no open database transaction. Check
+                # the lease once before CPU-heavy parsing, parse without locks,
+                # then fence again in the write checkpoint.
+                await self._assert_active_lease_without_lock(
+                    claimed_job_id, claimed_job_version
+                )
+                await self._db_session.rollback()
+                prepared = self._prepare_version(content, drive_file.mime_type)
+                checkpoint_job = await self._db_session.get(
+                    JobIntent, claimed_job_id, populate_existing=True
+                )
+                if checkpoint_job is None:
+                    raise JobLeaseLost(claimed_job_id)
+                document = await self._lock_parse_checkpoint(
+                    checkpoint_job,
+                    document_id,
+                    drive_file=drive_file,
+                )
+                version = await self._persist_prepared_version(document, prepared)
+                await self._commit_processing_checkpoint(checkpoint_job, version)
+                job = await self._db_session.get(
+                    JobIntent, claimed_job_id, populate_existing=True
+                )
+                if job is None:
+                    raise JobLeaseLost(claimed_job_id)
             version = await self._publish_processing_version(job, version)
             await lease_service.complete(job.id, self._worker_id)
             await self._db_session.commit()
@@ -110,7 +147,12 @@ class DocumentIngestionService:
                 if isinstance(exc, DocumentParseError)
                 else "DOCUMENT_DOWNLOAD_FORBIDDEN"
             )
-            await self._fail_terminal(lease_service, job, error_code)
+            await self._fail_terminal(
+                lease_service,
+                claimed_job_id,
+                claimed_job_version,
+                error_code,
+            )
             raise
         except Exception:
             # A failed embedding flush leaves SQLAlchemy rollback-required.  Restore
@@ -172,6 +214,101 @@ class DocumentIngestionService:
         )
         if lease_owner is None:
             raise JobLeaseLost(job.id)
+
+    async def _assert_active_lease_without_lock(
+        self, job_id: UUID, expected_version: int
+    ) -> None:
+        lease_owner = await self._db_session.scalar(
+            select(JobIntent.id).where(
+                JobIntent.id == job_id,
+                JobIntent.state == JobState.RUNNING,
+                JobIntent.lease_owner == self._worker_id,
+                JobIntent.version == expected_version,
+                JobIntent.lease_expires_at.is_not(None),
+                JobIntent.lease_expires_at > func.clock_timestamp(),
+            )
+        )
+        if lease_owner is None:
+            raise JobLeaseLost(job_id)
+
+    async def _lock_parse_checkpoint(
+        self,
+        job: JobIntent,
+        document_id: UUID,
+        *,
+        drive_file: DriveFile | None = None,
+    ) -> Document:
+        await self._assert_active_lease(job)
+        document = await self._db_session.scalar(
+            select(Document)
+            .where(Document.id == document_id)
+            .with_for_update()
+        )
+        if document is None:
+            raise DocumentParseError("DOCUMENT_NOT_FOUND")
+        source = await self._db_session.get(DriveSource, document.source_id)
+        if (
+            source is None
+            or source.organization_id != document.organization_id
+            or source.status is not DriveSourceStatus.ACTIVE
+            or (
+                drive_file is not None
+                and not KnowledgeSourceService.is_file_authorized(source, drive_file)
+            )
+        ):
+            raise DocumentParseError("DOCUMENT_REVOKED")
+        return document
+
+    def _prepare_version(
+        self,
+        content: bytes,
+        mime_type: str,
+        parser: DocumentParser | None = None,
+    ) -> _PreparedVersion:
+        version_id = uuid4()
+        selected_parser = parser or self._parser_for(mime_type)
+        try:
+            sections = selected_parser.parse(content)
+            chunks = self._chunker.chunk(
+                document_version_id=version_id,
+                sections=sections,
+            )
+        except DocumentParseError:
+            raise
+        except Exception as exc:
+            raise DocumentParseError() from exc
+        return _PreparedVersion(
+            id=version_id,
+            content_sha256=sha256(content).hexdigest(),
+            chunks=tuple(chunks),
+        )
+
+    async def _persist_prepared_version(
+        self, document: Document, prepared: _PreparedVersion
+    ) -> DocumentVersion:
+        version = DocumentVersion(
+            id=prepared.id,
+            document_id=document.id,
+            state=DocumentVersionState.PROCESSING,
+            content_sha256=prepared.content_sha256,
+        )
+        self._db_session.add(version)
+        await self._db_session.flush()
+        self._db_session.add_all(
+            DocumentChunk(
+                id=chunk.id,
+                document_version_id=version.id,
+                ordinal=chunk.ordinal,
+                text=chunk.text,
+                page_number=chunk.page_number,
+                section=chunk.section,
+                token_count=chunk.token_count,
+                metadata_=chunk.metadata,
+            )
+            for chunk in prepared.chunks
+        )
+        await self._db_session.flush()
+        return version
 
     async def ingest_bytes(
         self,
@@ -338,14 +475,15 @@ class DocumentIngestionService:
     async def _fail_terminal(
         self,
         lease_service: JobLeaseService,
-        job: JobIntent,
+        job_id: UUID,
+        expected_version: int,
         error_code: str,
     ) -> None:
         await lease_service.retry(
-            job.id,
+            job_id,
             self._worker_id or "",
             error_code=error_code,
             error_class=ErrorClass.NON_RETRYABLE,
-            expected_version=job.version,
+            expected_version=expected_version,
         )
         await self._db_session.commit()

@@ -138,4 +138,5 @@ async def drive_sync_status(
         isolated_files=sync_status.isolated_files,
         retry_count=sync_status.retry_count,
         recent_error_codes=sync_status.recent_error_codes,
+        disabled_reason=sync_status.disabled_reason,
     )

@@ -63,7 +63,6 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
     organization = Organization(name="Authorization loss owner")
     db_session.add(organization)
     await db_session.flush()
-    organization_id = organization.id
     knowledge_base = KnowledgeBase(organization_id=organization.id)
     db_session.add(knowledge_base)
     await db_session.flush()
@@ -77,7 +76,6 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
     )
     db_session.add(source)
     await db_session.flush()
-    source_id = source.id
     document = Document(
         organization_id=organization.id,
         knowledge_base_id=knowledge_base.id,
@@ -137,7 +135,7 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
         select(func.count(DocumentChunk.id)).where(
             DocumentChunk.document_version_id == version_id
         )
-    ) == 1
+    ) == 0
     persisted_job = await db_session.get(JobIntent, parse_job_id)
     assert persisted_job is not None
     assert persisted_job.state is JobState.FAILED
@@ -148,13 +146,7 @@ async def test_detected_folder_removal_revokes_before_cleanup(db_session) -> Non
             OutboxEvent.aggregate_id == document_id,
         )
     )
-    assert cleanup_event is not None
-    assert cleanup_event.payload == {
-        "organization_id": str(organization_id),
-        "source_id": str(source_id),
-        "document_id": str(document_id),
-        "version_ids": [str(version_id)],
-    }
+    assert cleanup_event is None
 
 
 @pytest.mark.asyncio

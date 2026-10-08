@@ -71,6 +71,7 @@ async def test_embedding_publication_switches_current_version_only_after_every_c
         ]
     )
     await db_session.flush()
+    await db_session.commit()
 
     published = await EmbeddingPublicationService(db_session, FakeEmbeddingProvider()).publish(
         version.id

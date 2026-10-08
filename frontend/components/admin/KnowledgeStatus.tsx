@@ -21,6 +21,9 @@ export function KnowledgeStatus({
   const [includeDescendants, setIncludeDescendants] = useState(
     sources[0]?.include_descendants ?? true,
   );
+  const rootUnavailable = (source: AdminKnowledgeStatus) =>
+    source.disabled_reason?.startsWith("ROOT_UNAVAILABLE_") === true ||
+    source.recent_error_codes.some((code) => code.startsWith("DRIVE_ROOT_UNAVAILABLE_"));
   return (
     <section aria-labelledby="knowledge-status-heading">
       <h2 id="knowledge-status-heading">Knowledge sources</h2>
@@ -56,6 +59,12 @@ export function KnowledgeStatus({
             <p>Cursor: {source.cursor ?? "Not initialized"}</p>
             <p>Last success: {formatUtc(source.last_success_at)}</p>
             <p>Backlog {source.backlog} · Retry attempts {source.retry_count}</p>
+            {source.status === "DISABLED" && rootUnavailable(source) ? (
+              <p role="status">
+                Drive root access was lost. Restore access to the authorized root or save a new
+                Drive scope; the source is not reactivated automatically.
+              </p>
+            ) : null}
             {source.recent_error_codes.map((code) => <p key={code}>Error: {code}</p>)}
             <button type="button" onClick={() => setPending(source.source_id)}>Sync Drive now</button>
           </li>

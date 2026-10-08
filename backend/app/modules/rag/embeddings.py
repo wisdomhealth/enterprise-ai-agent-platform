@@ -76,11 +76,9 @@ class EmbeddingPublicationService:
         *,
         before_publish: Callable[[], Awaitable[None]] | None = None,
     ) -> DocumentVersion:
-        version = await self._db_session.scalar(
-            select(DocumentVersion)
-            .where(DocumentVersion.id == version_id)
-            .with_for_update()
-        )
+        # Snapshot the texts without write locks. Embedding is external I/O and
+        # must not keep version/chunk locks while waiting on the provider.
+        version = await self._db_session.get(DocumentVersion, version_id)
         if version is None:
             raise LookupError("document version not found")
         if version.state is DocumentVersionState.RETRIEVABLE:
@@ -92,23 +90,63 @@ class EmbeddingPublicationService:
                 await self._db_session.scalars(
                     select(DocumentChunk)
                     .where(DocumentChunk.document_version_id == version.id)
-                    .order_by(DocumentChunk.ordinal)
-                    .with_for_update()
+                    .order_by(DocumentChunk.ordinal, DocumentChunk.id)
                 )
             ).all()
         )
         if not chunks:
             raise ValueError("a document version must contain chunks before publication")
-        vectors = await self._provider.embed([chunk.text for chunk in chunks])
+        document_id = version.document_id
+        chunk_snapshot = tuple((chunk.id, chunk.ordinal, chunk.text) for chunk in chunks)
+        # End the clean snapshot read transaction before calling the external
+        # embedding provider. The durable parse checkpoint is required here;
+        # committing pending caller writes would break the publication fence.
+        if self._db_session.new or self._db_session.dirty or self._db_session.deleted:
+            raise RuntimeError("embedding publication requires a durable parse checkpoint")
+        await self._db_session.commit()
+        vectors = await self._provider.embed([item[2] for item in chunk_snapshot])
         if len(vectors) != len(chunks) or not all(_valid_vector(vector) for vector in vectors):
             raise ValueError("embedding provider returned an invalid vector batch")
         if before_publish is not None:
             await before_publish()
-        for chunk, vector in zip(chunks, vectors, strict=True):
-            chunk.embedding = vector
-        document = await self._db_session.get(Document, version.document_id, with_for_update=True)
+        # Shared write order after the optional JobIntent lease fence:
+        # Document -> DocumentVersion -> DocumentChunk.
+        document = await self._db_session.get(Document, document_id, with_for_update=True)
         if document is None:
             raise LookupError("document not found")
+        version = cast(
+            DocumentVersion | None,
+            await self._db_session.scalar(
+                select(DocumentVersion)
+                .where(
+                    DocumentVersion.id == version_id,
+                    DocumentVersion.document_id == document.id,
+                )
+                .with_for_update()
+            ),
+        )
+        if version is None:
+            raise LookupError("document version not found")
+        if version.state is DocumentVersionState.RETRIEVABLE:
+            return version
+        if version.state is not DocumentVersionState.PROCESSING:
+            raise ValueError("only processing document versions can be published")
+        locked_chunks = list(
+            (
+                await self._db_session.scalars(
+                    select(DocumentChunk)
+                    .where(DocumentChunk.document_version_id == version.id)
+                    .order_by(DocumentChunk.ordinal, DocumentChunk.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if tuple(
+            (chunk.id, chunk.ordinal, chunk.text) for chunk in locked_chunks
+        ) != chunk_snapshot:
+            raise ValueError("document chunks changed during embedding")
+        for chunk, vector in zip(locked_chunks, vectors, strict=True):
+            chunk.embedding = vector
         # The embeddings, RETRIEVABLE state, and current-version switch are all
         # flushed together.  The caller owns the transaction commit boundary.
         version.state = DocumentVersionState.RETRIEVABLE
