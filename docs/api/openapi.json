@@ -538,6 +538,17 @@
             ],
             "title": "Cursor"
           },
+          "disabled_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disabled Reason"
+          },
           "isolated_files": {
             "title": "Isolated Files",
             "type": "integer"
@@ -853,6 +864,17 @@
           "descendant_count": {
             "title": "Descendant Count",
             "type": "integer"
+          },
+          "disabled_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disabled Reason"
           },
           "include_descendants": {
             "title": "Include Descendants",

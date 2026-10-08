@@ -29,18 +29,30 @@ headers in tickets, logs, or commands.
 
 ## Revocation behavior
 
-If a file is deleted, leaves the allowed folder tree, or loses accessible
-authorization, its document versions are immediately marked `REVOKED` and
-the current retrievable version reference is cleared in the cursor transaction.
-Moving a file to Drive trash and permanently deleting it use this same path.
-Temporary Drive API failures fail the sync job and never masquerade as deletion.
+Drive metadata and folder scope are assessed before the database write transaction.
+If a file is deleted, trashed, loses file access, or leaves the freshly enumerated
+authorized folder tree, one transaction invalidates its parse tasks, marks every
+non-deleted version `REVOKED`, clears the current retrievable version, deletes only
+those versions' `document_chunks` (including vectors), writes a scoped audit event,
+and advances the cursor. Already-revoked versions with remaining chunks are included.
+Temporary Drive failures, OAuth failures, and incomplete pages do not apply cleanup
+or advance the cursor. Document and version records remain as lifecycle history.
 
-The transactional cleanup event records the organization, source, document, and
-exact version IDs revoked by that sync operation. A Celery worker validates those
-relationships and states before deleting only those versions' `document_chunks`;
-the vector stored in each row disappears with the row. The document and version
-records remain for lifecycle and audit history. Delivery and consumption are
-idempotent, with a one-minute pending-event sweep and bounded task retries.
+Historical `knowledge.document.cleanup.requested` events are still consumed
+idempotently for deployments that created them before this change. New syncs do not
+create or wait for a separate cleanup event.
+
+If the authorized root itself is trashed, removed, inaccessible, or explicitly
+denied, all documents owned by that source are cleaned through the same transaction
+and the source becomes `DISABLED`. The job error records the exact
+`DRIVE_ROOT_UNAVAILABLE_*` reason. This differs from OAuth expiry (`ERROR` plus a
+`REAUTH_REQUIRED` connector) and from an administrator's intentional disablement.
+The worker never changes a disabled source back to `ACTIVE` on its own.
+
+To restore a root-disabled source, first restore the original root and the connector
+identity's access, then use **Save Drive scope** to validate and save that root again;
+or save a different accessible root. A successful administrator configuration is
+the explicit action that reactivates the source. Trigger synchronization afterwards.
 
 ## Replace previously ingested files from the UI
 
@@ -51,9 +63,9 @@ ingestion adapters:
 2. Delete or move the old files to trash in Google Drive. Do not delete the root
    folder itself.
 3. In the staff UI, open the knowledge source and trigger synchronization.
-4. Wait until the source status reports a successful sync and no cleanup backlog.
-   At that point the old versions are `REVOKED` and their chunks are physically
-   absent.
+4. Wait until the sync reports success. At that point the old versions are
+   `REVOKED` and their chunks are physically absent; there is no second cleanup
+   queue to wait for.
 5. Upload the replacement files. They must receive new Google Drive file IDs;
    reusing the same filename is safe and does not reuse the old document record.
 6. Trigger synchronization again and wait for parsing/embedding to finish. The new
@@ -61,5 +73,7 @@ ingestion adapters:
    publication transaction switches `current_version_id`.
 
 Do not clear database tables, edit cursors, invoke bulk ingestion scripts, or delete
-document/version records. If cleanup fails, leave the Outbox event in place and
-restore the worker/broker/database dependency; the scheduled dispatcher retries it.
+document/version records. A failed new sync transaction leaves its cursor and data
+unchanged and the durable sync job remains retryable. For a historical cleanup
+event, leave the event in place and restore the worker/broker/database dependency;
+the scheduled dispatcher retries it.

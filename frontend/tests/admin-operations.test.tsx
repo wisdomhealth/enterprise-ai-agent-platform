@@ -298,6 +298,35 @@ it("keeps both Drive confirmations keyboard-contained and restores each trigger"
   expectDialogKeyboardBoundary("Save Drive scope", "Drive scope change confirmation");
 });
 
+it("explains how to recover a source disabled by root-folder loss", () => {
+  render(
+    <KnowledgeStatus
+      sources={[
+        {
+          source_id: "source-disabled-root",
+          status: "DISABLED",
+          root_folder_id: "unavailable-root",
+          include_descendants: true,
+          descendant_count: 0,
+          cursor: "cursor-8",
+          last_success_at: null,
+          backlog: 0,
+          isolated_files: 1,
+          retry_count: 1,
+          recent_error_codes: [],
+          disabled_reason: "ROOT_UNAVAILABLE_NOT_FOUND_OR_NO_ACCESS",
+        },
+      ]}
+      onSync={vi.fn().mockResolvedValue(undefined)}
+      onConfigure={vi.fn().mockResolvedValue(undefined)}
+    />,
+  );
+
+  expect(
+    screen.getByText(/restore access to the authorized root or save a new Drive scope/i),
+  ).toBeVisible();
+});
+
 it("keeps job retry confirmation keyboard-contained and restores its trigger", () => {
   render(
     <JobFailures

@@ -32,6 +32,7 @@ class KnowledgeSourceStatusRead(BaseModel):
     isolated_files: int
     retry_count: int
     recent_error_codes: list[str]
+    disabled_reason: str | None = None
 
 
 class JobSummaryRead(BaseModel):

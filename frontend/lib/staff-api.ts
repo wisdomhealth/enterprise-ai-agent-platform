@@ -364,6 +364,7 @@ export type AdminKnowledgeStatus = {
   isolated_files: number;
   retry_count: number;
   recent_error_codes: string[];
+  disabled_reason?: string | null;
 };
 
 export type AdminQualityStatus = {

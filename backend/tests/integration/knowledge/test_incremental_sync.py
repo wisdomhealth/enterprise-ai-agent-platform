@@ -11,7 +11,7 @@ from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.drive_gateway import DriveFile
 from app.modules.knowledge.models import Document, DriveSource, KnowledgeBase
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
-from app.modules.knowledge.sync import DriveSyncService
+from app.modules.knowledge.sync import DriveSyncService, StaleDriveAssessment
 from app.modules.outbox.models import OutboxEvent
 
 
@@ -113,14 +113,15 @@ async def test_cursor_advances_only_after_page_is_persisted(db_session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplicate_change_page_creates_one_parse_intent(db_session) -> None:  # type: ignore[no-untyped-def]
+async def test_stale_duplicate_change_page_is_discarded(db_session) -> None:  # type: ignore[no-untyped-def]
     source = await _source(db_session)
     source_id = source.id
     boundary = FakeDriveChangeBoundary([_authorized_file()], "cursor-2")
     service = DriveSyncService(db_session, page_gateway=boundary)
 
-    await service.sync(source.id, "cursor-1")
-    await service.sync(source.id, "cursor-1")
+    await service.sync(source_id, "cursor-1")
+    with pytest.raises(StaleDriveAssessment, match="cursor changed"):
+        await service.sync(source_id, "cursor-1")
 
     assert await db_session.scalar(
         select(func.count(JobIntent.id)).where(
@@ -309,7 +310,7 @@ async def test_concurrent_enqueue_from_one_terminal_predecessor_creates_one_succ
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_cursor_is_committed_before_page_failure(db_session) -> None:  # type: ignore[no-untyped-def]
+async def test_bootstrap_cursor_is_not_committed_before_page_failure(db_session) -> None:  # type: ignore[no-untyped-def]
     source = await _source(db_session, cursor=None)
     source_id = source.id
     boundary = FailingAfterBootstrapBoundary([], None)
@@ -320,11 +321,11 @@ async def test_bootstrap_cursor_is_committed_before_page_failure(db_session) -> 
     db_session.expire_all()
     persisted = await db_session.get(DriveSource, source_id)
     assert persisted is not None
-    assert persisted.sync_cursor == "start-cursor"
+    assert persisted.sync_cursor is None
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_cursor_survives_page_failure_in_a_new_database_session() -> None:
+async def test_bootstrap_cursor_rolls_back_with_page_failure_in_a_new_database_session() -> None:
     async with async_sessionmaker() as session_a:
         organization = Organization(name="Cross-session bootstrap owner")
         session_a.add(organization)
@@ -351,7 +352,7 @@ async def test_bootstrap_cursor_survives_page_failure_in_a_new_database_session(
     async with async_sessionmaker() as session_b:
         persisted = await session_b.get(DriveSource, source_id)
         assert persisted is not None
-        assert persisted.sync_cursor == "start-cursor"
+        assert persisted.sync_cursor is None
         organization = await session_b.get(Organization, organization_id)
         assert organization is not None
         await session_b.delete(organization)

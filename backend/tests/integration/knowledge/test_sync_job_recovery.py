@@ -9,7 +9,7 @@ from app.modules.authorization.models import ResourceGrant
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffUser, UserRole, UserStatus
-from app.modules.jobs.models import JobIntent, JobState
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobService
 from app.modules.knowledge.models import DriveSource, DriveSourceStatus, KnowledgeBase
 from app.modules.knowledge.operations import DriveSyncOperations
@@ -311,8 +311,82 @@ async def test_completed_drive_sync_wakes_each_committed_document_parse_event(
             persisted_source = await inspection_session.get(DriveSource, source_id)
             assert persisted_source is not None
         assert dispatched_parse == [str(event_id)]
-        assert dispatched_cleanup == [str(cleanup_event_id)]
+        # New syncs perform cleanup in the cursor transaction; historical
+        # cleanup events remain supported but are not dispatched from here.
+        assert dispatched_cleanup == []
     finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_root_loss_records_specific_non_retryable_sync_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async with async_sessionmaker() as setup_session:
+        organization = Organization(name=f"root-loss owner {uuid4()}")
+        setup_session.add(organization)
+        await setup_session.flush()
+        knowledge_base = KnowledgeBase(organization_id=organization.id)
+        setup_session.add(knowledge_base)
+        await setup_session.flush()
+        source = DriveSource(
+            organization_id=organization.id,
+            knowledge_base_id=knowledge_base.id,
+            root_folder_id="root",
+            allowed_descendant_ids=[],
+            connection_identity="reader@example.test",
+            sync_cursor="cursor-1",
+        )
+        setup_session.add(source)
+        await setup_session.flush()
+        job = await JobService().enqueue(
+            setup_session,
+            "knowledge.drive_source.sync",
+            drive_sync_job_key(source.id, source.sync_cursor),
+            {"source_id": str(source.id), "page_token": source.sync_cursor},
+        )
+        await setup_session.commit()
+        job_id = job.id
+        organization_id = organization.id
+
+    async def root_lost(  # type: ignore[no-untyped-def]
+        _self, source_id_value, _page_token, *, parent_sync_job_id
+    ):
+        assert parent_sync_job_id == job_id
+        return SyncResult(
+            source_id_value,
+            "cursor-2",
+            0,
+            1,
+            0,
+            root_unavailable_reason="NOT_FOUND_OR_NO_ACCESS",
+        )
+
+    monkeypatch.setattr("app.modules.knowledge.tasks.DriveSyncService.sync", root_lost)
+    monkeypatch.setattr(
+        "app.modules.knowledge.tasks.ConnectorService.from_settings",
+        classmethod(lambda _cls, _settings: object()),
+    )
+    monkeypatch.setattr(
+        "app.modules.knowledge.tasks.GoogleDriveGatewayFactory.from_settings",
+        classmethod(lambda _cls, _settings: object()),
+    )
+
+    try:
+        await _consume_drive_sync_intent(job_id)
+        async with async_sessionmaker() as inspection_session:
+            persisted_job = await inspection_session.get(JobIntent, job_id)
+            assert persisted_job is not None
+            assert persisted_job.state is JobState.FAILED
+            assert persisted_job.error_class is ErrorClass.NON_RETRYABLE
+            assert (
+                persisted_job.last_error_code
+                == "DRIVE_ROOT_UNAVAILABLE_NOT_FOUND_OR_NO_ACCESS"
+            )
+    finally:
+        async with async_sessionmaker() as cleanup_session:
+            organization = await cleanup_session.get(Organization, organization_id)
+            if organization is not None:
+                await cleanup_session.delete(organization)
+                await cleanup_session.commit()
         await engine.dispose()
 
 

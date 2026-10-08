@@ -1,9 +1,12 @@
 import asyncio
+import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, Protocol, cast
 
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-untyped]
 
@@ -19,6 +22,82 @@ class DriveFile:
     parent_ids: tuple[str, ...]
     web_view_link: str | None
     removed: bool
+    trashed: bool = False
+
+
+class DriveUnavailableReason(StrEnum):
+    NOT_FOUND_OR_NO_ACCESS = "NOT_FOUND_OR_NO_ACCESS"
+    ACCESS_DENIED = "ACCESS_DENIED"
+
+
+class DriveFileUnavailable(Exception):
+    def __init__(self, file_id: str, reason: DriveUnavailableReason) -> None:
+        super().__init__(f"Drive file {file_id} is unavailable: {reason.value}")
+        self.file_id = file_id
+        self.reason = reason
+
+
+def _google_error_status(error: Exception) -> int | None:
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response_status = getattr(getattr(error, "resp", None), "status", None)
+    return response_status if isinstance(response_status, int) else None
+
+
+def _google_error_reasons(error: Exception) -> set[str]:
+    reasons: set[str] = set()
+    details = getattr(error, "error_details", None)
+    if isinstance(details, list):
+        reasons.update(
+            str(detail["reason"])
+            for detail in details
+            if isinstance(detail, Mapping) and isinstance(detail.get("reason"), str)
+        )
+    content = getattr(error, "content", None)
+    if isinstance(content, bytes):
+        try:
+            payload = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, Mapping):
+            body = payload.get("error")
+            if isinstance(body, Mapping):
+                raw_errors = body.get("errors")
+                if isinstance(raw_errors, list):
+                    reasons.update(
+                        str(detail["reason"])
+                        for detail in raw_errors
+                        if isinstance(detail, Mapping)
+                        and isinstance(detail.get("reason"), str)
+                    )
+    return reasons
+
+
+def drive_file_unavailability_reason(
+    error: Exception,
+) -> DriveUnavailableReason | None:
+    status = _google_error_status(error)
+    reasons = _google_error_reasons(error)
+    if status == 404 or reasons.intersection({"fileNotFound", "notFound"}):
+        return DriveUnavailableReason.NOT_FOUND_OR_NO_ACCESS
+    if status == 403 and "insufficientFilePermissions" in reasons:
+        return DriveUnavailableReason.ACCESS_DENIED
+    return None
+
+
+def is_drive_authorization_error(error: Exception) -> bool:
+    if isinstance(error, RefreshError):
+        return any(
+            (isinstance(argument, str) and "invalid_grant" in argument.casefold())
+            or (isinstance(argument, Mapping) and argument.get("error") == "invalid_grant")
+            for argument in error.args
+        )
+    if error.__class__.__name__ == "InvalidGrantError":
+        return True
+    return _google_error_status(error) == 401 or bool(
+        _google_error_reasons(error).intersection({"authError", "invalidCredentials"})
+    )
 
 
 class DriveReadClient(Protocol):
@@ -110,31 +189,53 @@ class GoogleDriveReadClient:
     async def list_changes(self, sync_cursor: str | None) -> tuple[list[DriveFile], str | None]:
         if sync_cursor is None:
             raise ValueError("Google Drive change listing requires a persisted sync cursor")
-        response = await asyncio.to_thread(
-            lambda: self._drive_api.changes()
-            .list(
-                pageToken=sync_cursor,
-                fields=(
-                    "nextPageToken,newStartPageToken,"
-                    f"changes(fileId,removed,file({self._FILE_FIELDS}))"
-                ),
+        page_token = sync_cursor
+        seen_page_tokens: set[str] = set()
+        latest_by_file_id: dict[str, DriveFile] = {}
+        while True:
+            if page_token in seen_page_tokens:
+                raise RuntimeError("Google Drive change pagination repeated a page token")
+            seen_page_tokens.add(page_token)
+            response = await asyncio.to_thread(
+                lambda: self._drive_api.changes()
+                .list(
+                    pageToken=page_token,
+                    fields=(
+                        "nextPageToken,newStartPageToken,"
+                        f"changes(fileId,removed,file({self._FILE_FIELDS}))"
+                    ),
+                )
+                .execute()
             )
-            .execute()
-        )
-        files = [
-            self._drive_change_to_file(change)
-            for change in response.get("changes", [])
-            if isinstance(change, Mapping)
-        ]
-        next_cursor = response.get("newStartPageToken") or response.get("nextPageToken")
-        return files, next_cursor if isinstance(next_cursor, str) else None
+            for change in response.get("changes", []):
+                if isinstance(change, Mapping):
+                    file = self._drive_change_to_file(change)
+                    # The last change in the fully consumed batch is the only
+                    # state safe to assess destructively.
+                    latest_by_file_id[file.id] = file
+            next_page_token = response.get("nextPageToken")
+            if isinstance(next_page_token, str) and next_page_token:
+                page_token = next_page_token
+                continue
+            next_cursor = response.get("newStartPageToken")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise RuntimeError(
+                    "Google Drive change listing omitted its final start-page token"
+                )
+            return list(latest_by_file_id.values()), next_cursor
 
     async def get(self, file_id: str) -> DriveFile | None:
-        response = await asyncio.to_thread(
-            lambda: self._drive_api.files()
-            .get(fileId=file_id, fields=self._FILE_FIELDS)
-            .execute()
-        )
+        try:
+            response = await asyncio.to_thread(
+                lambda: self._drive_api.files()
+                .get(fileId=file_id, fields=self._FILE_FIELDS)
+                .execute()
+            )
+        except Exception as error:
+            reason = drive_file_unavailability_reason(error)
+            if reason is not None:
+                raise DriveFileUnavailable(file_id, reason) from error
+            raise
         return self._drive_file_from_payload(response)
 
     async def download(self, file_id: str) -> bytes:
@@ -208,7 +309,8 @@ class GoogleDriveReadClient:
             modified_time=modified_time,
             parent_ids=tuple(parent for parent in parents if isinstance(parent, str)),
             web_view_link=raw_web_view_link if isinstance(raw_web_view_link, str) else None,
-            removed=removed or payload.get("trashed") is True,
+            removed=removed,
+            trashed=payload.get("trashed") is True,
         )
 
     @staticmethod

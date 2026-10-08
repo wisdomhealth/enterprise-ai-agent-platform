@@ -13,7 +13,14 @@ from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSta
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffUser, UserRole, UserStatus
-from app.modules.knowledge.drive_gateway import DriveConnection, DriveFile, DriveGateway
+from app.modules.knowledge.drive_gateway import (
+    DriveConnection,
+    DriveFile,
+    DriveFileUnavailable,
+    DriveGateway,
+    DriveUnavailableReason,
+)
+from app.modules.knowledge.models import DriveSourceStatus
 from app.modules.knowledge.service import KnowledgeSourceService
 
 
@@ -24,6 +31,17 @@ class FakeDriveGateway(DriveGateway):
 
     async def resolve_descendant_folder_ids(self, root_folder_id: str) -> set[str]:
         return {f"{root_folder_id}-child"}
+
+    async def get(self, file_id: str) -> DriveFile | None:
+        return DriveFile(
+            id=file_id,
+            name="Authorized root",
+            mime_type="application/vnd.google-apps.folder",
+            modified_time=None,
+            parent_ids=(),
+            web_view_link=None,
+            removed=False,
+        )
 
     async def download(self, file_id: str) -> bytes:
         self.download_calls.append(file_id)
@@ -109,6 +127,7 @@ async def test_admin_configuration_uses_connector_identity_and_writes_safe_audit
     organization = Organization(name="Knowledge source owner")
     db_session.add(organization)
     await db_session.flush()
+    organization_id = organization.id
     principal = await _principal_for(
         db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
     )
@@ -117,6 +136,7 @@ async def test_admin_configuration_uses_connector_identity_and_writes_safe_audit
     factory = FakeDriveGatewayFactory(gateway)
     service = KnowledgeSourceService(connector_service, factory)
     await _configuration_grant(db_session, principal, service)
+    await db_session.commit()
 
     source = await service.configure_drive_source(
         db_session,
@@ -130,13 +150,13 @@ async def test_admin_configuration_uses_connector_identity_and_writes_safe_audit
             AuditEvent.action == "knowledge.drive_source.configure",
         )
     )
-    assert source.organization_id == organization.id
+    assert source.organization_id == organization_id
     assert source.root_folder_id == "approved-root"
     assert source.allowed_descendant_ids == ["approved-root-child"]
     assert source.connection_identity == "knowledge-reader@example.test"
     assert factory.refresh_tokens == ["test-only-refresh-token"]
     assert audit_event is not None
-    assert audit_event.organization_id == organization.id
+    assert audit_event.organization_id == organization_id
     assert audit_event.actor_id == principal.subject_id
     assert audit_event.details["connector_id"]
     assert audit_event.details["root_folder_ref"]
@@ -156,6 +176,7 @@ async def test_reconfiguration_audit_reconstructs_actual_old_and_new_safe_refere
     organization = Organization(name="Knowledge source audit update")
     db_session.add(organization)
     await db_session.flush()
+    organization_id = organization.id
     principal = await _principal_for(
         db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
     )
@@ -163,11 +184,13 @@ async def test_reconfiguration_audit_reconstructs_actual_old_and_new_safe_refere
     factory = FakeDriveGatewayFactory(FakeDriveGateway())
     service = KnowledgeSourceService(connector_service, factory)
     await _configuration_grant(db_session, principal, service)
+    await db_session.commit()
     source = await service.configure_drive_source(
         db_session,
         principal=principal,
         root_folder_id="approved-root",
     )
+    await db_session.commit()
     factory.connection_identity = "rotated-reader@example.test"
     await service.configure_drive_source(
         db_session,
@@ -194,7 +217,7 @@ async def test_reconfiguration_audit_reconstructs_actual_old_and_new_safe_refere
     )
     changed = second.details["changed_fields"]
 
-    assert second.organization_id == organization.id
+    assert second.organization_id == organization_id
     assert second.actor_id == principal.subject_id
     assert second.object_id == source.id
     assert changed["root_folder_ref"] == {
@@ -234,6 +257,7 @@ async def test_member_cannot_configure_drive_root_even_with_knowledge_write_gran
     connector_service = await _drive_connector_service(db_session, organization, tmp_path)
     service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(FakeDriveGateway()))
     await _configuration_grant(db_session, principal, service)
+    await db_session.commit()
 
     with pytest.raises(HTTPException) as error:
         await service.configure_drive_source(
@@ -257,11 +281,13 @@ async def test_out_of_scope_file_never_reaches_drive_download(db_session, tmp_pa
     gateway = FakeDriveGateway()
     service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(gateway))
     await _configuration_grant(db_session, principal, service)
+    await db_session.commit()
     source = await service.configure_drive_source(
         db_session,
         principal=principal,
         root_folder_id="approved-root",
     )
+    await db_session.commit()
     foreign_file = DriveFile(
         id="outside-file",
         name="private.docx",
@@ -291,11 +317,13 @@ async def test_active_source_downloads_only_after_scope_authorization(db_session
     gateway = FakeDriveGateway()
     service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(gateway))
     await _configuration_grant(db_session, principal, service)
+    await db_session.commit()
     source = await service.configure_drive_source(
         db_session,
         principal=principal,
         root_folder_id="approved-root",
     )
+    await db_session.commit()
     authorized_file = DriveFile(
         id="inside-file",
         name="shared.docx",
@@ -310,3 +338,89 @@ async def test_active_source_downloads_only_after_scope_authorization(db_session
 
     assert content == b"authorized content"
     assert gateway.download_calls == ["inside-file"]
+
+
+@pytest.mark.asyncio
+async def test_configuration_validates_root_without_holding_a_database_transaction(
+    db_session, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    organization = Organization(name="Transaction-free Drive configuration")
+    db_session.add(organization)
+    await db_session.flush()
+    principal = await _principal_for(
+        db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
+    )
+    connector_service = await _drive_connector_service(db_session, organization, tmp_path)
+    root_checked = False
+
+    class TransactionCheckingGateway(FakeDriveGateway):
+        async def get(self, file_id: str) -> DriveFile | None:
+            nonlocal root_checked
+            root_checked = True
+            assert not db_session.in_transaction()
+            return await super().get(file_id)
+
+    gateway = TransactionCheckingGateway()
+    service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(gateway))
+    await _configuration_grant(db_session, principal, service)
+    await db_session.commit()
+
+    source = await service.configure_drive_source(
+        db_session,
+        principal=principal,
+        root_folder_id="approved-root",
+        include_descendants=False,
+    )
+
+    assert source.status.value == "ACTIVE"
+    assert source.allowed_descendant_ids == []
+    assert root_checked is True
+
+
+@pytest.mark.asyncio
+async def test_unavailable_root_does_not_reactivate_or_replace_existing_scope(
+    db_session, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    organization = Organization(name="Unavailable Drive root")
+    db_session.add(organization)
+    await db_session.flush()
+    principal = await _principal_for(
+        db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
+    )
+    connector_service = await _drive_connector_service(db_session, organization, tmp_path)
+    gateway = FakeDriveGateway()
+    service = KnowledgeSourceService(connector_service, FakeDriveGatewayFactory(gateway))
+    await _configuration_grant(db_session, principal, service)
+    await db_session.commit()
+    source = await service.configure_drive_source(
+        db_session,
+        principal=principal,
+        root_folder_id="saved-root",
+        include_descendants=True,
+    )
+    await db_session.commit()
+    source.status = DriveSourceStatus.DISABLED
+    await db_session.commit()
+    source_id = source.id
+
+    async def unavailable(_file_id: str) -> DriveFile | None:
+        raise DriveFileUnavailable(
+            "lost-root", DriveUnavailableReason.NOT_FOUND_OR_NO_ACCESS
+        )
+
+    gateway.get = unavailable  # type: ignore[method-assign]
+    with pytest.raises(HTTPException) as error:
+        await service.configure_drive_source(
+            db_session,
+            principal=principal,
+            root_folder_id="lost-root",
+            include_descendants=False,
+        )
+
+    await db_session.rollback()
+    persisted = await db_session.get(type(source), source_id)
+    assert error.value.status_code == 409
+    assert persisted is not None
+    assert persisted.status.value == "DISABLED"
+    assert persisted.root_folder_id == "saved-root"
+    assert persisted.include_descendants is True

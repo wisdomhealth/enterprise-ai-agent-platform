@@ -75,7 +75,7 @@ class ConnectorService:
         secret = await db_session.get(ConnectorSecret, connector.secret_id)
         if secret is None or secret.organization_id != connector.organization_id:
             raise LookupError("connector secret is unavailable")
-        return await self._cipher.decrypt(
+        return await self.decrypt_refresh_token(
             EncryptedSecret(
                 ciphertext=secret.ciphertext,
                 encrypted_data_key=secret.encrypted_data_key,
@@ -84,6 +84,10 @@ class ConnectorService:
                 key_version=secret.key_version,
             )
         )
+
+    async def decrypt_refresh_token(self, secret: EncryptedSecret) -> str:
+        """Decrypt an already-read secret without opening a database transaction."""
+        return await self._cipher.decrypt(secret)
 
     async def create_or_reauthorize(
         self,

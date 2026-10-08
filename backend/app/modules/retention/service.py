@@ -16,6 +16,7 @@ from app.modules.chat.models import ChatMessage, ChatSession
 from app.modules.email.models import EmailDraftVersion, EmailWorkItem
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import UserRole
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobService
 from app.modules.knowledge.models import Document
 from app.modules.outbox.models import OutboxEvent
@@ -460,18 +461,67 @@ class ErasureService:
             await self._retention._redact_email_items(email_ids)
             counts["email_items"] = len(email_ids)
         if document_ids:
-            await self._db_session.execute(
-                update(Document)
-                .where(Document.id.in_(document_ids))
-                .values(current_version_id=None)
+            owned_document_ids = list(
+                (
+                    await self._db_session.scalars(
+                        select(Document.id).where(
+                            Document.id.in_(document_ids),
+                            Document.organization_id == request.organization_id,
+                        )
+                    )
+                ).all()
             )
+            parse_jobs = list(
+                (
+                    await self._db_session.scalars(
+                        select(JobIntent)
+                        .where(
+                            JobIntent.kind == "knowledge.document.parse",
+                            JobIntent.payload["document_id"].as_string().in_(
+                                [str(value) for value in owned_document_ids]
+                            ),
+                        )
+                        .order_by(JobIntent.id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for job in parse_jobs:
+                if job.state in (
+                    JobState.PENDING,
+                    JobState.RUNNING,
+                    JobState.RECONCILIATION,
+                ):
+                    job.state = JobState.FAILED
+                    job.lease_owner = None
+                    job.lease_expires_at = None
+                    job.next_attempt_at = None
+                    job.last_error_code = "DOCUMENT_ERASED"
+                    job.error_class = ErrorClass.NON_RETRYABLE
+                    job.version += 1
+                    job.updated_at = func.clock_timestamp()
+            documents = list(
+                (
+                    await self._db_session.scalars(
+                        select(Document)
+                        .where(
+                            Document.id.in_(owned_document_ids),
+                            Document.organization_id == request.organization_id,
+                        )
+                        .order_by(Document.id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for document in documents:
+                document.current_version_id = None
             await self._db_session.flush()
             deleted_document_ids = list(
                 (
                     await self._db_session.scalars(
                         delete(Document)
                         .where(
-                            Document.id.in_(document_ids),
+                            Document.id.in_(owned_document_ids),
                             Document.organization_id == request.organization_id,
                         )
                         .returning(Document.id)
