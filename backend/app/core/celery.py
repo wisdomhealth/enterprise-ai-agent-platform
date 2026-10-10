@@ -22,10 +22,10 @@ def create_celery(settings: Settings | None = None) -> Celery:
         worker_concurrency=settings.celery_worker_concurrency,
         broker_connection_retry_on_startup=True,
         beat_schedule={
-            "knowledge-drive-source-sync": {
-                "task": "app.modules.knowledge.tasks.drive_source_sync",
-                "schedule": 15 * 60,
-            },
+            # "knowledge-drive-source-sync": {
+            #     "task": "app.modules.knowledge.tasks.drive_source_sync",
+            #     "schedule": 15 * 60,
+            # },
             "knowledge-drive-sync-outbox-dispatch": {
                 "task": "app.modules.knowledge.tasks.dispatch_pending_drive_sync_outbox_events",
                 "schedule": 60,

@@ -6,10 +6,11 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.modules.audit.service import AuditService
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService
 from app.modules.knowledge.chunking import Chunk, DeterministicChunker
@@ -24,6 +25,7 @@ from app.modules.knowledge.models import (
 )
 from app.modules.knowledge.parsers import DocumentParseError, DocumentParser, PdfParser, WordParser
 from app.modules.knowledge.service import KnowledgeSourceService
+from app.modules.knowledge.sync import knowledge_worker_actor_id
 
 if TYPE_CHECKING:
     from app.modules.rag.types import EmbeddingProvider
@@ -34,6 +36,12 @@ class _PreparedVersion:
     id: UUID
     content_sha256: str
     chunks: tuple[Chunk, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _JobLeaseSnapshot:
+    id: UUID
+    version: int
 
 
 class DocumentIngestionService:
@@ -47,6 +55,7 @@ class DocumentIngestionService:
         job_lease_seconds: int = 300,
         job_lease_service: JobLeaseService | None = None,
         embedding_provider: "EmbeddingProvider | None" = None,
+        audit_service: AuditService | None = None,
     ) -> None:
         self._db_session = db_session
         if chunker is None:
@@ -61,6 +70,7 @@ class DocumentIngestionService:
         self._job_lease_seconds = job_lease_seconds
         self._job_lease_service = job_lease_service
         self._embedding_provider = embedding_provider
+        self._audit_service = audit_service or AuditService()
 
     async def parse(self, job_id: UUID) -> DocumentVersion:
         """Parse one durable job through the existing authorized Drive download boundary."""
@@ -88,7 +98,11 @@ class DocumentIngestionService:
         try:
             version = await self._version_from_job(job)
             if version is not None and version.state is DocumentVersionState.RETRIEVABLE:
-                await lease_service.complete(job.id, self._worker_id)
+                await lease_service.complete(
+                    job.id,
+                    self._worker_id,
+                    expected_version=claimed_job_version,
+                )
                 await self._db_session.commit()
                 return version
             if version is not None and version.state is not DocumentVersionState.PROCESSING:
@@ -101,6 +115,7 @@ class DocumentIngestionService:
                 source = await self._db_session.get(DriveSource, document.source_id)
                 if source is None or source.organization_id != document.organization_id:
                     raise DocumentParseError("DOCUMENT_SOURCE_NOT_FOUND")
+                source_id = source.id
                 drive_file = self._drive_file_from_payload(job.payload)
                 if drive_file.id != document.external_id:
                     raise DocumentParseError("DOCUMENT_FILE_MISMATCH")
@@ -116,7 +131,7 @@ class DocumentIngestionService:
                     claimed_job_id, claimed_job_version
                 )
                 await self._db_session.rollback()
-                prepared = self._prepare_version(content, drive_file.mime_type)
+                content_hash = sha256(content).hexdigest()
                 checkpoint_job = await self._db_session.get(
                     JobIntent, claimed_job_id, populate_existing=True
                 )
@@ -125,8 +140,55 @@ class DocumentIngestionService:
                 document = await self._lock_parse_checkpoint(
                     checkpoint_job,
                     document_id,
+                    source_id=source_id,
                     drive_file=drive_file,
                 )
+                matching, locked_versions = await self._lock_versions_and_find_match(
+                    document.id, content_hash
+                )
+                if matching is not None:
+                    version = await self._reuse_or_reject_matching_version(
+                        lease_service,
+                        checkpoint_job,
+                        document,
+                        matching,
+                        locked_versions,
+                        expected_job_version=claimed_job_version,
+                    )
+                    await self._db_session.commit()
+                    return version
+                await self._db_session.rollback()
+
+                prepared = self._prepare_version(
+                    content,
+                    drive_file.mime_type,
+                    content_sha256=content_hash,
+                )
+                checkpoint_job = await self._db_session.get(
+                    JobIntent, claimed_job_id, populate_existing=True
+                )
+                if checkpoint_job is None:
+                    raise JobLeaseLost(claimed_job_id)
+                document = await self._lock_parse_checkpoint(
+                    checkpoint_job,
+                    document_id,
+                    source_id=source_id,
+                    drive_file=drive_file,
+                )
+                matching, locked_versions = await self._lock_versions_and_find_match(
+                    document.id, prepared.content_sha256
+                )
+                if matching is not None:
+                    version = await self._reuse_or_reject_matching_version(
+                        lease_service,
+                        checkpoint_job,
+                        document,
+                        matching,
+                        locked_versions,
+                        expected_job_version=claimed_job_version,
+                    )
+                    await self._db_session.commit()
+                    return version
                 version = await self._persist_prepared_version(document, prepared)
                 await self._commit_processing_checkpoint(checkpoint_job, version)
                 job = await self._db_session.get(
@@ -135,7 +197,11 @@ class DocumentIngestionService:
                 if job is None:
                     raise JobLeaseLost(claimed_job_id)
             version = await self._publish_processing_version(job, version)
-            await lease_service.complete(job.id, self._worker_id)
+            await lease_service.complete(
+                job.id,
+                self._worker_id,
+                expected_version=claimed_job_version,
+            )
             await self._db_session.commit()
             return version
         except JobLeaseLost:
@@ -194,12 +260,42 @@ class DocumentIngestionService:
         from app.modules.rag.embeddings import EmbeddingPublicationService, OpenAIEmbeddingProvider
 
         provider = self._embedding_provider or OpenAIEmbeddingProvider.from_settings(Settings())
+        version_id = version.id
+        document_id = version.document_id
+        job_snapshot = _JobLeaseSnapshot(id=job.id, version=job.version)
+        source_id = await self._db_session.scalar(
+            select(Document.source_id).where(Document.id == document_id)
+        )
+        if source_id is None:
+            raise DocumentParseError("DOCUMENT_NOT_FOUND")
+        drive_file = self._drive_file_from_payload(job.payload)
+        await self._db_session.rollback()
+
+        async def lock_before_publish() -> None:
+            await self._lock_parse_checkpoint(
+                job_snapshot,
+                document_id,
+                source_id=source_id,
+                drive_file=drive_file,
+            )
+
         return await EmbeddingPublicationService(self._db_session, provider).publish(
-            version.id,
-            before_publish=lambda: self._assert_active_lease(job),
+            version_id,
+            before_publish=lock_before_publish,
+            transition=lambda document, target, versions, chunks: (
+                self._transition_current_version(
+                    job_snapshot,
+                    document,
+                    target,
+                    versions,
+                    chunks,
+                )
+            ),
         )
 
-    async def _assert_active_lease(self, job: JobIntent) -> None:
+    async def _assert_active_lease(
+        self, job: JobIntent | _JobLeaseSnapshot
+    ) -> None:
         lease_owner = await self._db_session.scalar(
             select(JobIntent.id)
             .where(
@@ -233,24 +329,49 @@ class DocumentIngestionService:
 
     async def _lock_parse_checkpoint(
         self,
-        job: JobIntent,
+        job: JobIntent | _JobLeaseSnapshot,
         document_id: UUID,
         *,
+        source_id: UUID,
         drive_file: DriveFile | None = None,
     ) -> Document:
-        await self._assert_active_lease(job)
+        source = await self._db_session.scalar(
+            select(DriveSource).where(DriveSource.id == source_id).with_for_update()
+        )
+        if source is None or source.status is not DriveSourceStatus.ACTIVE:
+            raise DocumentParseError("DOCUMENT_REVOKED")
+        parse_jobs = list(
+            (
+                await self._db_session.scalars(
+                    select(JobIntent)
+                    .where(
+                        JobIntent.kind == "knowledge.document.parse",
+                        JobIntent.payload["document_id"].as_string()
+                        == str(document_id),
+                    )
+                    .order_by(JobIntent.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        locked_job = next((item for item in parse_jobs if item.id == job.id), None)
+        if locked_job is None:
+            raise JobLeaseLost(job.id)
+        await self._assert_active_lease(locked_job)
         document = await self._db_session.scalar(
             select(Document)
-            .where(Document.id == document_id)
+            .where(
+                Document.id == document_id,
+                Document.organization_id == source.organization_id,
+                Document.knowledge_base_id == source.knowledge_base_id,
+                Document.source_id == source.id,
+            )
             .with_for_update()
         )
         if document is None:
             raise DocumentParseError("DOCUMENT_NOT_FOUND")
-        source = await self._db_session.get(DriveSource, document.source_id)
         if (
-            source is None
-            or source.organization_id != document.organization_id
-            or source.status is not DriveSourceStatus.ACTIVE
+            source.organization_id != document.organization_id
             or (
                 drive_file is not None
                 and not KnowledgeSourceService.is_file_authorized(source, drive_file)
@@ -264,6 +385,8 @@ class DocumentIngestionService:
         content: bytes,
         mime_type: str,
         parser: DocumentParser | None = None,
+        *,
+        content_sha256: str | None = None,
     ) -> _PreparedVersion:
         version_id = uuid4()
         selected_parser = parser or self._parser_for(mime_type)
@@ -279,8 +402,147 @@ class DocumentIngestionService:
             raise DocumentParseError() from exc
         return _PreparedVersion(
             id=version_id,
-            content_sha256=sha256(content).hexdigest(),
+            content_sha256=content_sha256 or sha256(content).hexdigest(),
             chunks=tuple(chunks),
+        )
+
+    async def _lock_versions_and_find_match(
+        self, document_id: UUID, content_sha256: str
+    ) -> tuple[DocumentVersion | None, list[DocumentVersion]]:
+        versions = list(
+            (
+                await self._db_session.scalars(
+                    select(DocumentVersion)
+                    .where(DocumentVersion.document_id == document_id)
+                    .order_by(DocumentVersion.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        return (
+            next(
+                (
+                    version
+                    for version in versions
+                    if version.content_sha256 == content_sha256
+                ),
+                None,
+            ),
+            versions,
+        )
+
+    async def _reuse_or_reject_matching_version(
+        self,
+        lease_service: JobLeaseService,
+        job: JobIntent,
+        document: Document,
+        version: DocumentVersion,
+        locked_versions: list[DocumentVersion],
+        *,
+        expected_job_version: int,
+    ) -> DocumentVersion:
+        if version.state is not DocumentVersionState.RETRIEVABLE:
+            error_codes = {
+                DocumentVersionState.PROCESSING: "DOCUMENT_CONTENT_PROCESSING",
+                DocumentVersionState.FAILED: "DOCUMENT_CONTENT_FAILED",
+                DocumentVersionState.REVOKED: "DOCUMENT_CONTENT_REVOKED",
+                DocumentVersionState.DELETED: "DOCUMENT_CONTENT_DELETED",
+            }
+            raise DocumentParseError(error_codes[version.state])
+        relevant_version_ids = {version.id}
+        if document.current_version_id is not None:
+            relevant_version_ids.add(document.current_version_id)
+        locked_chunks = list(
+            (
+                await self._db_session.scalars(
+                    select(DocumentChunk)
+                    .where(DocumentChunk.document_version_id.in_(relevant_version_ids))
+                    .order_by(DocumentChunk.document_version_id, DocumentChunk.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        await self._transition_current_version(
+            job,
+            document,
+            version,
+            locked_versions,
+            locked_chunks,
+        )
+        job.payload = {**job.payload, "document_version_id": str(version.id)}
+        await self._db_session.flush()
+        await lease_service.complete(
+            job.id,
+            self._worker_id or "",
+            expected_version=expected_job_version,
+        )
+        return version
+
+    async def _transition_current_version(
+        self,
+        job: JobIntent | _JobLeaseSnapshot,
+        document: Document,
+        target: DocumentVersion,
+        locked_versions: list[DocumentVersion],
+        locked_chunks: list[DocumentChunk],
+    ) -> None:
+        if target.document_id != document.id:
+            raise DocumentParseError("INVALID_DOCUMENT_PARSE_JOB")
+        previous_version_id = document.current_version_id
+        if previous_version_id == target.id:
+            return
+        previous = next(
+            (
+                version
+                for version in locked_versions
+                if version.id == previous_version_id
+            ),
+            None,
+        )
+        if previous_version_id is not None and previous is None:
+            raise DocumentParseError("DOCUMENT_CURRENT_VERSION_INVALID")
+        if previous is not None and previous.state is not DocumentVersionState.RETRIEVABLE:
+            raise DocumentParseError("DOCUMENT_CURRENT_VERSION_INVALID")
+
+        document.current_version_id = target.id
+        if previous is None:
+            return
+        previous.state = DocumentVersionState.REVOKED
+        locked_old_chunk_ids = {
+            chunk.id
+            for chunk in locked_chunks
+            if chunk.document_version_id == previous.id
+        }
+        deleted_chunk_ids = list(
+            (
+                await self._db_session.scalars(
+                    delete(DocumentChunk)
+                    .where(DocumentChunk.document_version_id == previous.id)
+                    .returning(DocumentChunk.id)
+                )
+            ).all()
+        )
+        if set(deleted_chunk_ids) != locked_old_chunk_ids:
+            raise DocumentParseError("DOCUMENT_VERSION_CHUNKS_CHANGED")
+        details = {
+            "organization_id": str(document.organization_id),
+            "source_id": str(document.source_id),
+            "document_id": str(document.id),
+            "job_id": str(job.id),
+            "old_version_id": str(previous.id),
+            "new_version_id": str(target.id),
+            "deleted_chunk_count": len(deleted_chunk_ids),
+        }
+        await self._audit_service.record_actor(
+            self._db_session,
+            organization_id=document.organization_id,
+            actor_id=knowledge_worker_actor_id(document.organization_id),
+            action="knowledge.document.version.replaced",
+            object_type="document",
+            object_id=document.id,
+            outcome="SUCCESS",
+            details=details,
+            safe_detail_keys=tuple(details),
         )
 
     async def _persist_prepared_version(
