@@ -75,6 +75,11 @@ class EmbeddingPublicationService:
         version_id: UUID,
         *,
         before_publish: Callable[[], Awaitable[None]] | None = None,
+        transition: Callable[
+            [Document, DocumentVersion, list[DocumentVersion], list[DocumentChunk]],
+            Awaitable[None],
+        ]
+        | None = None,
     ) -> DocumentVersion:
         # Snapshot the texts without write locks. Embedding is external I/O and
         # must not keep version/chunk locks while waiting on the provider.
@@ -109,21 +114,25 @@ class EmbeddingPublicationService:
             raise ValueError("embedding provider returned an invalid vector batch")
         if before_publish is not None:
             await before_publish()
-        # Shared write order after the optional JobIntent lease fence:
-        # Document -> DocumentVersion -> DocumentChunk.
+        # Standalone callers use Document -> DocumentVersion -> DocumentChunk.
+        # Drive ingestion's callback first holds Source -> ordered JobIntent rows;
+        # it then locks this Document before the ordered versions and chunks below.
         document = await self._db_session.get(Document, document_id, with_for_update=True)
         if document is None:
             raise LookupError("document not found")
-        version = cast(
-            DocumentVersion | None,
-            await self._db_session.scalar(
-                select(DocumentVersion)
-                .where(
-                    DocumentVersion.id == version_id,
-                    DocumentVersion.document_id == document.id,
+        locked_versions = list(
+            (
+                await self._db_session.scalars(
+                    select(DocumentVersion)
+                    .where(DocumentVersion.document_id == document.id)
+                    .order_by(DocumentVersion.id)
+                    .with_for_update()
                 )
-                .with_for_update()
-            ),
+            ).all()
+        )
+        version = next(
+            (item for item in locked_versions if item.id == version_id),
+            None,
         )
         if version is None:
             raise LookupError("document version not found")
@@ -131,26 +140,40 @@ class EmbeddingPublicationService:
             return version
         if version.state is not DocumentVersionState.PROCESSING:
             raise ValueError("only processing document versions can be published")
+        relevant_version_ids = {version.id}
+        if document.current_version_id is not None:
+            relevant_version_ids.add(document.current_version_id)
         locked_chunks = list(
             (
                 await self._db_session.scalars(
                     select(DocumentChunk)
-                    .where(DocumentChunk.document_version_id == version.id)
-                    .order_by(DocumentChunk.ordinal, DocumentChunk.id)
+                    .where(DocumentChunk.document_version_id.in_(relevant_version_ids))
+                    .order_by(DocumentChunk.document_version_id, DocumentChunk.id)
                     .with_for_update()
                 )
             ).all()
         )
+        target_chunks = [
+            chunk for chunk in locked_chunks if chunk.document_version_id == version.id
+        ]
         if tuple(
-            (chunk.id, chunk.ordinal, chunk.text) for chunk in locked_chunks
+            (chunk.id, chunk.ordinal, chunk.text)
+            for chunk in sorted(target_chunks, key=lambda item: (item.ordinal, item.id))
         ) != chunk_snapshot:
             raise ValueError("document chunks changed during embedding")
-        for chunk, vector in zip(locked_chunks, vectors, strict=True):
+        for chunk, vector in zip(
+            sorted(target_chunks, key=lambda item: (item.ordinal, item.id)),
+            vectors,
+            strict=True,
+        ):
             chunk.embedding = vector
         # The embeddings, RETRIEVABLE state, and current-version switch are all
         # flushed together.  The caller owns the transaction commit boundary.
         version.state = DocumentVersionState.RETRIEVABLE
-        document.current_version_id = version.id
+        if transition is None:
+            document.current_version_id = version.id
+        else:
+            await transition(document, version, locked_versions, locked_chunks)
         await self._db_session.flush()
         return version
 

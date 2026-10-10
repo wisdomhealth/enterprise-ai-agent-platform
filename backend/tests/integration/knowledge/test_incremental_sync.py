@@ -59,12 +59,17 @@ async def _source(db_session, *, cursor: str | None = "cursor-1") -> DriveSource
     return source
 
 
-def _authorized_file(*, file_id: str = "file-1", name: str = "guide.pdf") -> DriveFile:
+def _authorized_file(
+    *,
+    file_id: str = "file-1",
+    name: str = "guide.pdf",
+    modified_time: datetime | None = None,
+) -> DriveFile:
     return DriveFile(
         id=file_id,
         name=name,
         mime_type="application/pdf",
-        modified_time=datetime(2026, 8, 22, tzinfo=UTC),
+        modified_time=modified_time or datetime(2026, 8, 22, tzinfo=UTC),
         parent_ids=("root",),
         web_view_link=None,
         removed=False,
@@ -166,6 +171,58 @@ async def test_same_filename_with_new_drive_id_enqueues_a_new_document(db_sessio
         select(func.count(JobIntent.id)).where(
             JobIntent.kind == "knowledge.document.parse",
             JobIntent.payload["source_id"].astext == str(source_id),
+        )
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_renamed_drive_file_updates_the_existing_document_title(db_session) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session)
+
+    await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [_authorized_file(file_id="stable-drive-id", name="old-name.pdf")],
+            "cursor-2",
+        ),
+    ).sync(source.id, "cursor-1")
+    original = await db_session.scalar(
+        select(Document).where(
+            Document.source_id == source.id,
+            Document.external_id == "stable-drive-id",
+        )
+    )
+    assert original is not None
+    original_id = original.id
+
+    await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [
+                _authorized_file(
+                    file_id="stable-drive-id",
+                    name="renamed-policy.pdf",
+                    modified_time=datetime(2026, 8, 23, tzinfo=UTC),
+                )
+            ],
+            "cursor-3",
+        ),
+    ).sync(source.id, "cursor-2")
+
+    documents = list(
+        (
+            await db_session.scalars(
+                select(Document).where(Document.source_id == source.id)
+            )
+        ).all()
+    )
+    assert [(document.id, document.external_id, document.title) for document in documents] == [
+        (original_id, "stable-drive-id", "renamed-policy.pdf")
+    ]
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["source_id"].astext == str(source.id),
         )
     ) == 2
 

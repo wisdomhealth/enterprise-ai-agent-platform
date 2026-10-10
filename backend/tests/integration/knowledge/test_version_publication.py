@@ -1,20 +1,24 @@
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import event, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import async_sessionmaker, engine
+from app.modules.audit.models import AuditEvent
+from app.modules.audit.service import AuditService
+from app.modules.chat.models import ChatActor, ChatMessage, ChatSession
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
 from app.modules.identity.models import Organization
-from app.modules.jobs.models import JobIntent, JobState
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
 from app.modules.knowledge.drive_gateway import DriveConnection, DriveGateway
 from app.modules.knowledge.ingestion import DocumentIngestionService
@@ -28,6 +32,7 @@ from app.modules.knowledge.models import (
 )
 from app.modules.knowledge.parsers import DocumentParseError, PdfParser
 from app.modules.knowledge.service import KnowledgeSourceService
+from app.modules.outbox.models import OutboxEvent
 
 FIXTURE_DIRECTORY = Path("tests/fixtures/documents")
 
@@ -72,11 +77,17 @@ class LeaseLostOnceService(JobLeaseService):
         super().__init__(db_session)
         self._lose_next_completion = True
 
-    async def complete(self, job_id, worker_id):  # type: ignore[no-untyped-def]
+    async def complete(  # type: ignore[no-untyped-def]
+        self, job_id, worker_id, *, expected_version=None
+    ):
         if self._lose_next_completion:
             self._lose_next_completion = False
             raise JobLeaseLost(job_id)
-        return await super().complete(job_id, worker_id)
+        return await super().complete(
+            job_id,
+            worker_id,
+            expected_version=expected_version,
+        )
 
 
 class CommitClaimLeaseService(JobLeaseService):
@@ -147,7 +158,24 @@ class CountingPdfParser:
 
 
 class ValidEmbeddingProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        return [[1.0] * 1536 for _ in texts]
+
+
+class BlockingEmbeddingProvider(ValidEmbeddingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding_started = asyncio.Event()
+        self.release_embedding = asyncio.Event()
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        self.embedding_started.set()
+        await self.release_embedding.wait()
         return [[1.0] * 1536 for _ in texts]
 
 
@@ -356,6 +384,261 @@ async def test_parse_job_embeds_authorized_file_and_publishes_complete_version(
 
 
 @pytest.mark.asyncio
+async def test_parse_job_reuses_matching_retrievable_version_without_parsing_or_embedding(
+    db_session, tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    document = await _document(db_session, current_is_retrievable=False)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    existing = DocumentVersion(
+        document_id=document.id,
+        state=DocumentVersionState.RETRIEVABLE,
+        content_sha256=sha256(content).hexdigest(),
+    )
+    db_session.add(existing)
+    await db_session.flush()
+    existing_chunk = DocumentChunk(
+        id=uuid4(),
+        document_version_id=existing.id,
+        ordinal=0,
+        text="existing evidence",
+        page_number=1,
+        section=None,
+        token_count=2,
+        metadata_={},
+        embedding=[1.0] * 1536,
+    )
+    db_session.add(existing_chunk)
+    document.current_version_id = existing.id
+    await db_session.flush()
+    parser = CountingPdfParser()
+    monkeypatch.setattr(
+        DocumentIngestionService,
+        "_parser_for",
+        staticmethod(lambda _mime_type: parser),
+    )
+    provider = ValidEmbeddingProvider()
+    service, gateway = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        content=content,
+        embedding_provider=provider,
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        f"document-parse-identical-reuse-{uuid4()}",
+        {
+            "source_id": str(source.id),
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(
+                parent_id="authorized-folder", name="renamed-policy.pdf"
+            ),
+        },
+    )
+    version_count = await db_session.scalar(
+        select(func.count(DocumentVersion.id)).where(
+            DocumentVersion.document_id == document.id
+        )
+    )
+    chunk_count = await db_session.scalar(
+        select(func.count(DocumentChunk.id)).where(
+            DocumentChunk.document_version_id == existing.id
+        )
+    )
+
+    reused = await service.parse(job.id)
+
+    await db_session.refresh(job)
+    await db_session.refresh(document)
+    assert reused.id == existing.id
+    assert document.current_version_id == existing.id
+    assert job.state is JobState.SUCCEEDED
+    assert job.payload["document_version_id"] == str(existing.id)
+    assert parser.calls == 0
+    assert provider.calls == 0
+    assert gateway.download_calls == ["drive-file-1"]
+    assert await db_session.scalar(
+        select(func.count(DocumentVersion.id)).where(
+            DocumentVersion.document_id == document.id
+        )
+    ) == version_count
+    assert await db_session.scalar(
+        select(func.count(DocumentChunk.id)).where(
+            DocumentChunk.document_version_id == existing.id
+        )
+    ) == chunk_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "error_code"),
+    [
+        (DocumentVersionState.PROCESSING, "DOCUMENT_CONTENT_PROCESSING"),
+        (DocumentVersionState.FAILED, "DOCUMENT_CONTENT_FAILED"),
+        (DocumentVersionState.REVOKED, "DOCUMENT_CONTENT_REVOKED"),
+        (DocumentVersionState.DELETED, "DOCUMENT_CONTENT_DELETED"),
+    ],
+)
+async def test_parse_job_rejects_non_reusable_matching_version_without_retry(
+    db_session, tmp_path, monkeypatch, state, error_code
+) -> None:  # type: ignore[no-untyped-def]
+    content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    document = await _document(db_session, current_is_retrievable=False)
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    existing = DocumentVersion(
+        document_id=document.id,
+        state=state,
+        content_sha256=sha256(content).hexdigest(),
+    )
+    db_session.add(existing)
+    await db_session.flush()
+    parser = CountingPdfParser()
+    monkeypatch.setattr(
+        DocumentIngestionService,
+        "_parser_for",
+        staticmethod(lambda _mime_type: parser),
+    )
+    provider = ValidEmbeddingProvider()
+    service, _ = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        content=content,
+        embedding_provider=provider,
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        f"document-parse-non-reusable-{state.value}-{uuid4()}",
+        {
+            "source_id": str(source.id),
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+
+    with pytest.raises(DocumentParseError) as error:
+        await service.parse(job.id)
+
+    await db_session.refresh(job)
+    assert error.value.code == error_code
+    assert job.state is JobState.FAILED
+    assert job.error_class is ErrorClass.NON_RETRYABLE
+    assert parser.calls == 0
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_content_creates_one_version_and_does_not_retry_forever(
+    tmp_path, independent_sessions
+) -> None:
+    content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    key_path = tmp_path / "connector-master-key"
+    async with async_sessionmaker() as setup_session:
+        document = await _document(setup_session, current_is_retrievable=False)
+        source = await setup_session.get(DriveSource, document.source_id)
+        assert source is not None
+        source.allowed_descendant_ids = ["authorized-folder"]
+        await _authorized_ingestion_service(
+            setup_session,
+            document,
+            tmp_path,
+            content=content,
+        )
+        first_job = await JobService().enqueue(
+            setup_session,
+            "knowledge.document.parse",
+            f"document-parse-concurrent-first-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        second_job = await JobService().enqueue(
+            setup_session,
+            "knowledge.document.parse",
+            f"document-parse-concurrent-second-{uuid4()}",
+            {
+                "document_id": str(document.id),
+                "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+            },
+        )
+        document_id = document.id
+        first_job_id = first_job.id
+        second_job_id = second_job.id
+        await setup_session.commit()
+
+    blocking_provider = BlockingEmbeddingProvider()
+    async with (
+        async_sessionmaker() as first_session,
+        async_sessionmaker() as second_session,
+    ):
+        connector_service = ConnectorService.for_file_key(
+            key_path, app_env="development"
+        )
+        first_service = DocumentIngestionService(
+            first_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(FakeDriveGateway(content)),
+            ),
+            worker_id="concurrent-identical-first",
+            embedding_provider=blocking_provider,
+        )
+        second_provider = ValidEmbeddingProvider()
+        second_service = DocumentIngestionService(
+            second_session,
+            knowledge_source_service=KnowledgeSourceService(
+                connector_service,
+                FakeDriveGatewayFactory(FakeDriveGateway(content)),
+            ),
+            worker_id="concurrent-identical-second",
+            embedding_provider=second_provider,
+        )
+
+        first_attempt = asyncio.create_task(first_service.parse(first_job_id))
+        await blocking_provider.embedding_started.wait()
+        try:
+            with pytest.raises(DocumentParseError) as error:
+                await second_service.parse(second_job_id)
+            assert error.value.code == "DOCUMENT_CONTENT_PROCESSING"
+        finally:
+            blocking_provider.release_embedding.set()
+        published = await first_attempt
+
+    async with async_sessionmaker() as inspection_session:
+        versions = list(
+            (
+                await inspection_session.scalars(
+                    select(DocumentVersion).where(
+                        DocumentVersion.document_id == document_id
+                    )
+                )
+            ).all()
+        )
+        persisted_document = await inspection_session.get(Document, document_id)
+        persisted_first_job = await inspection_session.get(JobIntent, first_job_id)
+        persisted_second_job = await inspection_session.get(JobIntent, second_job_id)
+        assert persisted_document is not None
+        assert persisted_first_job is not None
+        assert persisted_second_job is not None
+        assert [version.id for version in versions] == [published.id]
+        assert persisted_document.current_version_id == published.id
+        assert persisted_first_job.state is JobState.SUCCEEDED
+        assert persisted_second_job.state is JobState.FAILED
+        assert persisted_second_job.error_class is ErrorClass.NON_RETRYABLE
+        assert persisted_second_job.last_error_code == "DOCUMENT_CONTENT_PROCESSING"
+        assert blocking_provider.calls == 1
+        assert second_provider.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_drive_download_and_parsing_run_without_open_database_transaction(
     db_session, tmp_path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
@@ -462,6 +745,20 @@ async def test_parse_job_keeps_prior_current_version_when_embeddings_are_invalid
     document = await _document(db_session, current_is_retrievable=True)
     prior_version_id = document.current_version_id
     assert prior_version_id is not None
+    prior_chunk = DocumentChunk(
+        id=uuid4(),
+        document_version_id=prior_version_id,
+        ordinal=0,
+        text="prior evidence",
+        page_number=1,
+        section=None,
+        token_count=2,
+        metadata_={},
+        embedding=[1.0] * 1536,
+    )
+    db_session.add(prior_chunk)
+    await db_session.flush()
+    prior_chunk_id = prior_chunk.id
     source = await db_session.get(DriveSource, document.source_id)
     assert source is not None
     source.allowed_descendant_ids = ["authorized-folder"]
@@ -488,6 +785,7 @@ async def test_parse_job_keeps_prior_current_version_when_embeddings_are_invalid
     await db_session.refresh(job)
     version_id = job.payload["document_version_id"]
     assert document.current_version_id == prior_version_id
+    assert await db_session.get(DocumentChunk, prior_chunk_id) is not None
     assert job.state is JobState.PENDING
     assert isinstance(version_id, str)
     version = await db_session.get(DocumentVersion, UUID(version_id))
@@ -499,6 +797,244 @@ async def test_parse_job_keeps_prior_current_version_when_embeddings_are_invalid
         )
     ).all()
     assert all(chunk.embedding is None for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_changed_content_atomically_replaces_current_version_and_deletes_old_chunks(
+    db_session, tmp_path
+) -> None:
+    content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    document = await _document(db_session, current_is_retrievable=True)
+    document.title = "latest-drive-name.pdf"
+    previous_version_id = document.current_version_id
+    assert previous_version_id is not None
+    previous_chunk = DocumentChunk(
+        id=uuid4(),
+        document_version_id=previous_version_id,
+        ordinal=0,
+        text="superseded evidence",
+        page_number=1,
+        section=None,
+        token_count=2,
+        metadata_={},
+        embedding=[1.0] * 1536,
+    )
+    db_session.add(previous_chunk)
+    previous_chunk_id = previous_chunk.id
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    protected_document = Document(
+        organization_id=document.organization_id,
+        knowledge_base_id=document.knowledge_base_id,
+        source_id=document.source_id,
+        external_id="different-drive-file",
+        title="Unrelated document",
+        mime_type="application/pdf",
+    )
+    db_session.add(protected_document)
+    await db_session.flush()
+    protected_version = DocumentVersion(
+        document_id=protected_document.id,
+        state=DocumentVersionState.RETRIEVABLE,
+        content_sha256=sha256(content).hexdigest(),
+    )
+    db_session.add(protected_version)
+    await db_session.flush()
+    protected_document.current_version_id = protected_version.id
+    protected_chunk = DocumentChunk(
+        id=uuid4(),
+        document_version_id=protected_version.id,
+        ordinal=0,
+        text="unrelated evidence",
+        page_number=1,
+        section=None,
+        token_count=2,
+        metadata_={},
+        embedding=[1.0] * 1536,
+    )
+    chat_session = ChatSession(
+        organization_id=document.organization_id,
+        knowledge_base_id=document.knowledge_base_id,
+    )
+    db_session.add_all([protected_chunk, chat_session])
+    await db_session.flush()
+    chat_message = ChatMessage(
+        session_id=chat_session.id,
+        sequence=1,
+        actor=ChatActor.AI,
+        body="Historical answer",
+    )
+    historical_citation_event = OutboxEvent(
+        event_type="chat.message.validated",
+        aggregate_type="chat_session",
+        aggregate_id=chat_session.id,
+        payload={"staff_citations": [{"chunk_id": str(previous_chunk_id)}]},
+    )
+    db_session.add_all([chat_message, historical_citation_event])
+    await db_session.flush()
+    protected_chunk_id = protected_chunk.id
+    chat_message_id = chat_message.id
+    citation_event_id = historical_citation_event.event_id
+    foreign_document = await _document(db_session, current_is_retrievable=True)
+    foreign_version_id = foreign_document.current_version_id
+    assert foreign_version_id is not None
+    foreign_chunk = DocumentChunk(
+        id=uuid4(),
+        document_version_id=foreign_version_id,
+        ordinal=0,
+        text="another organization's evidence",
+        page_number=1,
+        section=None,
+        token_count=3,
+        metadata_={},
+        embedding=[1.0] * 1536,
+    )
+    db_session.add(foreign_chunk)
+    await db_session.flush()
+    foreign_chunk_id = foreign_chunk.id
+    provider = ValidEmbeddingProvider()
+    service, _ = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        content=content,
+        embedding_provider=provider,
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        f"document-parse-content-replacement-{uuid4()}",
+        {
+            "source_id": str(source.id),
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(
+                parent_id="authorized-folder", name="stale-job-name.pdf"
+            ),
+        },
+    )
+
+    replacement = await service.parse(job.id)
+
+    await db_session.refresh(document)
+    await db_session.refresh(job)
+    previous = await db_session.get(DocumentVersion, previous_version_id)
+    replacement_chunks = (
+        await db_session.scalars(
+            select(DocumentChunk).where(
+                DocumentChunk.document_version_id == replacement.id
+            )
+        )
+    ).all()
+    audit = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.organization_id == document.organization_id,
+            AuditEvent.action == "knowledge.document.version.replaced",
+            AuditEvent.object_id == document.id,
+        )
+    )
+    assert previous is not None
+    assert previous.state is DocumentVersionState.REVOKED
+    assert await db_session.get(DocumentChunk, previous_chunk_id) is None
+    assert await db_session.get(DocumentChunk, protected_chunk_id) is not None
+    assert await db_session.get(DocumentChunk, foreign_chunk_id) is not None
+    assert await db_session.get(ChatMessage, chat_message_id) is not None
+    persisted_citation = await db_session.get(OutboxEvent, citation_event_id)
+    assert persisted_citation is not None
+    assert persisted_citation.payload["staff_citations"] == [
+        {"chunk_id": str(previous_chunk_id)}
+    ]
+    assert replacement.state is DocumentVersionState.RETRIEVABLE
+    assert replacement_chunks
+    assert all(chunk.embedding is not None for chunk in replacement_chunks)
+    assert document.current_version_id == replacement.id
+    assert document.title == "latest-drive-name.pdf"
+    assert job.state is JobState.SUCCEEDED
+    assert provider.calls == 1
+    assert audit is not None
+    assert audit.details == {
+        "organization_id": str(document.organization_id),
+        "source_id": str(source.id),
+        "document_id": str(document.id),
+        "job_id": str(job.id),
+        "old_version_id": str(previous_version_id),
+        "new_version_id": str(replacement.id),
+        "deleted_chunk_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_replacement_audit_failure_rolls_back_publication_and_cleanup(
+    db_session, tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    content = (FIXTURE_DIRECTORY / "sample.pdf").read_bytes()
+    document = await _document(db_session, current_is_retrievable=True)
+    previous_version_id = document.current_version_id
+    assert previous_version_id is not None
+    previous_chunk = DocumentChunk(
+        id=uuid4(),
+        document_version_id=previous_version_id,
+        ordinal=0,
+        text="must survive rollback",
+        page_number=1,
+        section=None,
+        token_count=3,
+        metadata_={},
+        embedding=[1.0] * 1536,
+    )
+    db_session.add(previous_chunk)
+    previous_chunk_id = previous_chunk.id
+    source = await db_session.get(DriveSource, document.source_id)
+    assert source is not None
+    source.allowed_descendant_ids = ["authorized-folder"]
+    service, _ = await _authorized_ingestion_service(
+        db_session,
+        document,
+        tmp_path,
+        content=content,
+        embedding_provider=ValidEmbeddingProvider(),
+    )
+    job = await JobService().enqueue(
+        db_session,
+        "knowledge.document.parse",
+        f"document-parse-audit-rollback-{uuid4()}",
+        {
+            "source_id": str(source.id),
+            "document_id": str(document.id),
+            "drive_file": _drive_file_payload(parent_id="authorized-folder"),
+        },
+    )
+    original_record_actor = AuditService.record_actor
+
+    async def fail_replacement_audit(self, db_session, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs["action"] == "knowledge.document.version.replaced":
+            raise RuntimeError("injected replacement audit failure")
+        return await original_record_actor(self, db_session, **kwargs)
+
+    monkeypatch.setattr(AuditService, "record_actor", fail_replacement_audit)
+
+    with pytest.raises(RuntimeError, match="injected replacement audit failure"):
+        await service.parse(job.id)
+
+    await db_session.refresh(document)
+    await db_session.refresh(job)
+    previous = await db_session.get(DocumentVersion, previous_version_id)
+    checkpoint_version_id = job.payload.get("document_version_id")
+    assert isinstance(checkpoint_version_id, str)
+    checkpoint = await db_session.get(DocumentVersion, UUID(checkpoint_version_id))
+    assert previous is not None
+    assert previous.state is DocumentVersionState.RETRIEVABLE
+    assert document.current_version_id == previous_version_id
+    assert await db_session.get(DocumentChunk, previous_chunk_id) is not None
+    assert checkpoint is not None
+    assert checkpoint.state is DocumentVersionState.PROCESSING
+    assert job.state is JobState.PENDING
+    assert await db_session.scalar(
+        select(func.count(AuditEvent.id)).where(
+            AuditEvent.action == "knowledge.document.version.replaced",
+            AuditEvent.object_id == document.id,
+        )
+    ) == 0
 
 
 @pytest.mark.asyncio
@@ -948,7 +1484,7 @@ async def test_parse_job_recovers_after_completion_lease_loss_without_duplicate_
         )
     ).all()
     job.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    await db_session.flush()
+    await db_session.commit()
 
     recovered_version = await service.parse(job.id)
 
