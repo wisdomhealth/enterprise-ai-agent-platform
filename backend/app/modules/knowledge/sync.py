@@ -6,6 +6,7 @@ applied in one transaction with its cursor, cleanup, enqueue, and audit work.
 
 from dataclasses import dataclass
 from datetime import UTC
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -104,6 +105,7 @@ class _Assessment:
     next_cursor: str
     descendant_ids: tuple[str, ...]
     files_to_ingest: tuple[DriveFile, ...]
+    content_hashes: tuple[tuple[str, str], ...]
     revocations: tuple[tuple[UUID, str], ...]
     isolated_files: int
     root_unavailable_reason: str | None = None
@@ -407,10 +409,18 @@ class DriveSyncService:
         }
         for external_id in revoked_external_ids:
             ingest_by_id.pop(external_id, None)
+        download = getattr(gateway, "download", None)
+        content_hashes: dict[str, str] = {}
+        existing_external_ids = set(documents_by_external_id)
+        for external_id in sorted(set(ingest_by_id).intersection(existing_external_ids)):
+            if download is None:
+                raise RuntimeError("Drive content verification is unavailable")
+            content_hashes[external_id] = sha256(await download(external_id)).hexdigest()
         return _Assessment(
             next_cursor=next_cursor,
             descendant_ids=tuple(sorted(descendant_ids)),
             files_to_ingest=tuple(ingest_by_id[key] for key in sorted(ingest_by_id)),
+            content_hashes=tuple(sorted(content_hashes.items())),
             revocations=tuple(sorted(revocations.items(), key=lambda item: str(item[0]))),
             isolated_files=isolated,
         )
@@ -423,6 +433,7 @@ class DriveSyncService:
             next_cursor=next_cursor,
             descendant_ids=snapshot.allowed_descendant_ids,
             files_to_ingest=(),
+            content_hashes=(),
             revocations=tuple(
                 (document_id, "AUTHORIZED_ROOT_UNAVAILABLE")
                 for document_id, _ in snapshot.documents
@@ -440,6 +451,7 @@ class DriveSyncService:
     ) -> SyncResult:
         assert self._db_session is not None
         parse_event_ids: list[UUID] = []
+        enqueued_documents = 0
         revoked_count = 0
         async with self._db_session.begin():
             source = await self._db_session.scalar(
@@ -473,10 +485,6 @@ class DriveSyncService:
                 source.id, locked_document_ids, ingest_job_keys
             )
             affected_values = {str(value) for value in affected_ids}
-            ingest_keys_by_document_value = {
-                str(document_id): key
-                for document_id, key in ingest_keys_by_document.items()
-            }
             for job in parse_jobs:
                 if job.state not in (
                     JobState.PENDING,
@@ -489,10 +497,6 @@ class DriveSyncService:
                     continue
                 if raw_document_id in affected_values:
                     self._invalidate_parse_job(job, "DOCUMENT_REVOKED")
-                    continue
-                current_key = ingest_keys_by_document_value.get(raw_document_id)
-                if current_key is not None and job.idempotency_key != current_key:
-                    self._invalidate_parse_job(job, "DOCUMENT_SUPERSEDED")
             if affected_ids:
                 documents = await self._lock_cleanup_documents(source, affected_ids)
                 versions = await self._lock_cleanup_versions(affected_ids)
@@ -535,8 +539,29 @@ class DriveSyncService:
                             root_unavailable_reason=assessment.root_unavailable_reason,
                         )
 
+            content_hashes = dict(assessment.content_hashes)
             for drive_file in assessment.files_to_ingest:
-                document = await self._upsert_document(source, drive_file)
+                document, previous_title = await self._upsert_document(source, drive_file)
+                observed_hash = content_hashes.get(drive_file.id)
+                if observed_hash is not None and await self._skip_unchanged_content_parse(
+                    source,
+                    document,
+                    drive_file,
+                    observed_hash,
+                    parse_jobs,
+                    previous_title=previous_title,
+                    parent_sync_job_id=parent_sync_job_id,
+                ):
+                    continue
+                current_key = self._parse_job_key(source.id, drive_file)
+                for job in parse_jobs:
+                    if (
+                        job.state
+                        in (JobState.PENDING, JobState.RUNNING, JobState.RECONCILIATION)
+                        and job.payload.get("document_id") == str(document.id)
+                        and job.idempotency_key != current_key
+                    ):
+                        self._invalidate_parse_job(job, "DOCUMENT_SUPERSEDED")
                 parse_event_ids.append(
                     await self._enqueue_parse(
                         source,
@@ -545,6 +570,7 @@ class DriveSyncService:
                         parent_sync_job_id=parent_sync_job_id,
                     )
                 )
+                enqueued_documents += 1
 
             source.allowed_descendant_ids = list(assessment.descendant_ids)
             source.sync_cursor = assessment.next_cursor
@@ -572,7 +598,7 @@ class DriveSyncService:
         return SyncResult(
             source_id=snapshot.id,
             cursor=assessment.next_cursor,
-            enqueued_documents=len(assessment.files_to_ingest),
+            enqueued_documents=enqueued_documents,
             revoked_documents=revoked_count,
             isolated_files=assessment.isolated_files,
             parse_outbox_event_ids=tuple(parse_event_ids),
@@ -734,7 +760,9 @@ class DriveSyncService:
             and source.connection_identity == snapshot.connection_identity
         )
 
-    async def _upsert_document(self, source: DriveSource, drive_file: DriveFile) -> Document:
+    async def _upsert_document(
+        self, source: DriveSource, drive_file: DriveFile
+    ) -> tuple[Document, str | None]:
         assert self._db_session is not None
         document = await self._db_session.scalar(
             select(Document)
@@ -745,6 +773,7 @@ class DriveSyncService:
             )
             .with_for_update()
         )
+        previous_title = document.title if document is not None else None
         if document is None:
             document = Document(
                 organization_id=source.organization_id,
@@ -759,7 +788,99 @@ class DriveSyncService:
         else:
             document.title = drive_file.name
             document.mime_type = drive_file.mime_type
-        return document
+        return document, previous_title
+
+    async def _skip_unchanged_content_parse(
+        self,
+        source: DriveSource,
+        document: Document,
+        drive_file: DriveFile,
+        content_sha256: str,
+        parse_jobs: list[JobIntent],
+        *,
+        previous_title: str | None,
+        parent_sync_job_id: UUID | None,
+    ) -> bool:
+        assert self._db_session is not None
+        versions = list(
+            (
+                await self._db_session.scalars(
+                    select(DocumentVersion)
+                    .where(DocumentVersion.document_id == document.id)
+                    .order_by(DocumentVersion.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        matching = next(
+            (version for version in versions if version.content_sha256 == content_sha256),
+            None,
+        )
+        if matching is None:
+            return False
+
+        parse_job: JobIntent | None = None
+        outcome: str
+        decision: str
+        reason: str | None = None
+        if (
+            matching.state is DocumentVersionState.RETRIEVABLE
+            and document.current_version_id == matching.id
+        ):
+            outcome = "SUCCESS"
+            decision = "SKIPPED_CONTENT_UNCHANGED"
+        elif matching.state is DocumentVersionState.PROCESSING:
+            parse_job = next(
+                (
+                    job
+                    for job in parse_jobs
+                    if job.payload.get("document_id") == str(document.id)
+                    and job.payload.get("document_version_id") == str(matching.id)
+                    and job.state
+                    in (JobState.PENDING, JobState.RUNNING, JobState.RECONCILIATION)
+                ),
+                None,
+            )
+            if parse_job is None:
+                outcome = "ATTENTION_REQUIRED"
+                decision = "PROCESSING_RECOVERY_UNAVAILABLE"
+                reason = "NO_RECOVERABLE_PARSE_JOB"
+            else:
+                outcome = "DEFERRED"
+                decision = "RECOVER_EXISTING_JOB"
+        else:
+            return False
+
+        details: dict[str, object] = {
+            "source_id": str(source.id),
+            "document_id": str(document.id),
+            "version_id": str(matching.id),
+            "version_state": matching.state.value,
+            "external_id": drive_file.id,
+            "previous_title": previous_title,
+            "current_title": document.title,
+            "content_sha256": content_sha256,
+            "parse_decision": decision,
+            "parent_sync_job_id": (
+                str(parent_sync_job_id) if parent_sync_job_id is not None else None
+            ),
+        }
+        if parse_job is not None:
+            details["parse_job_id"] = str(parse_job.id)
+        if reason is not None:
+            details["reason"] = reason
+        await self._audit_service.record_actor(
+            self._db_session,
+            organization_id=source.organization_id,
+            actor_id=knowledge_worker_actor_id(source.organization_id),
+            action="knowledge.document.sync.content_unchanged",
+            object_type="document",
+            object_id=document.id,
+            outcome=outcome,
+            details=details,
+            safe_detail_keys=tuple(details),
+        )
+        return True
 
     async def _enqueue_parse(
         self,

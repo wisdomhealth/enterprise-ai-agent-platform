@@ -1,25 +1,43 @@
 import asyncio
 from datetime import UTC, datetime
+from hashlib import sha256
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select
 
 from app.core.database import async_sessionmaker, engine
+from app.modules.audit.models import AuditEvent
 from app.modules.identity.models import Organization
 from app.modules.jobs.models import JobIntent, JobState
 from app.modules.knowledge.drive_gateway import DriveFile
-from app.modules.knowledge.models import Document, DriveSource, KnowledgeBase
+from app.modules.knowledge.models import (
+    Document,
+    DocumentVersion,
+    DocumentVersionState,
+    DriveSource,
+    KnowledgeBase,
+)
 from app.modules.knowledge.operations import enqueue_drive_sync_intent
 from app.modules.knowledge.sync import DriveSyncService, StaleDriveAssessment
 from app.modules.outbox.models import OutboxEvent
 
 
 class FakeDriveChangeBoundary:
-    def __init__(self, files: list[DriveFile], next_cursor: str | None) -> None:
+    def __init__(
+        self,
+        files: list[DriveFile],
+        next_cursor: str | None,
+        *,
+        content: bytes = b"unchanged-content",
+        transaction_session=None,  # type: ignore[no-untyped-def]
+    ) -> None:
         self.files = files
         self.next_cursor = next_cursor
+        self.content = content
+        self.transaction_session = transaction_session
         self.calls: list[tuple[str, str | None]] = []
+        self.download_calls: list[str] = []
 
     async def list_changes(self, _db_session, *, source, sync_cursor):  # type: ignore[no-untyped-def]
         self.calls.append((str(source.id), sync_cursor))
@@ -28,6 +46,12 @@ class FakeDriveChangeBoundary:
     async def get_start_page_token(self, _db_session, *, source):  # type: ignore[no-untyped-def]
         self.calls.append((str(source.id), "bootstrap"))
         return "start-cursor"
+
+    async def download(self, file_id: str) -> bytes:
+        if self.transaction_session is not None:
+            assert not self.transaction_session.in_transaction()
+        self.download_calls.append(file_id)
+        return self.content
 
     @staticmethod
     def is_file_authorized(source, drive_file):  # type: ignore[no-untyped-def]
@@ -178,6 +202,7 @@ async def test_same_filename_with_new_drive_id_enqueues_a_new_document(db_sessio
 @pytest.mark.asyncio
 async def test_renamed_drive_file_updates_the_existing_document_title(db_session) -> None:  # type: ignore[no-untyped-def]
     source = await _source(db_session)
+    content = b"same PDF bytes after rename"
 
     await DriveSyncService(
         db_session,
@@ -194,19 +219,39 @@ async def test_renamed_drive_file_updates_the_existing_document_title(db_session
     )
     assert original is not None
     original_id = original.id
+    version = DocumentVersion(
+        document_id=original.id,
+        state=DocumentVersionState.RETRIEVABLE,
+        content_sha256=sha256(content).hexdigest(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+    original.current_version_id = version.id
+    original_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["document_id"].astext == str(original.id),
+        )
+    )
+    assert original_job is not None
+    original_job.state = JobState.SUCCEEDED
+    await db_session.commit()
 
-    await DriveSyncService(
+    rename_boundary = FakeDriveChangeBoundary(
+        [
+            _authorized_file(
+                file_id="stable-drive-id",
+                name="renamed-policy.pdf",
+                modified_time=datetime(2026, 8, 23, tzinfo=UTC),
+            )
+        ],
+        "cursor-3",
+        content=content,
+        transaction_session=db_session,
+    )
+    result = await DriveSyncService(
         db_session,
-        page_gateway=FakeDriveChangeBoundary(
-            [
-                _authorized_file(
-                    file_id="stable-drive-id",
-                    name="renamed-policy.pdf",
-                    modified_time=datetime(2026, 8, 23, tzinfo=UTC),
-                )
-            ],
-            "cursor-3",
-        ),
+        page_gateway=rename_boundary,
     ).sync(source.id, "cursor-2")
 
     documents = list(
@@ -219,12 +264,265 @@ async def test_renamed_drive_file_updates_the_existing_document_title(db_session
     assert [(document.id, document.external_id, document.title) for document in documents] == [
         (original_id, "stable-drive-id", "renamed-policy.pdf")
     ]
+    assert result.enqueued_documents == 0
+    assert result.parse_outbox_event_ids == ()
     assert await db_session.scalar(
         select(func.count(JobIntent.id)).where(
             JobIntent.kind == "knowledge.document.parse",
             JobIntent.payload["source_id"].astext == str(source.id),
         )
+    ) == 1
+    assert await db_session.scalar(
+        select(func.count(OutboxEvent.event_id)).where(
+            OutboxEvent.event_type == "knowledge.document.parse.requested",
+            OutboxEvent.payload["source_id"].astext == str(source.id),
+        )
+    ) == 1
+    audit = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.organization_id == source.organization_id,
+            AuditEvent.action == "knowledge.document.sync.content_unchanged",
+            AuditEvent.object_id == original_id,
+        )
+    )
+    assert audit is not None
+    assert audit.outcome == "SUCCESS"
+    assert audit.details["version_state"] == DocumentVersionState.RETRIEVABLE.value
+    assert audit.details["parse_decision"] == "SKIPPED_CONTENT_UNCHANGED"
+    assert audit.details["previous_title"] == "old-name.pdf"
+    assert audit.details["current_title"] == "renamed-policy.pdf"
+    assert rename_boundary.download_calls == ["stable-drive-id"]
+
+
+@pytest.mark.asyncio
+async def test_changed_content_still_enqueues_a_successor_parse_job(db_session) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session)
+    old_content = b"old file content"
+    await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [_authorized_file(file_id="changed-file", name="old-name.pdf")],
+            "cursor-2",
+        ),
+    ).sync(source.id, "cursor-1")
+    document = await db_session.scalar(
+        select(Document).where(
+            Document.source_id == source.id,
+            Document.external_id == "changed-file",
+        )
+    )
+    assert document is not None
+    current = DocumentVersion(
+        document_id=document.id,
+        state=DocumentVersionState.RETRIEVABLE,
+        content_sha256=sha256(old_content).hexdigest(),
+    )
+    db_session.add(current)
+    await db_session.flush()
+    document.current_version_id = current.id
+    original_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["document_id"].astext == str(document.id),
+        )
+    )
+    assert original_job is not None
+    original_job.state = JobState.SUCCEEDED
+    await db_session.commit()
+
+    result = await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [
+                _authorized_file(
+                    file_id="changed-file",
+                    name="new-name.pdf",
+                    modified_time=datetime(2026, 8, 23, tzinfo=UTC),
+                )
+            ],
+            "cursor-3",
+            content=b"new file content",
+            transaction_session=db_session,
+        ),
+    ).sync(source.id, "cursor-2")
+
+    await db_session.refresh(document)
+    assert document.title == "new-name.pdf"
+    assert document.current_version_id == current.id
+    assert result.enqueued_documents == 1
+    assert len(result.parse_outbox_event_ids) == 1
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["document_id"].astext == str(document.id),
+        )
     ) == 2
+
+
+@pytest.mark.asyncio
+async def test_renamed_file_with_matching_processing_version_reuses_original_job(
+    db_session,
+) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session)
+    content = b"content already checkpointed by original parse"
+    await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [_authorized_file(file_id="processing-file", name="old-name.pdf")],
+            "cursor-2",
+        ),
+    ).sync(source.id, "cursor-1")
+    document = await db_session.scalar(
+        select(Document).where(
+            Document.source_id == source.id,
+            Document.external_id == "processing-file",
+        )
+    )
+    assert document is not None
+    original_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["document_id"].astext == str(document.id),
+        )
+    )
+    assert original_job is not None
+    processing = DocumentVersion(
+        document_id=document.id,
+        state=DocumentVersionState.PROCESSING,
+        content_sha256=sha256(content).hexdigest(),
+    )
+    db_session.add(processing)
+    await db_session.flush()
+    original_job.payload = {
+        **original_job.payload,
+        "document_version_id": str(processing.id),
+    }
+    await db_session.commit()
+
+    rename_boundary = FakeDriveChangeBoundary(
+        [
+            _authorized_file(
+                file_id="processing-file",
+                name="renamed-during-processing.pdf",
+                modified_time=datetime(2026, 8, 23, tzinfo=UTC),
+            )
+        ],
+        "cursor-3",
+        content=content,
+    )
+    result = await DriveSyncService(
+        db_session,
+        page_gateway=rename_boundary,
+    ).sync(source.id, "cursor-2")
+
+    await db_session.refresh(document)
+    await db_session.refresh(original_job)
+    await db_session.refresh(processing)
+    assert document.title == "renamed-during-processing.pdf"
+    assert document.current_version_id is None
+    assert processing.state is DocumentVersionState.PROCESSING
+    assert original_job.state is JobState.PENDING
+    assert result.enqueued_documents == 0
+    assert result.parse_outbox_event_ids == ()
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["document_id"].astext == str(document.id),
+        )
+    ) == 1
+    assert await db_session.scalar(
+        select(func.count(OutboxEvent.event_id)).where(
+            OutboxEvent.event_type == "knowledge.document.parse.requested",
+            OutboxEvent.payload["document_id"].astext == str(document.id),
+        )
+    ) == 1
+    audit = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "knowledge.document.sync.content_unchanged",
+            AuditEvent.object_id == document.id,
+        )
+    )
+    assert audit is not None
+    assert audit.outcome == "DEFERRED"
+    assert audit.details["version_state"] == DocumentVersionState.PROCESSING.value
+    assert audit.details["parse_decision"] == "RECOVER_EXISTING_JOB"
+    assert audit.details["parse_job_id"] == str(original_job.id)
+    assert rename_boundary.download_calls == ["processing-file"]
+
+
+@pytest.mark.asyncio
+async def test_orphan_processing_version_records_reason_without_duplicate_job(
+    db_session,
+) -> None:  # type: ignore[no-untyped-def]
+    source = await _source(db_session)
+    content = b"orphan processing checkpoint"
+    await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [_authorized_file(file_id="orphan-file", name="old-name.pdf")],
+            "cursor-2",
+        ),
+    ).sync(source.id, "cursor-1")
+    document = await db_session.scalar(
+        select(Document).where(
+            Document.source_id == source.id,
+            Document.external_id == "orphan-file",
+        )
+    )
+    assert document is not None
+    original_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["document_id"].astext == str(document.id),
+        )
+    )
+    assert original_job is not None
+    processing = DocumentVersion(
+        document_id=document.id,
+        state=DocumentVersionState.PROCESSING,
+        content_sha256=sha256(content).hexdigest(),
+    )
+    db_session.add(processing)
+    original_job.state = JobState.SUCCEEDED
+    await db_session.commit()
+
+    result = await DriveSyncService(
+        db_session,
+        page_gateway=FakeDriveChangeBoundary(
+            [
+                _authorized_file(
+                    file_id="orphan-file",
+                    name="renamed-orphan.pdf",
+                    modified_time=datetime(2026, 8, 23, tzinfo=UTC),
+                )
+            ],
+            "cursor-3",
+            content=content,
+        ),
+    ).sync(source.id, "cursor-2")
+
+    await db_session.refresh(document)
+    await db_session.refresh(processing)
+    assert document.title == "renamed-orphan.pdf"
+    assert document.current_version_id is None
+    assert processing.state is DocumentVersionState.PROCESSING
+    assert result.enqueued_documents == 0
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "knowledge.document.parse",
+            JobIntent.payload["document_id"].astext == str(document.id),
+        )
+    ) == 1
+    audit = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "knowledge.document.sync.content_unchanged",
+            AuditEvent.object_id == document.id,
+        )
+    )
+    assert audit is not None
+    assert audit.outcome == "ATTENTION_REQUIRED"
+    assert audit.details["parse_decision"] == "PROCESSING_RECOVERY_UNAVAILABLE"
+    assert audit.details["reason"] == "NO_RECOVERABLE_PARSE_JOB"
 
 
 @pytest.mark.asyncio
