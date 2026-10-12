@@ -276,6 +276,36 @@ async def test_retry_routes_each_error_class(
 
 
 @pytest.mark.asyncio
+async def test_retryable_job_stops_on_configured_max_attempts(
+    job_service, lease_service, db_session
+):
+    job = await job_service.enqueue(
+        db_session,
+        "email.classify",
+        "email:classification:max-attempts",
+        {"work_item_id": str(uuid4())},
+    )
+    job.attempts = 2
+    await db_session.flush()
+    claimed = await lease_service.claim(job.id, "worker-a", 60)
+    assert claimed is not None
+    assert claimed.attempts == 3
+
+    stopped = await lease_service.retry(
+        job.id,
+        "worker-a",
+        error_code="EMAIL_CLASSIFICATION_TIMEOUT",
+        error_class=ErrorClass.RETRYABLE,
+        max_attempts=3,
+    )
+
+    assert stopped.state is JobState.FAILED
+    assert stopped.attempts == 3
+    assert stopped.next_attempt_at is None
+    assert stopped.error_class is ErrorClass.RETRYABLE
+
+
+@pytest.mark.asyncio
 async def test_security_error_emits_safe_audit_signal(
     job_service, lease_service, db_session
 ):

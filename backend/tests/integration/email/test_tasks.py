@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -8,15 +8,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import async_sessionmaker
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
-from app.modules.email.classification import ClassificationExecution
+from app.modules.email.classification import ClassificationExecution, EmailClassificationFailure
 from app.modules.email.gmail_gateway import GmailHistoryPage, GmailMessage
 from app.modules.email.ingestion import EmailIngestionService
-from app.modules.email.models import EmailCategory, EmailPriority, EmailSyncState, EmailWorkItem
+from app.modules.email.models import (
+    EmailCategory,
+    EmailPriority,
+    EmailState,
+    EmailSyncState,
+    EmailWorkItem,
+)
 from app.modules.email.schemas import EmailClassification
 from app.modules.email.tasks import _consume_email_job, _enqueue_gmail_history_jobs
 from app.modules.identity.models import Organization
-from app.modules.jobs.models import JobIntent, JobState
-from app.modules.jobs.service import JobService
+from app.modules.jobs.models import ErrorClass, JobIntent, JobState
+from app.modules.jobs.service import JobLeaseLost, JobService
 from app.modules.knowledge.models import KnowledgeBase
 
 
@@ -110,6 +116,315 @@ class BlockingClassifier:
         )
 
 
+class SequenceClassifier:
+    def __init__(self, results: list[ClassificationExecution | BaseException]) -> None:
+        self.results = results
+        self.calls = 0
+
+    async def classify(self, _subject: str, _body: str) -> ClassificationExecution:
+        result = self.results[self.calls]
+        self.calls += 1
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def _informational_execution() -> ClassificationExecution:
+    return ClassificationExecution(
+        EmailClassification(
+            category=EmailCategory.INFORMATIONAL,
+            priority=EmailPriority.NORMAL,
+            reply_required=False,
+        ),
+        "fixture",
+        "fixture-v1",
+        1,
+        2,
+        1,
+        0.0,
+    )
+
+
+def _action_required_execution() -> ClassificationExecution:
+    return ClassificationExecution(
+        EmailClassification(
+            category=EmailCategory.ACTION_REQUIRED,
+            priority=EmailPriority.HIGH,
+            reply_required=True,
+        ),
+        "fixture",
+        "fixture-v1",
+        1,
+        2,
+        1,
+        0.0,
+    )
+
+
+async def _classification_job() -> tuple[UUID, UUID]:
+    async with async_sessionmaker() as setup:
+        organization = Organization(name=f"Classification {uuid4()}")
+        setup.add(organization)
+        await setup.flush()
+        knowledge_base = KnowledgeBase(
+            organization_id=organization.id, public_key=f"classify-{uuid4().hex}"
+        )
+        secret = ConnectorSecret(
+            organization_id=organization.id,
+            ciphertext=b"fixture",
+            encrypted_data_key=b"fixture",
+            nonce=b"fixture",
+            algorithm="AES-256-GCM",
+            key_version="fixture",
+        )
+        setup.add_all([knowledge_base, secret])
+        await setup.flush()
+        connector = Connector(
+            organization_id=organization.id,
+            kind=ConnectorKind.GMAIL,
+            status=ConnectorStatus.ACTIVE,
+            secret_id=secret.id,
+        )
+        setup.add(connector)
+        await setup.flush()
+        message = GmailMessage(
+            id=f"gmail-{uuid4().hex}",
+            thread_id="thread-classification",
+            history_id="cursor-classification",
+            sender="customer@example.test",
+            recipients=("support@example.test",),
+            subject="Classification fixture",
+            body="Please classify this message.",
+            received_at=datetime.now(UTC),
+            raw_content_ref="gmail://fixture/classification",
+        )
+        item = await EmailIngestionService(
+            setup, classifier=SequenceClassifier([])
+        ).ingest_message(
+            message,
+            organization_id=organization.id,
+            connector_id=connector.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+        job = await setup.scalar(
+            select(JobIntent).where(
+                JobIntent.kind == "email.classify",
+                JobIntent.payload["work_item_id"].astext == str(item.id),
+            )
+        )
+        assert job is not None
+        item_id = item.id
+        job_id = job.id
+        await setup.commit()
+        return item_id, job_id
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_terminally_fails_original_classification_job(
+    monkeypatch,
+) -> None:
+    item_id, job_id = await _classification_job()
+    classifier = SequenceClassifier(
+        [
+            EmailClassificationFailure(
+                "EMAIL_CLASSIFICATION_AUTHENTICATION_FAILED",
+                ErrorClass.NON_RETRYABLE,
+            )
+        ]
+    )
+    monkeypatch.setattr("app.modules.email.tasks._build_classifier", lambda _settings: classifier)
+
+    await _consume_email_job(job_id)
+
+    async with async_sessionmaker() as verify:
+        persisted = await verify.get(JobIntent, job_id)
+        persisted_item = await verify.get(EmailWorkItem, item_id)
+        assert persisted is not None
+        assert persisted_item is not None
+        assert persisted.state is JobState.FAILED
+        assert persisted.attempts == 1
+        assert persisted.last_error_code == "EMAIL_CLASSIFICATION_AUTHENTICATION_FAILED"
+        assert persisted_item.state is EmailState.DRAFT_RETRY_WAIT
+        assert persisted_item.last_error_code == persisted.last_error_code
+        assert classifier.calls == 1
+        assert (
+            await verify.scalar(
+                select(func.count(JobIntent.id)).where(
+                    JobIntent.kind == "email.classify",
+                    JobIntent.payload["work_item_id"].astext == str(item_id),
+                )
+            )
+            == 1
+        )
+
+    await _consume_email_job(job_id)
+    assert classifier.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_retries_same_job_then_succeeds(
+    monkeypatch,
+) -> None:
+    item_id, job_id = await _classification_job()
+    classifier = SequenceClassifier(
+        [
+            EmailClassificationFailure(
+                "EMAIL_CLASSIFICATION_TIMEOUT", ErrorClass.RETRYABLE
+            ),
+            _action_required_execution(),
+        ]
+    )
+    monkeypatch.setattr("app.modules.email.tasks._build_classifier", lambda _settings: classifier)
+
+    await _consume_email_job(job_id)
+    async with async_sessionmaker() as advance:
+        first_attempt = await advance.get(JobIntent, job_id)
+        assert first_attempt is not None
+        assert first_attempt.state is JobState.PENDING
+        assert first_attempt.next_attempt_at is not None
+        first_attempt.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await advance.commit()
+
+    await _consume_email_job(job_id)
+
+    async with async_sessionmaker() as verify:
+        persisted = await verify.get(JobIntent, job_id)
+        persisted_item = await verify.get(EmailWorkItem, item_id)
+        assert persisted is not None
+        assert persisted_item is not None
+        assert persisted.id == job_id
+        assert persisted.state is JobState.SUCCEEDED
+        assert persisted.attempts == 2
+        assert persisted_item.state is EmailState.DRAFTING
+        assert persisted_item.category is EmailCategory.ACTION_REQUIRED
+        assert classifier.calls == 2
+        assert (
+            await verify.scalar(
+                select(func.count(JobIntent.id)).where(
+                    JobIntent.kind == "email.draft",
+                    JobIntent.payload["work_item_id"].astext == str(item_id),
+                )
+            )
+            == 1
+        )
+
+    await _consume_email_job(job_id)
+    assert classifier.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_retryable_classification_stops_at_attempt_limit(
+    monkeypatch,
+) -> None:
+    item_id, job_id = await _classification_job()
+    classifier = SequenceClassifier(
+        [
+            EmailClassificationFailure(
+                "EMAIL_CLASSIFICATION_TIMEOUT", ErrorClass.RETRYABLE
+            ),
+            EmailClassificationFailure(
+                "EMAIL_CLASSIFICATION_TIMEOUT", ErrorClass.RETRYABLE
+            ),
+        ]
+    )
+    monkeypatch.setenv("EMAIL_CLASSIFICATION_MAX_ATTEMPTS", "2")
+    monkeypatch.setattr("app.modules.email.tasks._build_classifier", lambda _settings: classifier)
+
+    await _consume_email_job(job_id)
+    async with async_sessionmaker() as advance:
+        pending = await advance.get(JobIntent, job_id)
+        assert pending is not None
+        pending.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await advance.commit()
+    await _consume_email_job(job_id)
+
+    async with async_sessionmaker() as verify:
+        stopped = await verify.get(JobIntent, job_id)
+        assert stopped is not None
+        assert stopped.state is JobState.FAILED
+        assert stopped.attempts == 2
+        assert stopped.next_attempt_at is None
+        assert classifier.calls == 2
+        assert (
+            await verify.scalar(
+                select(func.count(JobIntent.id)).where(
+                    JobIntent.kind == "email.classify",
+                    JobIntent.payload["work_item_id"].astext == str(item_id),
+                )
+            )
+            == 1
+        )
+
+    await _consume_email_job(job_id)
+    assert classifier.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_historical_duplicate_classification_job_is_superseded_without_model_call(
+    monkeypatch,
+) -> None:
+    item_id, original_id = await _classification_job()
+    async with async_sessionmaker() as setup:
+        original = await setup.get(JobIntent, original_id)
+        assert original is not None
+        duplicate = await JobService().enqueue(
+            setup,
+            "email.classify",
+            f"historical-duplicate:{uuid4()}",
+            dict(original.payload),
+        )
+        duplicate_id = duplicate.id
+        await setup.commit()
+    classifier = SequenceClassifier([_informational_execution()])
+    monkeypatch.setattr("app.modules.email.tasks._build_classifier", lambda _settings: classifier)
+
+    await _consume_email_job(duplicate_id)
+
+    async with async_sessionmaker() as verify:
+        persisted = await verify.get(JobIntent, duplicate_id)
+        assert persisted is not None
+        assert persisted.state is JobState.FAILED
+        assert persisted.last_error_code == "EMAIL_CLASSIFICATION_SUPERSEDED"
+        assert classifier.calls == 0
+        original_job = await verify.get(JobIntent, original_id)
+        persisted_item = await verify.get(EmailWorkItem, item_id)
+        assert original_job is not None and original_job.state is JobState.PENDING
+        assert persisted_item is not None and persisted_item.category is None
+
+
+@pytest.mark.asyncio
+async def test_classification_lease_loss_rolls_back_result_and_downstream_job(monkeypatch) -> None:
+    item_id, job_id = await _classification_job()
+    classifier = SequenceClassifier([_action_required_execution()])
+    monkeypatch.setattr("app.modules.email.tasks._build_classifier", lambda _settings: classifier)
+
+    async def lose_lease(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise JobLeaseLost(job_id)
+
+    monkeypatch.setattr("app.modules.email.tasks.JobLeaseService.complete", lose_lease)
+
+    with pytest.raises(JobLeaseLost):
+        await _consume_email_job(job_id)
+
+    async with async_sessionmaker() as verify:
+        persisted_item = await verify.get(EmailWorkItem, item_id)
+        persisted_job = await verify.get(JobIntent, job_id)
+        assert persisted_item is not None
+        assert persisted_job is not None
+        assert persisted_item.state is EmailState.INGESTED
+        assert persisted_item.category is None
+        assert persisted_job.state is JobState.RUNNING
+        assert (
+            await verify.scalar(
+                select(func.count(JobIntent.id)).where(
+                    JobIntent.kind == "email.draft",
+                    JobIntent.payload["work_item_id"].astext == str(item_id),
+                )
+            )
+            == 0
+        )
+
+
 class OnePageGateway:
     def __init__(self, message: GmailMessage) -> None:
         self.message = message
@@ -124,7 +439,7 @@ class OnePageGateway:
 
 
 @pytest.mark.asyncio
-async def test_history_consumer_renews_real_pg_lease_without_duplicate_paid_work(
+async def test_history_consumer_enqueues_classification_without_paid_model_call(
     monkeypatch,
 ) -> None:
     classifier = BlockingClassifier()
@@ -196,15 +511,9 @@ async def test_history_consumer_renews_real_pg_lease_without_duplicate_paid_work
         )
         return result.reauth_required
 
-    monkeypatch.setattr("app.modules.email.tasks.EMAIL_LEASE_SECONDS", 1)
     monkeypatch.setattr("app.modules.email.tasks._consume_history", consume_history)
 
-    first = asyncio.create_task(_consume_email_job(job_id))
-    await asyncio.wait_for(classifier.started.wait(), timeout=2)
-    await asyncio.sleep(1.2)
     await _consume_email_job(job_id)
-    classifier.release.set()
-    await asyncio.wait_for(first, timeout=3)
 
     async with async_sessionmaker() as verify:
         persisted_job = await verify.get(JobIntent, job_id)
@@ -213,7 +522,7 @@ async def test_history_consumer_renews_real_pg_lease_without_duplicate_paid_work
         )
         assert persisted_job is not None
         assert persisted_job.state is JobState.SUCCEEDED
-        assert classifier.calls == 1
+        assert classifier.calls == 0
         assert (
             await verify.scalar(
                 select(func.count(EmailWorkItem.id)).where(
@@ -224,3 +533,12 @@ async def test_history_consumer_renews_real_pg_lease_without_duplicate_paid_work
         )
         assert sync_state is not None
         assert sync_state.history_id == "cursor-2"
+        assert (
+            await verify.scalar(
+                select(func.count(JobIntent.id)).where(
+                    JobIntent.kind == "email.classify",
+                    JobIntent.payload["organization_id"].astext == str(organization_id),
+                )
+            )
+            == 1
+        )

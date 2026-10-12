@@ -41,7 +41,7 @@ class RetryPolicy:
         bounded = min(self._max_seconds, jittered)
         if retry_after_seconds is None:
             return bounded
-        return max(bounded, max(0, retry_after_seconds))
+        return min(self._max_seconds, max(bounded, max(0, retry_after_seconds)))
 
 
 class JobService:
@@ -207,9 +207,12 @@ class JobLeaseService:
         error_class: ErrorClass,
         expected_version: int | None = None,
         retry_after_seconds: int | None = None,
+        max_attempts: int | None = None,
         organization_id: UUID | None = None,
         actor_id: UUID | None = None,
     ) -> JobIntent:
+        if max_attempts is not None and max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
         if error_class is ErrorClass.SECURITY and (organization_id is None or actor_id is None):
             raise ValueError("security job failures require organization_id and actor_id")
         database_now = func.clock_timestamp()
@@ -229,7 +232,10 @@ class JobLeaseService:
             raise JobLeaseLost(job_id)
 
         next_attempt_at = None
-        if error_class is ErrorClass.RETRYABLE:
+        if (
+            error_class is ErrorClass.RETRYABLE
+            and (max_attempts is None or attempts < max_attempts)
+        ):
             state = JobState.PENDING
             delay = self._retry_policy.delay_seconds(
                 attempts=attempts,

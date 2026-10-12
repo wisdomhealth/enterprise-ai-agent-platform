@@ -41,7 +41,11 @@ class FixedClassifier:
 
 
 class FailingClassifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def classify(self, _subject: str, _body: str) -> ClassificationExecution:
+        self.calls += 1
         raise RuntimeError("provider payload must not escape")
 
 
@@ -162,7 +166,7 @@ async def test_history_worker_can_defer_page_commit_until_lease_completion(
 
 
 @pytest.mark.asyncio
-async def test_automated_ingestion_history_records_system_actor_and_job(
+async def test_automated_classification_records_system_actor_and_job(
     db_session: AsyncSession, email_context: dict[str, object]
 ) -> None:
     connector = email_context["connector"]
@@ -174,35 +178,64 @@ async def test_automated_ingestion_history_records_system_actor_and_job(
         {"connector_id": str(connector.id)},
     )
 
-    await EmailIngestionService(
+    service = EmailIngestionService(
         db_session,
         gateway=FakeGmailGateway([email_context["message"]]),
         classifier=FixedClassifier(),
-    ).ingest_history(connector.id, knowledge_base.id, job_id=job.id)
+    )
+    await service.ingest_history(connector.id, knowledge_base.id, job_id=job.id)
+    item = await db_session.scalar(
+        select(EmailWorkItem).where(
+            EmailWorkItem.organization_id == connector.organization_id,
+            EmailWorkItem.gmail_message_id == email_context["message"].id,
+        )
+    )
+    assert item is not None
+    classify_job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.kind == "email.classify",
+            JobIntent.payload["work_item_id"].astext == str(item.id),
+        )
+    )
+    assert classify_job is not None
+    await service.process_classification(item.id, job_id=classify_job.id)
 
-    histories = list((await db_session.scalars(select(EmailStateHistory))).all())
+    histories = list(
+        (
+            await db_session.scalars(
+                select(EmailStateHistory).where(EmailStateHistory.work_item_id == item.id)
+            )
+        ).all()
+    )
     assert histories
-    assert {history.job_id for history in histories} == {job.id}
+    assert {history.job_id for history in histories} == {classify_job.id}
     assert {history.actor_type for history in histories} == {"SYSTEM"}
     assert all(history.actor_id is not None for history in histories)
 
 
 @pytest.mark.asyncio
-async def test_retry_job_survives_classification_failure_without_sensitive_error(
+async def test_initial_ingestion_enqueues_classification_without_calling_model(
     db_session: AsyncSession, email_context: dict[str, object]
 ) -> None:
     connector = email_context["connector"]
     knowledge_base = email_context["knowledge_base"]
-    item = await EmailIngestionService(db_session, classifier=FailingClassifier()).ingest_message(
+    classifier = FailingClassifier()
+    item = await EmailIngestionService(db_session, classifier=classifier).ingest_message(
         email_context["message"],
         organization_id=connector.organization_id,
         connector_id=connector.id,
         knowledge_base_id=knowledge_base.id,
     )
 
-    assert item.state is EmailState.DRAFT_RETRY_WAIT
-    assert item.last_error_code == "EMAIL_CLASSIFICATION_FAILED"
-    job = await db_session.scalar(select(JobIntent).where(JobIntent.kind == "email.classify"))
+    assert classifier.calls == 0
+    assert item.state is EmailState.INGESTED
+    assert item.last_error_code is None
+    job = await db_session.scalar(
+        select(JobIntent).where(
+            JobIntent.kind == "email.classify",
+            JobIntent.payload["work_item_id"].astext == str(item.id),
+        )
+    )
     assert job is not None
     assert job.payload == {
         "work_item_id": str(item.id),
@@ -212,28 +245,6 @@ async def test_retry_job_survives_classification_failure_without_sensitive_error
         "phase": "classification",
     }
     assert "provider payload" not in str(job.payload)
-
-
-@pytest.mark.asyncio
-async def test_manual_retry_uses_state_machine_and_creates_new_durable_intent(
-    db_session: AsyncSession, email_context: dict[str, object]
-) -> None:
-    connector = email_context["connector"]
-    knowledge_base = email_context["knowledge_base"]
-    service = EmailIngestionService(db_session, classifier=FailingClassifier())
-    item = await service.ingest_message(
-        email_context["message"],
-        organization_id=connector.organization_id,
-        connector_id=connector.id,
-        knowledge_base_id=knowledge_base.id,
-    )
-    original_job_count = await db_session.scalar(select(func.count(JobIntent.id)))
-
-    retried = await service.retry_failed_work_item(item.id)
-
-    assert retried.state is EmailState.DRAFTING
-    assert retried.last_error_code is None
-    assert await db_session.scalar(select(func.count(JobIntent.id))) == original_job_count + 1
 
 
 @pytest.mark.asyncio

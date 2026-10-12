@@ -92,7 +92,7 @@ async def test_duplicate_gmail_message_creates_one_work_item(
     assert (
         await db_session.scalar(
             select(func.count(JobIntent.id)).where(
-                JobIntent.kind == "email.draft",
+                JobIntent.kind == "email.classify",
                 JobIntent.payload["work_item_id"].astext == str(first.id),
             )
         )
@@ -100,7 +100,7 @@ async def test_duplicate_gmail_message_creates_one_work_item(
     )
 
 
-async def test_ingestion_normalizes_headers_body_and_queues_durable_draft(
+async def test_ingestion_normalizes_headers_body_and_queues_durable_classification(
     db_session: AsyncSession, email_context: dict[str, object]
 ) -> None:
     message = email_context["message"]
@@ -117,10 +117,10 @@ async def test_ingestion_normalizes_headers_body_and_queues_durable_draft(
     assert item.recipients == ["Support <support@example.test>", "other@example.test"]
     assert item.subject == "Need refund help"
     assert item.body == "First line.\n\nSecond line."
-    assert item.state is EmailState.DRAFTING
+    assert item.state is EmailState.INGESTED
     job = await db_session.scalar(
         select(JobIntent).where(
-            JobIntent.kind == "email.draft",
+            JobIntent.kind == "email.classify",
             JobIntent.payload["work_item_id"].astext == str(item.id),
         )
     )
@@ -130,7 +130,7 @@ async def test_ingestion_normalizes_headers_body_and_queues_durable_draft(
         "organization_id": str(item.organization_id),
         "connector_id": str(item.connector_id),
         "knowledge_base_id": str(item.knowledge_base_id),
-        "phase": "draft",
+        "phase": "classification",
     }
 
 

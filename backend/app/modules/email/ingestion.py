@@ -11,7 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
 from app.modules.email.actors import EMAIL_SYSTEM_ACTOR_TYPE, email_worker_actor_id
-from app.modules.email.classification import ClassificationExecution, EmailClassifier
+from app.modules.email.classification import (
+    ClassificationExecution,
+    EmailClassificationFailure,
+    EmailClassifier,
+    classify_email_error,
+)
 from app.modules.email.gmail_gateway import (
     GmailAuthorizationError,
     GmailGateway,
@@ -52,6 +57,7 @@ class EmailIngestionService:
         gateway_factory: GmailGatewayFactory | None = None,
         job_service: JobService | None = None,
         outbox_service: OutboxService | None = None,
+        classification_retry_after_cap_seconds: int = 300,
     ) -> None:
         self._db_session = db_session
         self._classifier = classifier
@@ -60,6 +66,7 @@ class EmailIngestionService:
         self._gateway_factory = gateway_factory
         self._job_service = job_service or JobService()
         self._outbox_service = outbox_service or OutboxService()
+        self._classification_retry_after_cap_seconds = classification_retry_after_cap_seconds
 
     async def ingest_message(
         self,
@@ -107,7 +114,7 @@ class EmailIngestionService:
             raise RuntimeError("email ingestion did not return the inserted or existing item")
         if inserted_id is None:
             return item
-        await self._classify(item, retrying=False, job_id=job_id)
+        await self._enqueue_work(item, kind="email.classify", phase="classification")
         await self._db_session.flush()
         return item
 
@@ -172,53 +179,37 @@ class EmailIngestionService:
     async def process_classification(
         self, work_item_id: UUID, *, job_id: UUID | None = None
     ) -> EmailWorkItem:
+        item = await self._db_session.get(EmailWorkItem, work_item_id)
+        if item is None:
+            raise LookupError("email work item not found")
+        if item.category is not None:
+            return item
+        if item.state not in {EmailState.INGESTED, EmailState.DRAFT_RETRY_WAIT}:
+            raise ValueError("email classification is not retryable in its current state")
+        subject = item.subject
+        body = item.body
+        try:
+            execution = await self._classifier.classify(subject, body)
+        except Exception as error:
+            failure = classify_email_error(
+                error,
+                retry_after_cap_seconds=self._classification_retry_after_cap_seconds,
+            )
+            await self._record_classification_failure(work_item_id, failure, job_id=job_id)
+            raise failure from error
+
         item = await self._db_session.scalar(
-            select(EmailWorkItem).where(EmailWorkItem.id == work_item_id).with_for_update()
+            select(EmailWorkItem)
+            .where(EmailWorkItem.id == work_item_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if item is None:
             raise LookupError("email work item not found")
         if item.category is not None:
             return item
-        if item.state is EmailState.DRAFT_RETRY_WAIT:
-            self._change_state(
-                item,
-                EmailAction.RETRY_DRAFT,
-                reason_code="AUTOMATIC_RETRY",
-                job_id=job_id,
-            )
-        if item.state is not EmailState.DRAFTING:
+        if item.state not in {EmailState.INGESTED, EmailState.DRAFT_RETRY_WAIT}:
             raise ValueError("email classification is not retryable in its current state")
-        await self._classify(item, retrying=True, job_id=job_id)
-        return item
-
-    async def retry_failed_work_item(self, work_item_id: UUID) -> EmailWorkItem:
-        item = await self._db_session.scalar(
-            select(EmailWorkItem).where(EmailWorkItem.id == work_item_id).with_for_update()
-        )
-        if item is None:
-            raise LookupError("email work item not found")
-        self._change_state(item, EmailAction.RETRY_DRAFT, reason_code="MANUAL_RETRY")
-        item.last_error_code = None
-        kind = "email.classify" if item.category is None else "email.draft"
-        phase = "classification" if item.category is None else "draft"
-        await self._enqueue_work(item, kind=kind, phase=phase)
-        await self._db_session.flush()
-        return item
-
-    async def _classify(self, item: EmailWorkItem, *, retrying: bool, job_id: UUID | None) -> None:
-        try:
-            execution = await self._classifier.classify(item.subject, item.body)
-        except Exception:
-            action = EmailAction.DRAFT_FAILED if retrying else EmailAction.CLASSIFICATION_FAILED
-            self._change_state(
-                item,
-                action,
-                reason_code="EMAIL_CLASSIFICATION_FAILED",
-                job_id=job_id,
-            )
-            item.last_error_code = "EMAIL_CLASSIFICATION_FAILED"
-            await self._enqueue_work(item, kind="email.classify", phase="classification")
-            return
         self._apply_classification(item, execution)
         if execution.classification.category in {
             EmailCategory.ACTION_REQUIRED,
@@ -226,9 +217,53 @@ class EmailIngestionService:
         }:
             if item.state is EmailState.INGESTED:
                 self._change_state(item, EmailAction.START_DRAFT, job_id=job_id)
+            else:
+                self._change_state(
+                    item,
+                    EmailAction.RETRY_DRAFT,
+                    reason_code="AUTOMATIC_RETRY",
+                    job_id=job_id,
+                )
             await self._enqueue_work(item, kind="email.draft", phase="draft")
-        elif item.state is EmailState.DRAFTING:
+        elif item.state is EmailState.DRAFT_RETRY_WAIT:
+            self._change_state(
+                item,
+                EmailAction.RETRY_DRAFT,
+                reason_code="AUTOMATIC_RETRY",
+                job_id=job_id,
+            )
             self._change_state(item, EmailAction.CLASSIFIED_NO_DRAFT, job_id=job_id)
+        await self._db_session.flush()
+        return item
+
+    async def _record_classification_failure(
+        self,
+        work_item_id: UUID,
+        failure: EmailClassificationFailure,
+        *,
+        job_id: UUID | None,
+    ) -> None:
+        item = await self._db_session.scalar(
+            select(EmailWorkItem)
+            .where(EmailWorkItem.id == work_item_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if item is None:
+            raise LookupError("email work item not found")
+        if item.category is not None:
+            return
+        if item.state is EmailState.INGESTED:
+            self._change_state(
+                item,
+                EmailAction.CLASSIFICATION_FAILED,
+                reason_code=failure.error_code,
+                job_id=job_id,
+            )
+        elif item.state is not EmailState.DRAFT_RETRY_WAIT:
+            raise ValueError("email classification failure is stale")
+        item.last_error_code = failure.error_code
+        await self._db_session.flush()
 
     @staticmethod
     def _apply_classification(item: EmailWorkItem, execution: ClassificationExecution) -> None:
@@ -257,7 +292,9 @@ class EmailIngestionService:
         job = await self._job_service.enqueue(
             self._db_session,
             kind,
-            f"{kind}:{item.id}:v{item.version}",
+            f"{kind}:{item.id}"
+            if kind == "email.classify"
+            else f"{kind}:{item.id}:v{item.version}",
             payload,
         )
         await self._outbox_service.add(

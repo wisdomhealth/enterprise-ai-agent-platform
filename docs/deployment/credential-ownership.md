@@ -40,6 +40,9 @@ not a developer account.
 | `OPENAI_BASE_URL` | AI platform | Optional OpenAI-compatible endpoint; use the official provider when unset. |
 | `OPENAI_GENERATION_MODEL` | AI platform | Approved structured answer-generation model. |
 | `OPENAI_CLASSIFIER_MODEL` | AI platform | Approved email and safety classification model. |
+| `EMAIL_CLASSIFICATION_MAX_ATTEMPTS` | AI platform | Total durable attempts allowed for one email classification job. |
+| `EMAIL_CLASSIFICATION_RETRY_BASE_SECONDS` | AI platform | Base delay for durable email classification exponential backoff. |
+| `EMAIL_CLASSIFICATION_RETRY_MAX_SECONDS` | AI platform | Maximum email classification delay and provider `Retry-After` cap. |
 | `OPENAI_EMBEDDING_MODEL` | AI platform | Approved embedding model; changing vector compatibility requires a migration and re-embedding. |
 | `OPENAI_EMBEDDING_DIMENSIONS` | AI platform | Embedding vector size, fixed at 1536 to match the pgvector column. |
 | `OPENAI_EMBEDDING_BATCH_SIZE` | AI platform | Maximum texts submitted by each LlamaIndex embedding batch. |

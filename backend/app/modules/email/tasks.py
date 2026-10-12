@@ -1,6 +1,7 @@
 """Celery consumers for durable Gmail history, classification, and draft intents."""
 
 import asyncio
+import logging
 from hashlib import sha256
 from uuid import UUID, uuid4
 
@@ -14,8 +15,9 @@ from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSta
 from app.modules.connectors.service import ConnectorService
 from app.modules.email.actors import email_worker_principal
 from app.modules.email.classification import (
+    EmailClassificationFailure,
     EmailClassifier,
-    EmailClassifierUnavailable,
+    EmailClassifierConfigurationError,
     OpenAIEmailClassifier,
 )
 from app.modules.email.delivery import EMAIL_DELIVERY_KIND, EmailDeliveryService
@@ -24,7 +26,7 @@ from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
 from app.modules.email.ingestion import EmailIngestionService
 from app.modules.email.models import DeliveryIntent, EmailSyncState, EmailWorkItem
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
-from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService
+from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService, RetryPolicy
 from app.modules.knowledge.models import KnowledgeBase
 from app.modules.outbox.models import OutboxEvent, ProcessedEvent
 from app.modules.outbox.service import OutboxService
@@ -41,11 +43,12 @@ EMAIL_DELIVERY_OUTBOX_EVENT_TYPES = frozenset(
 )
 EMAIL_WORKER_ID = "celery-email"
 EMAIL_LEASE_SECONDS = 300
+logger = logging.getLogger(__name__)
 
 
 class _UnavailableEmailClassifier:
     async def classify(self, _subject: str, _body: str):  # type: ignore[no-untyped-def]
-        raise EmailClassifierUnavailable("OPENAI_API_KEY is not configured")
+        raise EmailClassifierConfigurationError("OPENAI_API_KEY is not configured")
 
 
 @shared_task(name=EMAIL_JOB_TASK_NAME)  # type: ignore[untyped-decorator]
@@ -326,7 +329,13 @@ async def _consume_email_job(job_id: UUID) -> None:
         if pending_job is not None and pending_job.kind == EMAIL_DELIVERY_KIND:
             await _consume_delivery_job(db_session, job_id, settings)
             return
-        lease_service = JobLeaseService(db_session)
+        lease_service = JobLeaseService(
+            db_session,
+            retry_policy=RetryPolicy(
+                base_seconds=settings.email_classification_retry_base_seconds,
+                max_seconds=settings.email_classification_retry_max_seconds,
+            ),
+        )
         execution_owner = f"{EMAIL_WORKER_ID}:{uuid4()}"
         job = await lease_service.claim(job_id, execution_owner, lease_seconds=EMAIL_LEASE_SECONDS)
         if job is None:
@@ -362,16 +371,59 @@ async def _consume_email_job(job_id: UUID) -> None:
                         claimed_job_id, execution_owner, expected_version=current_version
                     )
             elif claimed_job_kind == EMAIL_CLASSIFY_KIND:
-                await _consume_classification(
-                    db_session, claimed_job_id, claimed_job_payload, settings
-                )
-                await lease_service.complete(
-                    claimed_job_id,
-                    execution_owner,
-                    expected_version=await _current_claim_version(
-                        db_session, claimed_job_id, execution_owner
-                    ),
-                )
+                try:
+                    await _consume_classification(
+                        db_session, claimed_job_id, claimed_job_payload, settings
+                    )
+                except EmailClassificationFailure as failure:
+                    retried = await lease_service.retry(
+                        claimed_job_id,
+                        execution_owner,
+                        error_code=failure.error_code,
+                        error_class=failure.error_class,
+                        retry_after_seconds=failure.retry_after_seconds,
+                        max_attempts=settings.email_classification_max_attempts,
+                        expected_version=await _current_claim_version(
+                            db_session, claimed_job_id, execution_owner
+                        ),
+                    )
+                    await db_session.commit()
+                    logger.warning(
+                        "email classification failed",
+                        extra={
+                            "organization_id": claimed_job_payload.get("organization_id"),
+                            "work_item_id": claimed_job_payload.get("work_item_id"),
+                            "job_id": str(claimed_job_id),
+                            "attempt": retried.attempts,
+                            "error_code": failure.error_code,
+                            "error_class": failure.error_class.value,
+                            "failure_retryable": failure.error_class is ErrorClass.RETRYABLE,
+                            "retry_scheduled": retried.state is JobState.PENDING,
+                            "terminal_reason": (
+                                None
+                                if retried.state is JobState.PENDING
+                                else (
+                                    "attempt_limit"
+                                    if failure.error_class is ErrorClass.RETRYABLE
+                                    else "non_retryable"
+                                )
+                            ),
+                            "next_attempt_at": (
+                                retried.next_attempt_at.isoformat()
+                                if retried.next_attempt_at is not None
+                                else None
+                            ),
+                        },
+                    )
+                    return
+                else:
+                    await lease_service.complete(
+                        claimed_job_id,
+                        execution_owner,
+                        expected_version=await _current_claim_version(
+                            db_session, claimed_job_id, execution_owner
+                        ),
+                    )
             elif claimed_job_kind == EMAIL_DRAFT_KIND:
                 await _consume_draft(db_session, claimed_job_id, claimed_job_payload, settings)
                 await lease_service.complete(
@@ -397,7 +449,15 @@ async def _consume_email_job(job_id: UUID) -> None:
             raise
         except Exception:
             await db_session.rollback()
-            await _recover_failed_email_job(claimed_job_id, execution_owner)
+            await _recover_failed_email_job(
+                claimed_job_id,
+                execution_owner,
+                max_attempts=(
+                    settings.email_classification_max_attempts
+                    if claimed_job_kind == EMAIL_CLASSIFY_KIND
+                    else None
+                ),
+            )
             raise
 
 
@@ -416,7 +476,9 @@ async def _current_claim_version(
     return int(version)
 
 
-async def _recover_failed_email_job(job_id: UUID, execution_owner: str) -> None:
+async def _recover_failed_email_job(
+    job_id: UUID, execution_owner: str, *, max_attempts: int | None = None
+) -> None:
     """Best-effort durable retry that never masks the original business failure."""
     try:
         async with async_sessionmaker() as recovery_session:
@@ -428,6 +490,7 @@ async def _recover_failed_email_job(job_id: UUID, execution_owner: str) -> None:
                 execution_owner,
                 error_code="EMAIL_WORKER_TRANSIENT_FAILURE",
                 error_class=ErrorClass.RETRYABLE,
+                max_attempts=max_attempts,
                 expected_version=current_version,
             )
             await recovery_session.commit()
@@ -516,9 +579,26 @@ async def _consume_classification(
     payload: dict[str, object],
     settings: Settings,
 ) -> None:
+    work_item_id = UUID(str(payload["work_item_id"]))
+    canonical_job_id = await db_session.scalar(
+        select(JobIntent.id)
+        .where(
+            JobIntent.kind == EMAIL_CLASSIFY_KIND,
+            JobIntent.payload["work_item_id"].astext == str(work_item_id),
+            JobIntent.state != JobState.SUCCEEDED,
+        )
+        .order_by(JobIntent.created_at, JobIntent.id)
+        .limit(1)
+    )
+    if canonical_job_id != job_id:
+        raise EmailClassificationFailure(
+            "EMAIL_CLASSIFICATION_SUPERSEDED", ErrorClass.NON_RETRYABLE
+        )
     await EmailIngestionService(
-        db_session, classifier=_build_classifier(settings)
-    ).process_classification(UUID(str(payload["work_item_id"])), job_id=job_id)
+        db_session,
+        classifier=_build_classifier(settings),
+        classification_retry_after_cap_seconds=settings.email_classification_retry_max_seconds,
+    ).process_classification(work_item_id, job_id=job_id)
 
 
 async def _consume_draft(
