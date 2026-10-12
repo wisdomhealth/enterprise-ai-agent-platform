@@ -22,6 +22,106 @@ from app.modules.outbox.models import OutboxEvent
 
 
 @pytest.mark.asyncio
+async def test_admin_retries_failed_classification_on_same_job_intent(
+    db_session, operations_context
+) -> None:  # type: ignore[no-untyped-def]
+    organization = operations_context["organization"]
+    source = operations_context["source"]
+    connector = operations_context["connector"]
+    admin = operations_context["admin"]
+    item = EmailWorkItem(
+        organization_id=organization.id,
+        connector_id=connector.id,
+        knowledge_base_id=source.knowledge_base_id,
+        gmail_message_id=f"classification-retry-{uuid4()}",
+        gmail_thread_id="thread-classification-retry",
+        sender="customer@example.test",
+        recipients=["support@example.test"],
+        subject="Safe fixture subject",
+        body="Safe fixture body",
+        received_at=datetime.now(UTC),
+        raw_content_ref="gmail://fixture/classification-retry",
+        state=EmailState.DRAFT_RETRY_WAIT,
+        last_error_code="EMAIL_CLASSIFICATION_AUTHENTICATION_FAILED",
+    )
+    db_session.add(item)
+    await db_session.flush()
+    job = JobIntent(
+        kind="email.classify",
+        idempotency_key=f"email.classify:{item.id}",
+        payload={
+            "work_item_id": str(item.id),
+            "organization_id": str(organization.id),
+            "knowledge_base_id": str(source.knowledge_base_id),
+        },
+        state=JobState.FAILED,
+        attempts=3,
+        last_error_code="EMAIL_CLASSIFICATION_AUTHENTICATION_FAILED",
+        error_class=ErrorClass.NON_RETRYABLE,
+    )
+    db_session.add_all(
+        (
+            job,
+            ResourceGrant(
+                organization_id=organization.id,
+                subject_id=admin.id,
+                resource_type="knowledge",
+                resource_id=source.knowledge_base_id,
+                actions=["knowledge.review"],
+            ),
+        )
+    )
+    await db_session.commit()
+    job_id = job.id
+    item_id = item.id
+
+    async with operations_context["client_for"](operations_context["foreign_admin"]) as client:
+        hidden = await client.post(
+            f"/api/v1/admin/jobs/{job_id}/retry",
+            headers={"Idempotency-Key": "foreign-classification-retry"},
+        )
+    assert hidden.status_code == 404
+    await db_session.refresh(admin)
+    await db_session.refresh(operations_context["session"])
+
+    async with operations_context["client_for"](admin) as client:
+        listed = await client.get("/api/v1/admin/jobs/failed")
+        retried = await client.post(
+            f"/api/v1/admin/jobs/{job_id}/retry",
+            headers={"Idempotency-Key": "classification-retry"},
+        )
+
+    visible = next(entry for entry in listed.json() if entry["job_id"] == str(job_id))
+    assert visible["action"] == "RETRY_EMAIL_CLASSIFICATION"
+    assert retried.status_code == 202
+    assert retried.json()["job_id"] == str(job_id)
+    assert retried.json()["state"] == "PENDING"
+    db_session.expire_all()
+    persisted = await db_session.get(JobIntent, job_id)
+    persisted_item = await db_session.get(EmailWorkItem, item_id)
+    assert persisted is not None
+    assert persisted_item is not None
+    assert persisted.state is JobState.PENDING
+    assert persisted.attempts == 0
+    assert persisted.last_error_code is None
+    assert persisted.error_class is None
+    assert persisted_item.state is EmailState.DRAFT_RETRY_WAIT
+    assert persisted_item.last_error_code is None
+    assert await db_session.scalar(
+        select(AuditEvent.id).where(
+            AuditEvent.action == "email.classification.retry",
+            AuditEvent.object_id == job_id,
+        )
+    )
+    assert await db_session.scalar(
+        select(OutboxEvent.event_id).where(
+            OutboxEvent.event_type == "email.classify.requested",
+            OutboxEvent.aggregate_id == job_id,
+        )
+    )
+
+
+@pytest.mark.asyncio
 async def test_manual_sync_records_audit_and_durable_dispatch_intent(
     db_session, operations_context
 ) -> None:  # type: ignore[no-untyped-def]

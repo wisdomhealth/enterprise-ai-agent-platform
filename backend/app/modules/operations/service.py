@@ -113,6 +113,16 @@ class OperationsService:
         reviewable_knowledge_base_ids = await self._granted_resource_ids(
             principal, "knowledge", action="knowledge.review"
         )
+        reviewable_work_item_ids = set(
+            (
+                await self._db_session.scalars(
+                    select(EmailWorkItem.id).where(
+                        EmailWorkItem.organization_id == principal.organization_id,
+                        EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                    )
+                )
+            ).all()
+        )
         delivery_job_ids = set(
             (
                 await self._db_session.scalars(
@@ -134,6 +144,10 @@ class OperationsService:
                 and str(job.payload.get("source_id")) in source_ids
             )
             or job.id in delivery_job_ids
+            or (
+                job.kind == "email.classify"
+                and self._payload_uuid(job, "work_item_id") in reviewable_work_item_ids
+            )
         ]
         email_retry_wait = int(
             await self._db_session.scalar(
@@ -245,6 +259,17 @@ class OperationsService:
             ).all()
         )
         delivery_by_job = {intent.job_id: intent for intent in delivery_intents}
+        reviewable_items = list(
+            (
+                await self._db_session.scalars(
+                    select(EmailWorkItem).where(
+                        EmailWorkItem.organization_id == principal.organization_id,
+                        EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                    )
+                )
+            ).all()
+        )
+        reviewable_items_by_id = {item.id: item for item in reviewable_items}
         jobs = list(
             (
                 await self._db_session.scalars(
@@ -281,6 +306,14 @@ class OperationsService:
                     action = JobAction.RETRY_EMAIL_DELIVERY
                 else:
                     continue
+            elif (
+                job.kind == "email.classify"
+                and job.state is JobState.FAILED
+                and (work_item_id := self._payload_uuid(job, "work_item_id"))
+                in reviewable_items_by_id
+            ):
+                action = JobAction.RETRY_EMAIL_CLASSIFICATION
+                action_resource_id = work_item_id
             else:
                 continue
             results.append(
@@ -350,7 +383,80 @@ class OperationsService:
                     detail={"code": "JOB_NOT_RETRYABLE"},
                 ) from None
             return JobRetryRead(job_id=job.id, state=result.state.value, version=result.version)
+        if job.kind == "email.classify":
+            return await self._retry_email_classification(principal, job_id)
         raise OperationsNotFound(job_id)
+
+    async def _retry_email_classification(
+        self, principal: Principal, job_id: UUID
+    ) -> JobRetryRead:
+        job = await self._db_session.scalar(
+            select(JobIntent).where(JobIntent.id == job_id).with_for_update()
+        )
+        if job is None or job.kind != "email.classify":
+            raise OperationsNotFound(job_id)
+        work_item_id = self._payload_uuid(job, "work_item_id")
+        reviewable_ids = await self._granted_resource_ids(
+            principal, "knowledge", action="knowledge.review"
+        )
+        item = await self._db_session.scalar(
+            select(EmailWorkItem)
+            .where(
+                EmailWorkItem.id == work_item_id,
+                EmailWorkItem.organization_id == principal.organization_id,
+                EmailWorkItem.knowledge_base_id.in_(reviewable_ids),
+            )
+            .with_for_update()
+        )
+        if item is None:
+            raise OperationsNotFound(job_id)
+        if (
+            job.state is not JobState.FAILED
+            or item.category is not None
+            or item.state not in {EmailState.INGESTED, EmailState.DRAFT_RETRY_WAIT}
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "JOB_NOT_RETRYABLE"},
+            )
+        previous_attempts = job.attempts
+        previous_error_code = self._safe_error_code(job.last_error_code)
+        job.state = JobState.PENDING
+        job.attempts = 0
+        job.next_attempt_at = None
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.last_error_code = None
+        job.error_class = None
+        job.version += 1
+        item.last_error_code = None
+        details = {
+            "work_item_id": str(item.id),
+            "previous_attempts": previous_attempts,
+            "previous_error_code": previous_error_code,
+        }
+        await self._audit.record(
+            self._db_session,
+            principal,
+            action="email.classification.retry",
+            object_type="job",
+            object_id=job.id,
+            outcome="SUCCESS",
+            details=details,
+            safe_detail_keys=set(details),
+        )
+        await self._outbox.add(
+            self._db_session,
+            "email.classify.requested",
+            "job",
+            job.id,
+            {
+                "work_item_id": str(item.id),
+                "organization_id": str(item.organization_id),
+            },
+        )
+        await self._db_session.flush()
+        return JobRetryRead(job_id=job.id, state=job.state.value, version=job.version)
 
     async def begin_connector_reauthorization(
         self, principal: Principal, connector_id: UUID

@@ -39,7 +39,18 @@ Do not capture prompts, answers, email bodies, OAuth tokens, headers or secrets.
 | `DRIVE_SYNC_TRANSIENT_FAILURE` | Check connector health and durable cursor, then retry through the supported action. |
 | `EMAIL_APPROVAL_INVALID` | Obtain a current review/approval; never send an invalidated draft. |
 | `EMAIL_APPROVAL_INVALIDATED` | Review the new draft version and approve again if appropriate. |
-| `EMAIL_CLASSIFICATION_FAILED` | Check provider safe errors and retry only the durable item. |
+| `EMAIL_CLASSIFICATION_AUTHENTICATION_FAILED` | Correct the configured API key, then retry the same failed job through the administrator endpoint. |
+| `EMAIL_CLASSIFICATION_CONFIGURATION_INVALID` | Correct the classifier deployment configuration before an authorized manual retry. |
+| `EMAIL_CLASSIFICATION_CONNECTION_FAILED` | Let the bounded durable retry run; check provider/network health if attempts are exhausted. |
+| `EMAIL_CLASSIFICATION_INSUFFICIENT_QUOTA` | Restore approved billing or quota, then retry the same failed job through the administrator endpoint. |
+| `EMAIL_CLASSIFICATION_INVALID_REQUEST` | Correct the approved model/request configuration; do not automatically retry. |
+| `EMAIL_CLASSIFICATION_INVALID_RESPONSE` | Let the bounded durable retry run; investigate structured-output compatibility if exhausted. |
+| `EMAIL_CLASSIFICATION_MODEL_ACCESS_DENIED` | Grant the deployment access to the configured model or select an approved model, then retry manually. |
+| `EMAIL_CLASSIFICATION_RATE_LIMITED` | Let the same job honor bounded `Retry-After` and exponential backoff. |
+| `EMAIL_CLASSIFICATION_SERVER_ERROR` | Let the bounded durable retry run and check provider status if attempts are exhausted. |
+| `EMAIL_CLASSIFICATION_SUPERSEDED` | No action for the duplicate; recover only the oldest authoritative failed classification job. |
+| `EMAIL_CLASSIFICATION_TIMEOUT` | Let the bounded durable retry run; check provider/network latency if attempts are exhausted. |
+| `EMAIL_CLASSIFICATION_UNCLASSIFIED_FAILURE` | Treat as terminal, inspect safe telemetry, and classify the cause before an authorized manual retry. |
 | `EMAIL_DRAFT_FAILED` | Inspect authorized source/citation availability and retry under review policy. |
 | `EMAIL_DRAFT_GROUNDED_ANSWER_UNAVAILABLE` | Restore grounded evidence; do not substitute unsupported text. |
 | `EMAIL_DRAFT_PRINCIPAL_SCOPE_MISMATCH` | Correct staff/resource authorization; do not broaden access. |

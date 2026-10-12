@@ -73,12 +73,14 @@ async def test_draft_contains_only_authorized_staff_citations(
 ) -> None:
     connector = email_context["connector"]
     knowledge_base = email_context["knowledge_base"]
-    item = await EmailIngestionService(db_session, classifier=FixedClassifier()).ingest_message(
+    ingestion = EmailIngestionService(db_session, classifier=FixedClassifier())
+    item = await ingestion.ingest_message(
         email_context["message"],
         organization_id=connector.organization_id,
         connector_id=connector.id,
         knowledge_base_id=knowledge_base.id,
     )
+    await ingestion.process_classification(item.id)
     chunk_id = uuid4()
     version_id = uuid4()
     citation = SourceCitation(
@@ -169,12 +171,14 @@ async def test_draft_rejects_cross_organization_retrieval_evidence(
 ) -> None:
     connector = email_context["connector"]
     knowledge_base = email_context["knowledge_base"]
-    item = await EmailIngestionService(db_session, classifier=FixedClassifier()).ingest_message(
+    ingestion = EmailIngestionService(db_session, classifier=FixedClassifier())
+    item = await ingestion.ingest_message(
         email_context["message"],
         organization_id=connector.organization_id,
         connector_id=connector.id,
         knowledge_base_id=knowledge_base.id,
     )
+    await ingestion.process_classification(item.id)
     chunk_id = uuid4()
     version_id = uuid4()
     answer = ValidatedAnswer(
@@ -237,12 +241,14 @@ async def test_draft_persistence_failure_rolls_back_instead_of_becoming_model_fa
 ) -> None:
     connector = email_context["connector"]
     knowledge_base = email_context["knowledge_base"]
-    item = await EmailIngestionService(db_session, classifier=FixedClassifier()).ingest_message(
+    ingestion = EmailIngestionService(db_session, classifier=FixedClassifier())
+    item = await ingestion.ingest_message(
         email_context["message"],
         organization_id=connector.organization_id,
         connector_id=connector.id,
         knowledge_base_id=knowledge_base.id,
     )
+    await ingestion.process_classification(item.id)
     await db_session.commit()
     chunk_id = uuid4()
     version_id = uuid4()

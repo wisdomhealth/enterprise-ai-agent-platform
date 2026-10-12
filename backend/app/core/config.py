@@ -144,6 +144,24 @@ class Settings(BaseSettings):
         le=3,
         validation_alias="RAG_MAX_GENERATION_ATTEMPTS",
     )
+    email_classification_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        validation_alias="EMAIL_CLASSIFICATION_MAX_ATTEMPTS",
+    )
+    email_classification_retry_base_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=3600,
+        validation_alias="EMAIL_CLASSIFICATION_RETRY_BASE_SECONDS",
+    )
+    email_classification_retry_max_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=86400,
+        validation_alias="EMAIL_CLASSIFICATION_RETRY_MAX_SECONDS",
+    )
     openai_input_cost_per_million: float = Field(
         default=0.0,
         ge=0,

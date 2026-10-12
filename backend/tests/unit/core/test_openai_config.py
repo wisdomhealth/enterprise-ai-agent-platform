@@ -17,6 +17,9 @@ def test_openai_models_costs_and_budgets_have_stable_defaults() -> None:
     assert settings.openai_request_timeout_seconds == 30.0
     assert settings.rag_execution_timeout_seconds == 60.0
     assert settings.rag_max_generation_attempts == 2
+    assert settings.email_classification_max_attempts == 3
+    assert settings.email_classification_retry_base_seconds == 5
+    assert settings.email_classification_retry_max_seconds == 300
     assert settings.openai_input_cost_per_million >= 0
     assert settings.openai_output_cost_per_million >= 0
 
