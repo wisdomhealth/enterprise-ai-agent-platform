@@ -199,6 +199,7 @@ async def test_graph_stops_after_transient_retry_exhaustion() -> None:
 
     assert execution.answer.refused is True
     assert provider.calls == 2
+    assert execution.outcome == "provider_transient_error"
 
 
 @pytest.mark.asyncio

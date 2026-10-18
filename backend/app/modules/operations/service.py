@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.modules.audit.models import AuditEvent
 from app.modules.audit.service import AuditService
 from app.modules.authorization.models import ResourceGrant
@@ -330,7 +331,14 @@ class OperationsService:
             )
         return results
 
-    async def retry_job(self, principal: Principal, job_id: UUID) -> JobRetryRead:
+    async def retry_job(
+        self,
+        principal: Principal,
+        job_id: UUID,
+        *,
+        reason: str | None = None,
+        expected_version: int | None = None,
+    ) -> JobRetryRead:
         self.require_admin(principal)
         job = await self._db_session.get(JobIntent, job_id)
         if job is None:
@@ -385,7 +393,95 @@ class OperationsService:
             return JobRetryRead(job_id=job.id, state=result.state.value, version=result.version)
         if job.kind == "email.classify":
             return await self._retry_email_classification(principal, job_id)
+        if job.kind == "email.draft":
+            return await self._retry_email_draft(
+                principal,
+                job_id,
+                reason=reason,
+                expected_version=expected_version,
+            )
         raise OperationsNotFound(job_id)
+
+    async def _retry_email_draft(
+        self,
+        principal: Principal,
+        job_id: UUID,
+        *,
+        reason: str | None,
+        expected_version: int | None,
+    ) -> JobRetryRead:
+        if reason is None or not reason.strip() or expected_version is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "DRAFT_RETRY_REASON_AND_VERSION_REQUIRED"},
+            )
+        job = await self._db_session.scalar(
+            select(JobIntent).where(JobIntent.id == job_id).with_for_update()
+        )
+        if job is None or job.kind != "email.draft":
+            raise OperationsNotFound(job_id)
+        if job.version != expected_version or job.state is not JobState.FAILED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "JOB_NOT_RETRYABLE"},
+            )
+        item = await self._db_session.scalar(
+            select(EmailWorkItem)
+            .where(
+                EmailWorkItem.id == self._payload_uuid(job, "work_item_id"),
+                EmailWorkItem.organization_id == principal.organization_id,
+            )
+            .with_for_update()
+        )
+        if item is None or item.state is not EmailState.DRAFT_RETRY_WAIT:
+            raise OperationsNotFound(job_id)
+        reviewable_ids = await self._granted_resource_ids(
+            principal, "knowledge", action="knowledge.review"
+        )
+        if item.knowledge_base_id not in reviewable_ids:
+            raise OperationsNotFound(job_id)
+        job.attempt_cycle = (job.attempt_cycle or 1) + 1
+        job.cycle_start_attempts = job.attempts
+        job.cycle_attempt_limit = Settings().email_draft_max_attempts
+        job.state = JobState.PENDING
+        job.next_attempt_at = None
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.last_error_code = None
+        job.error_class = None
+        job.version += 1
+        item.active_draft_job_id = job.id
+        await self._outbox.add(
+            self._db_session,
+            "email.draft.requested",
+            "job",
+            job.id,
+            {
+                "job_id": str(job.id),
+                "work_item_id": str(item.id),
+                "organization_id": str(item.organization_id),
+                "attempt_cycle": job.attempt_cycle,
+            },
+        )
+        details = {
+            "work_item_id": str(item.id),
+            "reason": reason.strip(),
+            "attempt_cycle": job.attempt_cycle,
+            "cycle_start_attempts": job.cycle_start_attempts,
+            "cycle_attempt_limit": job.cycle_attempt_limit,
+        }
+        await self._audit.record(
+            self._db_session,
+            principal,
+            action="email.draft.retry_cycle.start",
+            object_type="job",
+            object_id=job.id,
+            outcome="SUCCESS",
+            details=details,
+            safe_detail_keys=set(details),
+        )
+        await self._db_session.flush()
+        return JobRetryRead(job_id=job.id, state=job.state.value, version=job.version)
 
     async def _retry_email_classification(
         self, principal: Principal, job_id: UUID

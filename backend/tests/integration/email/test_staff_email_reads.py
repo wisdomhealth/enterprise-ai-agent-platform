@@ -310,6 +310,7 @@ async def test_email_reads_enforce_reviewer_role_and_resource_grant(
     principal = email_review_context["principal"]
     grant = await db_session.scalar(
         select(ResourceGrant).where(ResourceGrant.subject_id == principal.subject_id)
+        .where(ResourceGrant.resource_type == "knowledge")
     )
     assert grant is not None
     await db_session.delete(grant)

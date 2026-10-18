@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.audit.models import AuditEvent
 from app.modules.email.actors import email_worker_principal
 from app.modules.email.classification import ClassificationExecution
-from app.modules.email.drafting import EmailDraftingService
+from app.modules.email.drafting import EmailDraftFailure, EmailDraftingService
 from app.modules.email.ingestion import EmailIngestionService
 from app.modules.email.models import (
     EmailCategory,
@@ -129,6 +129,8 @@ async def test_draft_contains_only_authorized_staff_citations(
         f"draft-provenance-{uuid4()}",
         {"work_item_id": str(item.id)},
     )
+    item.active_draft_job_id = job.id
+    await db_session.flush()
     principal = email_worker_principal(item.organization_id, item.knowledge_base_id, job.id)
 
     draft = await EmailDraftingService(db_session, grounded, principal).generate(
@@ -224,15 +226,16 @@ async def test_draft_rejects_cross_organization_retrieval_evidence(
         "x",
     )
 
-    draft = await EmailDraftingService(
-        db_session,
-        FakeGroundedAnswerService(AnswerExecution(answer, [other_chunk], 0, 0)),
-        principal,
-    ).generate(item.id)
+    with pytest.raises(EmailDraftFailure, match="EMAIL_DRAFT_UNAUTHORIZED_CITATION"):
+        await EmailDraftingService(
+            db_session,
+            FakeGroundedAnswerService(AnswerExecution(answer, [other_chunk], 0, 0)),
+            principal,
+        ).generate(item.id)
 
-    assert draft.state is EmailState.DRAFT_RETRY_WAIT
-    assert draft.error_code == "EMAIL_DRAFT_UNAUTHORIZED_CITATION"
-    assert draft.body is None
+    assert item.state is EmailState.DRAFT_RETRY_WAIT
+    assert item.last_error_code == "EMAIL_DRAFT_UNAUTHORIZED_CITATION"
+    assert item.draft_body is None
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,8 @@
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import getaddresses
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -21,7 +21,9 @@ from app.modules.email.gmail_gateway import (
     GmailAuthorizationError,
     GmailGateway,
     GmailGatewayFactory,
+    GmailHistoryCursorExpired,
     GmailMessage,
+    GmailPageTokenInvalid,
 )
 from app.modules.email.models import (
     EmailAction,
@@ -30,6 +32,7 @@ from app.modules.email.models import (
     EmailStateHistory,
     EmailSyncState,
     EmailWorkItem,
+    GmailSyncStatus,
 )
 from app.modules.email.state_machine import transition
 from app.modules.jobs.models import JobIntent
@@ -58,6 +61,9 @@ class EmailIngestionService:
         job_service: JobService | None = None,
         outbox_service: OutboxService | None = None,
         classification_retry_after_cap_seconds: int = 300,
+        draft_max_attempts: int = 3,
+        recovery_lookback_days: int = 7,
+        recovery_max_messages: int = 500,
     ) -> None:
         self._db_session = db_session
         self._classifier = classifier
@@ -67,6 +73,9 @@ class EmailIngestionService:
         self._job_service = job_service or JobService()
         self._outbox_service = outbox_service or OutboxService()
         self._classification_retry_after_cap_seconds = classification_retry_after_cap_seconds
+        self._draft_max_attempts = draft_max_attempts
+        self._recovery_lookback_days = recovery_lookback_days
+        self._recovery_max_messages = recovery_max_messages
 
     async def ingest_message(
         self,
@@ -136,8 +145,128 @@ class EmailIngestionService:
         sync_state = await self._sync_state(connector)
         gateway = await self._resolve_gateway(connector)
         try:
-            page = await gateway.list_history(sync_state.history_id, sync_state.pending_page_token)
+            if sync_state.processed_history_id is None:
+                return await self._initialize_history(
+                    connector,
+                    sync_state,
+                    gateway,
+                    knowledge_base_id,
+                    job_id=job_id,
+                )
+            page_token = sync_state.pending_page_token
+            start_history_id = (
+                sync_state.sync_start_history_id
+                if page_token is not None and sync_state.sync_start_history_id is not None
+                else sync_state.processed_history_id
+            )
+            if page_token is None:
+                sync_state.sync_start_history_id = start_history_id
+                sync_state.page_token_generation = sync_state.sync_generation
             ingested = 0
+            while True:
+                try:
+                    page = await gateway.list_history(start_history_id, page_token)
+                except GmailPageTokenInvalid:
+                    sync_state.pending_page_token = None
+                    page_token = None
+                    await self._db_session.commit()
+                    continue
+                except GmailHistoryCursorExpired:
+                    sync_state.processed_history_id = None
+                    sync_state.pending_page_token = None
+                    sync_state.sync_start_history_id = None
+                    sync_state.page_token_generation = None
+                    sync_state.sync_status = GmailSyncStatus.RECOVERY_REQUIRED
+                    await self._db_session.commit()
+                    return await self._initialize_history(
+                        connector,
+                        sync_state,
+                        gateway,
+                        knowledge_base_id,
+                        job_id=job_id,
+                    )
+                for message_id in page.message_ids:
+                    message = await gateway.get_message(message_id)
+                    before = await self._db_session.scalar(
+                        select(EmailWorkItem.id).where(
+                            EmailWorkItem.organization_id == connector.organization_id,
+                            EmailWorkItem.gmail_message_id == message.id,
+                        )
+                    )
+                    await self.ingest_message(
+                        message,
+                        organization_id=connector.organization_id,
+                        connector_id=connector.id,
+                        knowledge_base_id=knowledge_base_id,
+                        job_id=job_id,
+                    )
+                    ingested += int(before is None)
+                sync_state.pending_page_token = page.next_page_token
+                if page.next_page_token is None:
+                    sync_state.processed_history_id = page.history_id
+                    sync_state.sync_start_history_id = None
+                    sync_state.page_token_generation = None
+                await self._db_session.commit()
+                if page.next_page_token is None:
+                    break
+                page_token = page.next_page_token
+            sync_state.last_error_code = None
+            sync_state.last_success_at = datetime.now(UTC)
+            if commit:
+                await self._db_session.commit()
+            else:
+                await self._db_session.flush()
+            return EmailIngestionResult(
+                connector.id,
+                sync_state.processed_history_id,
+                ingested,
+                sync_state.pending_page_token,
+            )
+        except GmailAuthorizationError:
+            await self._db_session.rollback()
+            return await self._mark_reauth_required(connector_id, commit=commit)
+        except Exception:
+            await self._db_session.rollback()
+            raise
+
+    async def _initialize_history(
+        self,
+        connector: Connector,
+        sync_state: EmailSyncState,
+        gateway: GmailGateway,
+        knowledge_base_id: UUID,
+        *,
+        job_id: UUID | None,
+    ) -> EmailIngestionResult:
+        if sync_state.recovery_baseline_history_id is None:
+            profile = await gateway.get_profile()
+            sync_state.recovery_batch_id = uuid4()
+            sync_state.recovery_baseline_history_id = profile.history_id
+            sync_state.recovery_window_started_at = datetime.now(UTC) - timedelta(
+                days=self._recovery_lookback_days
+            )
+            sync_state.recovery_started_at = datetime.now(UTC)
+            sync_state.recovery_processed_count = 0
+            sync_state.recovery_message_limit = self._recovery_max_messages
+            sync_state.recovery_has_more = True
+            sync_state.sync_status = GmailSyncStatus.RECOVERY_RUNNING
+            await self._db_session.commit()
+        ingested = 0
+        while sync_state.recovery_has_more:
+            remaining = (
+                sync_state.recovery_message_limit - sync_state.recovery_processed_count
+            )
+            if remaining <= 0:
+                sync_state.sync_status = GmailSyncStatus.RECOVERY_TRUNCATED
+                await self._db_session.commit()
+                return EmailIngestionResult(
+                    connector.id, None, ingested, sync_state.recovery_page_token
+                )
+            page = await gateway.list_recent_inbox(
+                after=sync_state.recovery_window_started_at,
+                page_token=sync_state.recovery_page_token,
+                max_results=min(100, remaining),
+            )
             for message_id in page.message_ids:
                 message = await gateway.get_message(message_id)
                 before = await self._db_session.scalar(
@@ -154,27 +283,54 @@ class EmailIngestionService:
                     job_id=job_id,
                 )
                 ingested += int(before is None)
-            sync_state.pending_page_token = page.next_page_token
-            if sync_state.history_id is None or page.next_page_token is None:
-                sync_state.history_id = page.history_id
-            sync_state.last_error_code = None
-            sync_state.last_success_at = datetime.now(UTC)
-            if commit:
-                await self._db_session.commit()
-            else:
-                await self._db_session.flush()
-            return EmailIngestionResult(
-                connector.id,
-                sync_state.history_id,
-                ingested,
-                sync_state.pending_page_token,
-            )
-        except GmailAuthorizationError:
-            await self._db_session.rollback()
-            return await self._mark_reauth_required(connector_id, commit=commit)
-        except Exception:
-            await self._db_session.rollback()
-            raise
+            sync_state.recovery_processed_count += len(page.message_ids)
+            sync_state.recovery_page_token = page.next_page_token
+            sync_state.recovery_has_more = page.next_page_token is not None
+            await self._db_session.commit()
+        baseline = sync_state.recovery_baseline_history_id
+        page_token = None
+        final_history_id = baseline
+        while True:
+            page = await gateway.list_history(baseline, page_token)
+            for message_id in page.message_ids:
+                message = await gateway.get_message(message_id)
+                before = await self._db_session.scalar(
+                    select(EmailWorkItem.id).where(
+                        EmailWorkItem.organization_id == connector.organization_id,
+                        EmailWorkItem.gmail_message_id == message.id,
+                    )
+                )
+                await self.ingest_message(
+                    message,
+                    organization_id=connector.organization_id,
+                    connector_id=connector.id,
+                    knowledge_base_id=knowledge_base_id,
+                    job_id=job_id,
+                )
+                ingested += int(before is None)
+            final_history_id = page.history_id
+            page_token = page.next_page_token
+            await self._db_session.commit()
+            if page_token is None:
+                break
+        sync_state.processed_history_id = final_history_id
+        if (
+            sync_state.pending_history_id is not None
+            and int(sync_state.pending_history_id) <= int(final_history_id)
+        ):
+            sync_state.pending_history_id = None
+        sync_state.recovery_batch_id = None
+        sync_state.recovery_baseline_history_id = None
+        sync_state.recovery_window_started_at = None
+        sync_state.recovery_page_token = None
+        sync_state.recovery_processed_count = 0
+        sync_state.recovery_message_limit = 0
+        sync_state.recovery_has_more = False
+        sync_state.recovery_started_at = None
+        sync_state.sync_status = GmailSyncStatus.IDLE
+        sync_state.last_success_at = datetime.now(UTC)
+        await self._db_session.commit()
+        return EmailIngestionResult(connector.id, final_history_id, ingested, None)
 
     async def process_classification(
         self, work_item_id: UUID, *, job_id: UUID | None = None
@@ -297,6 +453,11 @@ class EmailIngestionService:
             else f"{kind}:{item.id}:v{item.version}",
             payload,
         )
+        if kind == "email.draft":
+            job.attempt_cycle = 1
+            job.cycle_start_attempts = job.attempts
+            job.cycle_attempt_limit = self._draft_max_attempts
+            item.active_draft_job_id = job.id
         await self._outbox_service.add(
             self._db_session,
             f"{kind}.requested",
@@ -388,7 +549,7 @@ class EmailIngestionService:
             await self._db_session.flush()
         return EmailIngestionResult(
             connector.id,
-            sync_state.history_id,
+            sync_state.processed_history_id,
             0,
             sync_state.pending_page_token,
             reauth_required=True,

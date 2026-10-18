@@ -17,8 +17,11 @@ gateway responses.
 
 ## Durable ingestion flow
 
-Celery Beat schedules `app.modules.email.tasks.gmail_history_poll` every 60 seconds. The scheduler
-creates a PostgreSQL `JobIntent` for each active Gmail connector and dispatches the durable job.
+Gmail push notifications create durable history jobs. Celery Beat dispatches committed history
+Outbox events every 60 seconds, renews watches, and runs a configurable low-frequency
+reconciliation safety net. Reconciliation only schedules work when durable state shows an enabled
+mailbox has pending or recoverable work; it is not a periodic Gmail pull and it does not create a
+new job for every connector on each run.
 `dispatch_pending_email_jobs` sweeps pending, due-retry, and expired-lease email jobs every minute,
 so Redis or worker restarts do not lose committed work.
 
@@ -26,7 +29,8 @@ Each Gmail page, its normalized work items, one durable `email.classify` intent 
 Outbox events, and the corresponding history/page cursor are committed together. Classification is
 not performed inside the Gmail history job. A failed page rolls back the entire page and leaves the
 previous cursor resumable. The bootstrap history anchor is retained across all bootstrap pages so
-messages arriving during the initial scan are collected by the next history poll.
+messages arriving during the initial scan are collected by the required incremental catch-up from
+the persisted H0 baseline before the processed cursor is established.
 `(organization_id, gmail_message_id)` prevents duplicate work items.
 
 The stored raw reference is an opaque `gmail://` locator, never raw MIME content or an access token.
@@ -44,6 +48,13 @@ and `SPAM` stay visible as ingested work without an automatic send path. Draft g
 staff RAG audience and persists only organization- and knowledge-base-authorized citations plus
 model, prompt, retrieval, latency, token, and estimated-cost provenance. Successful drafts stop at
 `AWAITING_REVIEW`.
+
+Draft failures keep distinct safe reasons. Missing authorized evidence becomes
+`EMAIL_DRAFT_KNOWLEDGE_INSUFFICIENT` and requires human handling. Citation-validation/safety
+refusal becomes `EMAIL_DRAFT_MODEL_SAFETY_REFUSAL`. Temporary provider, circuit, connection, and
+retrieval failures are retryable within the current finite cycle. Quota exhaustion, invalid model
+configuration, authorization scope failures, and unclassified programming errors are terminal and
+do not receive an unlimited automatic retry path.
 
 The classification worker calls the model without holding an `email_work_items` row lock, then
 locks the row only while persisting the result. A failure moves an `INGESTED` item to
@@ -89,7 +100,7 @@ For a stalled connector:
    error code. Never inspect or copy decrypted tokens.
 3. Confirm Beat and worker processes are running. The pending-job sweep will recover committed jobs
    and expired leases automatically.
-4. Verify `email_sync_states.history_id` and `pending_page_token` only after the complete page and
+4. Verify `email_sync_states.processed_history_id` and `pending_page_token` only after the complete page and
    work-item transaction is present.
 5. Run the focused recovery tests against an isolated PostgreSQL database before any manual repair.
 

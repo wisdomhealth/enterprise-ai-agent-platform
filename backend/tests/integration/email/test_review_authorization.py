@@ -10,7 +10,12 @@ from app.main import create_app
 from app.modules.authorization.models import ResourceGrant
 from app.modules.email.models import EmailApproval, EmailState
 from app.modules.email.review import EmailReviewAuthorizationError, EmailReviewService
-from app.modules.identity.dependencies import Principal, get_db_session, require_staff_csrf
+from app.modules.identity.dependencies import (
+    Principal,
+    get_db_session,
+    require_staff_csrf,
+    require_staff_session,
+)
 from app.modules.identity.models import StaffUser, UserRole, UserStatus
 
 
@@ -108,6 +113,7 @@ async def test_approval_api_requires_idempotency_and_replays_safe_metadata(
 
     application.dependency_overrides[get_db_session] = override_db
     application.dependency_overrides[require_staff_csrf] = override_staff
+    application.dependency_overrides[require_staff_session] = override_staff
     payload = {"expected_version": item.version, "current_draft_id": str(draft.id)}
     try:
         async with httpx.AsyncClient(

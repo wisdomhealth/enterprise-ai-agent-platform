@@ -3,7 +3,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.email.classification import ClassificationExecution
-from app.modules.email.gmail_gateway import GmailHistoryPage, GmailMessage
+from app.modules.email.gmail_gateway import (
+    GmailHistoryPage,
+    GmailMessage,
+    GmailMessagePage,
+    GmailProfile,
+)
 from app.modules.email.ingestion import EmailIngestionService
 from app.modules.email.models import EmailCategory, EmailPriority, EmailState, EmailWorkItem
 from app.modules.email.schemas import EmailClassification
@@ -34,6 +39,15 @@ class FakeGmailGateway:
         self._messages = {message.id: message for message in messages}
         self.list_calls: list[tuple[str | None, str | None]] = []
 
+    async def get_profile(self) -> GmailProfile:
+        return GmailProfile("support@example.test", "101")
+
+    async def list_recent_inbox(
+        self, *, after, page_token: str | None, max_results: int  # type: ignore[no-untyped-def]
+    ) -> GmailMessagePage:
+        del after, page_token, max_results
+        return GmailMessagePage(tuple(self._messages), None)
+
     async def list_history(
         self, start_history_id: str | None, page_token: str | None = None
     ) -> GmailHistoryPage:
@@ -45,17 +59,26 @@ class FakeGmailGateway:
 
 
 class PaginatedBootstrapGateway(FakeGmailGateway):
+    def __init__(self, messages: list[GmailMessage]) -> None:
+        super().__init__(messages)
+        self.recent_calls = 0
+
+    async def list_recent_inbox(
+        self, *, after, page_token: str | None, max_results: int  # type: ignore[no-untyped-def]
+    ) -> GmailMessagePage:
+        del after, max_results
+        self.recent_calls += 1
+        if page_token is None:
+            return GmailMessagePage(tuple(self._messages), "recent-page-2")
+        assert page_token == "recent-page-2"
+        return GmailMessagePage((), None)
+
     async def list_history(
         self, start_history_id: str | None, page_token: str | None = None
     ) -> GmailHistoryPage:
         self.list_calls.append((start_history_id, page_token))
-        if len(self.list_calls) == 1:
-            return GmailHistoryPage(tuple(self._messages), "bootstrap-anchor", "bootstrap:page-2")
-        assert (start_history_id, page_token) == (
-            "bootstrap-anchor",
-            "bootstrap:page-2",
-        )
-        return GmailHistoryPage((), "bootstrap-anchor", None)
+        assert (start_history_id, page_token) == ("101", None)
+        return GmailHistoryPage((), "102", None)
 
 
 async def test_duplicate_gmail_message_creates_one_work_item(
@@ -147,7 +170,7 @@ async def test_history_page_persists_messages_and_cursor_together(
 
     assert result.history_id == "102"
     assert result.ingested == 1
-    assert gateway.list_calls == [(None, None)]
+    assert gateway.list_calls == [("101", None)]
     assert (
         await db_session.scalar(
             select(func.count(EmailWorkItem.id)).where(EmailWorkItem.connector_id == connector.id)
@@ -164,14 +187,9 @@ async def test_bootstrap_anchor_is_committed_with_each_page_for_crash_safe_resum
     gateway = PaginatedBootstrapGateway([email_context["message"]])
     service = EmailIngestionService(db_session, gateway=gateway, classifier=FixedClassifier())
 
-    first = await service.ingest_history(connector.id, knowledge_base.id)
-    second = await service.ingest_history(connector.id, knowledge_base.id)
+    result = await service.ingest_history(connector.id, knowledge_base.id)
 
-    assert first.history_id == "bootstrap-anchor"
-    assert first.next_page_token == "bootstrap:page-2"
-    assert second.history_id == "bootstrap-anchor"
-    assert second.next_page_token is None
-    assert gateway.list_calls == [
-        (None, None),
-        ("bootstrap-anchor", "bootstrap:page-2"),
-    ]
+    assert result.history_id == "102"
+    assert result.next_page_token is None
+    assert gateway.recent_calls == 2
+    assert gateway.list_calls == [("101", None)]

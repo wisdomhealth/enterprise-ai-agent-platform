@@ -12,6 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import async_sessionmaker, engine
 from app.main import create_app
 from app.modules.audit.models import AuditEvent
+from app.modules.authorization.application import (
+    ApplicationCapability,
+    application_access_resource_id,
+)
 from app.modules.authorization.models import ResourceGrant
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffSession, StaffUser, UserRole, UserStatus
@@ -109,6 +113,9 @@ async def _seed_staff_assist(
     user_status: UserStatus = UserStatus.ACTIVE,
     session_expired: bool = False,
     session_revoked: bool = False,
+    application_capabilities: tuple[ApplicationCapability, ...] = (
+        ApplicationCapability.EMAIL,
+    ),
 ) -> StaffAssistFixture:
     organization = Organization(name=f"staff-assist {uuid4()}")
     db_session.add(organization)
@@ -184,7 +191,19 @@ async def _seed_staff_assist(
                 subject_id=user.id,
                 resource_type="knowledge",
                 resource_id=knowledge_base.id,
-                actions=["knowledge.read"],
+                actions=["knowledge.review"],
+            )
+        )
+    for capability in application_capabilities:
+        db_session.add(
+            ResourceGrant(
+                organization_id=organization.id,
+                subject_id=user.id,
+                resource_type="application",
+                resource_id=application_access_resource_id(
+                    organization.id, capability
+                ),
+                actions=["application.access"],
             )
         )
     await db_session.flush()
@@ -301,12 +320,26 @@ async def _mutable_domain_snapshot(fixture: StaffAssistFixture) -> dict[str, obj
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", list(UserRole))
+@pytest.mark.parametrize("role", [UserRole.ADMIN, UserRole.REVIEWER])
+@pytest.mark.parametrize(
+    "application_capabilities",
+    [
+        (ApplicationCapability.EMAIL,),
+        (ApplicationCapability.SUPPORT,),
+        (ApplicationCapability.EMAIL, ApplicationCapability.SUPPORT),
+    ],
+)
 async def test_staff_assist_uses_real_hybrid_retrieval_for_every_spec_allowed_role(
     role: UserRole,
+    application_capabilities: tuple[ApplicationCapability, ...],
 ) -> None:
     async with async_sessionmaker() as db_session:
-        fixture = await _seed_staff_assist(db_session, grant_read=True, role=role)
+        fixture = await _seed_staff_assist(
+            db_session,
+            grant_read=True,
+            role=role,
+            application_capabilities=application_capabilities,
+        )
         await db_session.commit()
 
     provider = ContextClaimProvider()
@@ -377,7 +410,9 @@ async def test_staff_assist_grounded_and_authorization_failures_refuse_without_s
         assert response.json()["citations"] == []
         assert "Refunds take one hour." not in response.text
         assert await _outbox_count() == before
-        assert provider.calls == int(version_state is DocumentVersionState.RETRIEVABLE)
+        assert provider.calls == (
+            2 if version_state is DocumentVersionState.RETRIEVABLE else 0
+        )
         assert retriever.calls == 1
     finally:
         await _delete_organization(fixture.organization_id)
@@ -387,7 +422,11 @@ async def test_staff_assist_grounded_and_authorization_failures_refuse_without_s
 @pytest.mark.asyncio
 async def test_staff_assist_denies_missing_application_authorization_before_retrieval() -> None:
     async with async_sessionmaker() as db_session:
-        fixture = await _seed_staff_assist(db_session, grant_read=False)
+        fixture = await _seed_staff_assist(
+            db_session,
+            grant_read=True,
+            application_capabilities=(),
+        )
         await db_session.commit()
 
     provider = ContextClaimProvider()
@@ -408,6 +447,40 @@ async def test_staff_assist_denies_missing_application_authorization_before_retr
         assert provider.calls == 0
         assert retriever.calls == 0
         assert await _outbox_count() == before
+    finally:
+        await _delete_organization(fixture.organization_id)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [UserRole.REVIEWER, UserRole.MEMBER])
+async def test_staff_assist_denies_missing_review_capability_or_role(
+    role: UserRole,
+) -> None:
+    async with async_sessionmaker() as db_session:
+        fixture = await _seed_staff_assist(
+            db_session,
+            grant_read=role is UserRole.MEMBER,
+            role=role,
+        )
+        await db_session.commit()
+
+    provider = ContextClaimProvider()
+    app, retriever = _staff_app(provider)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="https://testserver",
+            cookies={"staff_session": fixture.cookie},
+        ) as client:
+            response = await client.post(
+                "/api/v1/staff/knowledge/search",
+                json={"question": "refund"},
+            )
+
+        assert response.status_code == 403
+        assert provider.calls == 0
+        assert retriever.calls == 0
     finally:
         await _delete_organization(fixture.organization_id)
         await engine.dispose()

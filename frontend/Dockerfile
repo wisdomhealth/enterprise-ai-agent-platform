@@ -13,6 +13,8 @@ COPY *.config.* next-env.d.ts test-setup.ts tsconfig.json ./
 CMD ["npm", "test", "--", "--run"]
 
 FROM deps AS builder
+ARG NEXT_PUBLIC_LIVENESS_URL=http://localhost/health/live
+ENV NEXT_PUBLIC_LIVENESS_URL=${NEXT_PUBLIC_LIVENESS_URL}
 COPY app ./app
 COPY components ./components
 COPY lib ./lib

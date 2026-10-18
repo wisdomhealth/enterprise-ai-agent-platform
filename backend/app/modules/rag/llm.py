@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, cast
 
+import openai
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.openai import (
@@ -30,6 +31,12 @@ class ProviderResponseError(RuntimeError):
     def __init__(self, message: str, *, usage: ModelUsage | None = None) -> None:
         super().__init__(message)
         self.usage = usage or ModelUsage(input_tokens=0, output_tokens=0, complete=False)
+
+
+class ProviderDefinitiveError(RuntimeError):
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+        super().__init__(outcome)
 
 
 class GeneratedAnswer(BaseModel):
@@ -95,7 +102,7 @@ class OpenAIGenerationProvider:
         except Exception as error:
             if _is_transient_provider_error(error):
                 raise ProviderTransientError("OpenAI temporarily unavailable") from error
-            raise
+            raise ProviderDefinitiveError(_definitive_provider_outcome(error)) from error
         return GeneratedAnswer(
             text=result.value.text,
             claims=result.value.claims,
@@ -107,6 +114,8 @@ class OpenAIGenerationProvider:
 
 
 def _is_transient_provider_error(error: Exception) -> bool:
+    if isinstance(error, openai.RateLimitError) and _is_insufficient_quota(error):
+        return False
     status_code = getattr(error, "status_code", None)
     return isinstance(error, (TimeoutError, ConnectionError)) or status_code in {
         408,
@@ -116,6 +125,33 @@ def _is_transient_provider_error(error: Exception) -> bool:
         503,
         504,
     }
+
+
+def _definitive_provider_outcome(error: Exception) -> str:
+    if isinstance(error, openai.RateLimitError) and _is_insufficient_quota(error):
+        return "provider_quota_error"
+    if isinstance(
+        error,
+        (
+            openai.AuthenticationError,
+            openai.PermissionDeniedError,
+            openai.NotFoundError,
+        ),
+    ):
+        return "provider_configuration_error"
+    if isinstance(error, (openai.BadRequestError, openai.UnprocessableEntityError)):
+        return "provider_request_error"
+    return "provider_definitive_error"
+
+
+def _is_insufficient_quota(error: openai.RateLimitError) -> bool:
+    body = error.body
+    if not isinstance(body, dict):
+        return False
+    detail = body.get("error")
+    if not isinstance(detail, dict):
+        return False
+    return detail.get("code") == "insufficient_quota" or detail.get("type") == "insufficient_quota"
 
 
 class CircuitStore(Protocol):

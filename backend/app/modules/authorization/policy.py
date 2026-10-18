@@ -19,6 +19,7 @@ ROLE_ACTIONS: Final = MappingProxyType(
     {
         UserRole.ADMIN: frozenset(
             {
+                "application.access",
                 "connector.create",
                 "connector.reauthorize",
                 "connector.revoke",
@@ -33,13 +34,16 @@ ROLE_ACTIONS: Final = MappingProxyType(
                 "webhook.write",
             }
         ),
-        UserRole.REVIEWER: frozenset({"knowledge.read", "knowledge.review"}),
+        UserRole.REVIEWER: frozenset(
+            {"application.access", "knowledge.read", "knowledge.review"}
+        ),
         UserRole.MEMBER: frozenset({"knowledge.read", "knowledge.write"}),
     }
 )
 
 ACTION_STATES: Final = MappingProxyType(
     {
+        "application.access": frozenset({ResourceState.ACTIVE}),
         "connector.create": frozenset({ResourceState.ACTIVE}),
         "connector.reauthorize": frozenset({ResourceState.REAUTH_REQUIRED, ResourceState.ERROR}),
         "connector.revoke": frozenset({ResourceState.ACTIVE}),

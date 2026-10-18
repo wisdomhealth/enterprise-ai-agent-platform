@@ -21,6 +21,18 @@ class GmailAuthorizationError(RuntimeError):
     """The credential is revoked or does not grant the approved Gmail scopes."""
 
 
+class GmailPageTokenInvalid(RuntimeError):
+    """The current page token is invalid, but its start history cursor may be retried."""
+
+
+class GmailHistoryCursorExpired(RuntimeError):
+    """The requested startHistoryId is no longer available from Gmail."""
+
+
+class GmailTransientError(RuntimeError):
+    """A bounded-retry Gmail dependency failure."""
+
+
 class GmailDefinitiveDeliveryError(RuntimeError):
     def __init__(self, error_code: str) -> None:
         super().__init__(error_code)
@@ -54,6 +66,24 @@ class GmailHistoryPage:
 
 
 @dataclass(frozen=True, slots=True)
+class GmailMessagePage:
+    message_ids: tuple[str, ...]
+    next_page_token: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GmailProfile:
+    email_address: str
+    history_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class GmailWatchResult:
+    history_id: str
+    expiration: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class GmailSendResult:
     gmail_message_id: str
     gmail_thread_id: str
@@ -67,6 +97,16 @@ class GmailSentMessage:
 
 
 class GmailReadClient(Protocol):
+    def get_profile(self) -> Awaitable[GmailProfile]: ...
+
+    def start_watch(self, topic_name: str) -> Awaitable[GmailWatchResult]: ...
+
+    def stop_watch(self) -> Awaitable[None]: ...
+
+    def list_recent_inbox(
+        self, *, after: datetime, page_token: str | None, max_results: int
+    ) -> Awaitable[GmailMessagePage]: ...
+
     def list_history(
         self, start_history_id: str | None, page_token: str | None = None
     ) -> Awaitable[GmailHistoryPage]: ...
@@ -98,6 +138,22 @@ class GmailGateway:
         if self._client is None:
             raise RuntimeError("Gmail client is not configured")
         return self._client
+
+    async def get_profile(self) -> GmailProfile:
+        return await self._require_client().get_profile()
+
+    async def start_watch(self, topic_name: str) -> GmailWatchResult:
+        return await self._require_client().start_watch(topic_name)
+
+    async def stop_watch(self) -> None:
+        await self._require_client().stop_watch()
+
+    async def list_recent_inbox(
+        self, *, after: datetime, page_token: str | None, max_results: int
+    ) -> GmailMessagePage:
+        return await self._require_client().list_recent_inbox(
+            after=after, page_token=page_token, max_results=max_results
+        )
 
     async def list_history(
         self, start_history_id: str | None, page_token: str | None = None
@@ -141,6 +197,94 @@ class GoogleGmailReadClient:
     def __init__(self, gmail_api: Any) -> None:
         self._gmail_api = gmail_api
 
+    async def get_profile(self) -> GmailProfile:
+        try:
+            response = await asyncio.to_thread(
+                lambda: self._gmail_api.users().getProfile(userId="me").execute()
+            )
+            email_address = response.get("emailAddress")
+            history_id = response.get("historyId")
+            if not isinstance(email_address, str) or not email_address:
+                raise RuntimeError("Gmail profile omitted emailAddress")
+            if not isinstance(history_id, str) or not history_id:
+                raise RuntimeError("Gmail profile omitted historyId")
+            return GmailProfile(email_address=email_address, history_id=history_id)
+        except Exception as error:
+            _raise_authorization_error(error)
+            raise
+
+    async def start_watch(self, topic_name: str) -> GmailWatchResult:
+        try:
+            response = await asyncio.to_thread(
+                lambda: (
+                    self._gmail_api.users()
+                    .watch(
+                        userId="me",
+                        body={
+                            "topicName": topic_name,
+                            "labelIds": ["INBOX"],
+                            "labelFilterBehavior": "include",
+                        },
+                    )
+                    .execute()
+                )
+            )
+            history_id = response.get("historyId")
+            expiration = response.get("expiration")
+            if not isinstance(history_id, str) or not history_id:
+                raise RuntimeError("Gmail watch response omitted historyId")
+            try:
+                expires_at = datetime.fromtimestamp(int(expiration) / 1_000, tz=UTC)
+            except (TypeError, ValueError, OSError) as error:
+                raise RuntimeError("Gmail watch response omitted expiration") from error
+            return GmailWatchResult(history_id=history_id, expiration=expires_at)
+        except Exception as error:
+            _raise_authorization_error(error)
+            raise
+
+    async def stop_watch(self) -> None:
+        try:
+            await asyncio.to_thread(
+                lambda: self._gmail_api.users().stop(userId="me").execute()
+            )
+        except Exception as error:
+            _raise_authorization_error(error)
+            raise
+
+    async def list_recent_inbox(
+        self, *, after: datetime, page_token: str | None, max_results: int
+    ) -> GmailMessagePage:
+        try:
+            response = await asyncio.to_thread(
+                lambda: (
+                    self._gmail_api.users()
+                    .messages()
+                    .list(
+                        userId="me",
+                        labelIds=["INBOX"],
+                        q=f"after:{int(after.timestamp())}",
+                        maxResults=max_results,
+                        pageToken=page_token,
+                    )
+                    .execute()
+                )
+            )
+            message_ids = tuple(
+                item["id"]
+                for item in response.get("messages", [])
+                if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+            )
+            raw_next = response.get("nextPageToken")
+            return GmailMessagePage(
+                message_ids=message_ids,
+                next_page_token=(
+                    raw_next if isinstance(raw_next, str) and raw_next else None
+                ),
+            )
+        except Exception as error:
+            _raise_authorization_error(error)
+            raise
+
     async def list_history(
         self, start_history_id: str | None, page_token: str | None = None
     ) -> GmailHistoryPage:
@@ -180,7 +324,9 @@ class GoogleGmailReadClient:
             )
             return GmailHistoryPage(tuple(dict.fromkeys(message_ids)), history_id, next_page_token)
         except Exception as error:
+            _raise_history_error(error, page_token=page_token)
             _raise_authorization_error(error)
+            _raise_transient_error(error)
             raise
 
     async def _bootstrap_page(
@@ -476,6 +622,24 @@ def _raise_authorization_error(error: Exception) -> None:
         "InvalidGrantError",
     }:
         raise GmailAuthorizationError("Gmail authorization is no longer valid") from error
+
+
+def _raise_history_error(error: Exception, *, page_token: str | None) -> None:
+    status_code = getattr(getattr(error, "resp", None), "status", None)
+    if status_code is None:
+        status_code = getattr(error, "status_code", None)
+    if page_token is not None and status_code == 400:
+        raise GmailPageTokenInvalid("Gmail history page token is invalid") from error
+    if status_code == 404:
+        raise GmailHistoryCursorExpired("Gmail history cursor is expired") from error
+
+
+def _raise_transient_error(error: Exception) -> None:
+    status_code = getattr(getattr(error, "resp", None), "status", None)
+    if status_code is None:
+        status_code = getattr(error, "status_code", None)
+    if status_code == 429 or (isinstance(status_code, int) and status_code >= 500):
+        raise GmailTransientError("Gmail dependency is temporarily unavailable") from error
 
 
 def _raise_delivery_error(error: Exception) -> None:
