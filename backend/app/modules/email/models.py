@@ -73,6 +73,23 @@ class EmailPriority(StrEnum):
     LOW = "LOW"
 
 
+class GmailWatchStatus(StrEnum):
+    STOPPED = "STOPPED"
+    STARTING = "STARTING"
+    ACTIVE = "ACTIVE"
+    STOPPING = "STOPPING"
+    ERROR = "ERROR"
+
+
+class GmailSyncStatus(StrEnum):
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    PAUSED_ERROR = "PAUSED_ERROR"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    RECOVERY_RUNNING = "RECOVERY_RUNNING"
+    RECOVERY_TRUNCATED = "RECOVERY_TRUNCATED"
+
+
 class EmailWorkItem(Base):
     __tablename__ = "email_work_items"
     __table_args__ = (
@@ -147,6 +164,11 @@ class EmailWorkItem(Base):
             ondelete="RESTRICT",
             use_alter=True,
         ),
+        nullable=True,
+    )
+    active_draft_job_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey(JobIntent.id, ondelete="SET NULL"),
         nullable=True,
     )
     version: Mapped[int] = mapped_column(
@@ -444,6 +466,7 @@ class EmailSyncState(Base):
     __tablename__ = "email_sync_states"
     __table_args__ = (
         UniqueConstraint("connector_id", name="uq_email_sync_states_connector"),
+        UniqueConstraint("mailbox_address", name="uq_email_sync_states_mailbox"),
         Index("ix_email_sync_states_organization", "organization_id"),
     )
 
@@ -463,8 +486,70 @@ class EmailSyncState(Base):
         ForeignKey("connectors.id", ondelete="CASCADE"),
         nullable=False,
     )
-    history_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    mailbox_address: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    processed_history_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    pending_history_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sync_start_history_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pending_page_token: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    page_token_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    active_sync_job_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey(JobIntent.id, ondelete="SET NULL"), nullable=True
+    )
+    sync_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    sync_status: Mapped[GmailSyncStatus] = mapped_column(
+        Enum(GmailSyncStatus, name="gmail_sync_status"),
+        nullable=False,
+        default=GmailSyncStatus.IDLE,
+        server_default=text("'IDLE'::gmail_sync_status"),
+    )
+    auto_sync_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    watch_status: Mapped[GmailWatchStatus] = mapped_column(
+        Enum(GmailWatchStatus, name="gmail_watch_status"),
+        nullable=False,
+        default=GmailWatchStatus.STOPPED,
+        server_default=text("'STOPPED'::gmail_watch_status"),
+    )
+    watch_operation_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    watch_topic_name: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    watch_expiration_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    watch_history_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_watch_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    watch_last_error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    last_notification_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_batch_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), nullable=True
+    )
+    recovery_baseline_history_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    recovery_window_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_page_token: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    recovery_processed_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    recovery_message_limit: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    recovery_has_more: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    recovery_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -473,6 +558,42 @@ class EmailSyncState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+
+
+class GmailPushReceipt(Base):
+    __tablename__ = "gmail_push_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_name",
+            "pubsub_message_id",
+            name="uq_gmail_push_receipts_subscription_message",
+        ),
+        Index("ix_gmail_push_receipts_expiry", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4,
+        server_default=text("gen_random_uuid()")
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False
+    )
+    connector_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("connectors.id", ondelete="CASCADE"),
+        nullable=False
+    )
+    subscription_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    pubsub_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    notification_history_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class EmailEvaluationRun(Base):

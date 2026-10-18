@@ -4,6 +4,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from app.modules.authorization.application import (
+    require_email_or_support_application_access,
+)
 from app.modules.identity.dependencies import Principal, require_staff_session
 from app.modules.identity.models import UserRole
 from app.modules.rag.router import _staff_knowledge_base, router
@@ -63,6 +66,9 @@ async def test_staff_assist_returns_internal_sources_without_side_effects() -> N
     app.state.grounded_answer_service = fake_service
     app.include_router(router)
     app.dependency_overrides[require_staff_session] = lambda: principal
+    app.dependency_overrides[require_email_or_support_application_access] = (
+        lambda: principal
+    )
     app.dependency_overrides[_staff_knowledge_base] = lambda: knowledge_base_id
     outbox_events: list[str] = []
 

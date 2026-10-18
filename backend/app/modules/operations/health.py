@@ -112,7 +112,7 @@ type HealthReporter = Callable[[], Awaitable[HealthReport]]
 class ConfiguredHealthReporter:
     """Check only safe dependencies and expose no exception or credential details."""
 
-    EXPECTED_MIGRATION = "0021_webhook_subscriptions"
+    EXPECTED_MIGRATION = "0022_gmail_push_access_draft_reliability"
 
     def __init__(
         self,

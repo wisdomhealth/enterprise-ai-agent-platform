@@ -32,6 +32,7 @@ class AnswerExecution:
     retrieval_latency_ms: int
     model_latency_ms: int
     source_citations: list[SourceCitation] = field(default_factory=list)
+    outcome: str = "validated"
 
 
 class GroundedAnswerService:
@@ -160,6 +161,7 @@ class GroundedAnswerService:
             retrieval_latency_ms=execution.retrieval_latency_ms,
             model_latency_ms=execution.model_latency_ms,
             source_citations=execution.source_citations,
+            outcome=execution.outcome,
         )
 
 

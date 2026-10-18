@@ -9,6 +9,10 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.authorization.application import (
+    ApplicationCapability,
+    application_access_resource_id,
+)
 from app.modules.authorization.models import ResourceGrant
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
 from app.modules.email.gmail_gateway import (
@@ -142,6 +146,17 @@ async def email_review_context(
             resource_type="knowledge",
             resource_id=knowledge_base.id,
             actions=["knowledge.review"],
+        )
+    )
+    db_session.add(
+        ResourceGrant(
+            organization_id=organization.id,
+            subject_id=staff_user.id,
+            resource_type="application",
+            resource_id=application_access_resource_id(
+                organization.id, ApplicationCapability.EMAIL
+            ),
+            actions=["application.access"],
         )
     )
     item = EmailWorkItem(

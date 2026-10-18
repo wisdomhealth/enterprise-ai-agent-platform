@@ -5,9 +5,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.models import AuditEvent
-from app.modules.email.drafting import EmailDraftingService
 from app.modules.email.models import EmailDraftVersion, EmailState
 from app.modules.email.review import EmailReviewService
+from app.modules.jobs.models import JobIntent, JobState
 from app.modules.outbox.models import OutboxEvent
 from app.modules.rag.answer_service import AnswerExecution
 from app.modules.rag.types import ClaimSupport, RetrievedChunk, SourceCitation, ValidatedAnswer
@@ -70,8 +70,7 @@ async def test_regeneration_preserves_prior_versions_and_safe_events(
     item = email_review_context["item"]
     first = email_review_context["draft"]
     principal = email_review_context["principal"]
-    drafting = EmailDraftingService(db_session, RegeneratedAnswer(item), principal)
-    service = EmailReviewService(db_session, principal, drafting_service=drafting)
+    service = EmailReviewService(db_session, principal)
 
     result = await service.regenerate(
         item.id,
@@ -80,21 +79,24 @@ async def test_regeneration_preserves_prior_versions_and_safe_events(
         current_draft_id=first.id,
     )
 
-    versions = list(
-        (
-            await db_session.scalars(
-                select(EmailDraftVersion)
-                .where(EmailDraftVersion.work_item_id == item.id)
-                .order_by(EmailDraftVersion.version)
+    jobs = list(
+        (await db_session.scalars(
+            select(JobIntent).where(
+                JobIntent.kind == "email.draft",
+                JobIntent.payload["work_item_id"].astext == str(item.id),
             )
-        ).all()
+        )).all()
     )
-    assert result.state is EmailState.AWAITING_REVIEW
-    assert result.current_draft_id != first.id
-    assert [version.version for version in versions] == [1, 2]
-    assert versions[0].body == "Original grounded draft."
-    assert versions[1].body == "Short grounded reply."
-    assert versions[1].reviewer_instruction == "Use a shorter tone."
+    assert result.state is EmailState.DRAFTING
+    assert result.current_draft_id == first.id
+    assert item.active_draft_job_id is not None
+    job = next(candidate for candidate in jobs if candidate.id == item.active_draft_job_id)
+    assert job.state is JobState.PENDING
+    assert job.payload["reviewer_instruction"] == "Use a shorter tone."
+    versions = list((await db_session.scalars(
+        select(EmailDraftVersion).where(EmailDraftVersion.work_item_id == item.id)
+    )).all())
+    assert [version.version for version in versions] == [1]
     audit = await db_session.scalar(
         select(AuditEvent).where(
             AuditEvent.object_id == item.id,
@@ -104,12 +106,12 @@ async def test_regeneration_preserves_prior_versions_and_safe_events(
     event = await db_session.scalar(
         select(OutboxEvent).where(
             OutboxEvent.aggregate_id == item.id,
-            OutboxEvent.event_type == "email.draft.regenerated",
+            OutboxEvent.event_type == "email.draft.regeneration_requested",
         )
     )
     assert audit is not None and "body" not in audit.details
     assert event is not None and "body" not in event.payload
-    assert "Short grounded reply." not in str(event.payload)
+    assert "Use a shorter tone." not in str(event.payload)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, expect, it, vi } from "vitest";
 
 import { ConnectorStatus } from "../components/admin/ConnectorStatus";
+import { GmailPushManagement } from "../components/admin/GmailPushManagement";
 import { JobFailures } from "../components/admin/JobFailures";
 import { KnowledgeStatus } from "../components/admin/KnowledgeStatus";
 import { QualitySummary } from "../components/admin/QualitySummary";
@@ -336,6 +337,48 @@ it("keeps job retry confirmation keyboard-contained and restores its trigger", (
     />,
   );
   expectDialogKeyboardBoundary("Retry Drive sync", "Retry Drive sync confirmation");
+});
+
+it("requires an explicit warning confirmation before accepting limited Gmail recovery", async () => {
+  const accept = vi.fn().mockResolvedValue(undefined);
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  render(
+    <GmailPushManagement
+      states={[{
+        connector_id: "gmail-1",
+        mailbox_address: "support@example.test",
+        auto_sync_enabled: true,
+        watch_status: "ACTIVE",
+        sync_status: "RECOVERY_TRUNCATED",
+        processed_history_id: null,
+        pending_history_id: "300",
+        watch_expiration_at: "2026-10-20T00:00:00Z",
+        recovery_batch_id: "batch-1",
+        recovery_window_started_at: "2026-10-12T00:00:00Z",
+        recovery_processed_count: 500,
+        recovery_message_limit: 500,
+        recovery_has_more: true,
+        last_error_code: null,
+        version: 7,
+      }]}
+      onWatch={vi.fn().mockResolvedValue(undefined)}
+      onManualSync={vi.fn().mockResolvedValue(undefined)}
+      onContinueRecovery={vi.fn().mockResolvedValue(undefined)}
+      onAcceptLimitedRecovery={accept}
+    />,
+  );
+
+  fireEvent.change(screen.getByLabelText("Administrative reason"), {
+    target: { value: "Reviewed the documented gap." },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Accept limited recovery" }));
+
+  expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/500 messages/));
+  await waitFor(() => expect(accept).toHaveBeenCalledWith(
+    expect.objectContaining({ connector_id: "gmail-1", version: 7 }),
+    "Reviewed the documented gap.",
+  ));
+  confirm.mockRestore();
 });
 
 it("shows quality, latency, and cost without model content", () => {

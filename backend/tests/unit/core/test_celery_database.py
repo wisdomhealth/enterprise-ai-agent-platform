@@ -93,6 +93,19 @@ def test_celery_recovers_pending_document_cleanup_events_each_minute() -> None:
     }
 
 
+def test_gmail_push_replaces_polling_without_disabling_durable_recovery() -> None:
+    schedule = create_celery(Settings()).conf.beat_schedule
+
+    assert "gmail-history-poll" not in schedule
+    assert schedule["email-history-outbox-dispatch"] == {
+        "task": "app.modules.email.tasks.dispatch_pending_email_history_outbox_events",
+        "schedule": 60,
+    }
+    assert "email-intent-dispatch" in schedule
+    assert "email-delivery-outbox-dispatch" in schedule
+    assert "retention-job-recovery" in schedule
+
+
 def test_worker_rag_assembly_accepts_the_celery_safe_session_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

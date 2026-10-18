@@ -4,6 +4,7 @@ from typing import Literal
 from uuid import UUID
 
 type Action = Literal[
+    "application.access",
     "connector.create",
     "connector.reauthorize",
     "connector.revoke",
@@ -17,7 +18,7 @@ type Action = Literal[
     "webhook.read",
     "webhook.write",
 ]
-type ResourceType = Literal["connector", "knowledge", "retention", "webhook"]
+type ResourceType = Literal["application", "connector", "knowledge", "retention", "webhook"]
 
 
 class ResourceState(StrEnum):

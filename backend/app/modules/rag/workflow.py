@@ -17,6 +17,7 @@ from app.modules.rag.llm import (
     GeneratedAnswer,
     GenerationProvider,
     ProviderCircuitBreaker,
+    ProviderDefinitiveError,
     ProviderResponseError,
     ProviderTransientError,
 )
@@ -185,7 +186,14 @@ async def _generate(
         generation = await context.provider.generate(prompt)
     except ProviderTransientError:
         await context.circuit_breaker.record_transient_failure(_PROVIDER_NAME)
-        return _failed_generation_update(state, context, attempts, started, usage=None)
+        return _failed_generation_update(
+            state,
+            context,
+            attempts,
+            started,
+            usage=None,
+            final_outcome="provider_transient_error",
+        )
     except ProviderResponseError as error:
         return _failed_generation_update(
             state,
@@ -193,14 +201,23 @@ async def _generate(
             attempts,
             started,
             usage=error.usage,
+            final_outcome="provider_response_error",
         )
+    except ProviderDefinitiveError as error:
+        return {
+            "attempts": attempts,
+            "model_latency_ms": state.get("model_latency_ms", 0) + _latency_ms(started),
+            "usage_complete": False,
+            "route": "refuse",
+            "outcome": error.outcome,
+        }
     except Exception:
         return {
             "attempts": attempts,
             "model_latency_ms": state.get("model_latency_ms", 0) + _latency_ms(started),
             "usage_complete": False,
             "route": "refuse",
-            "outcome": "provider_error",
+            "outcome": "provider_definitive_error",
         }
     if not isinstance(generation, GeneratedAnswer):
         return _failed_generation_update(state, context, attempts, started, usage=None)
@@ -223,6 +240,7 @@ def _failed_generation_update(
     started: float,
     *,
     usage: object | None,
+    final_outcome: str,
 ) -> AnswerState:
     input_tokens = int(getattr(usage, "input_tokens", 0))
     output_tokens = int(getattr(usage, "output_tokens", 0))
@@ -235,7 +253,7 @@ def _failed_generation_update(
         "output_tokens": state.get("output_tokens", 0) + output_tokens,
         "usage_complete": state.get("usage_complete", True) and usage_complete,
         "route": "check_circuit" if retry else "refuse",
-        "outcome": "pending" if retry else "provider_error",
+        "outcome": "pending" if retry else final_outcome,
     }
 
 

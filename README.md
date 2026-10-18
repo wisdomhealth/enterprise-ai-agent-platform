@@ -1,5 +1,9 @@
 # Enterprise AI Agent Platform
 
+> Gmail push deployment note: the one-minute Gmail poll is removed. Enable deployment only after
+> the authenticated Pub/Sub receiver, transactional Outbox publication, and Worker consumption
+> chain pass in the target environment. See `docs/runbooks/gmail-push.md`.
+
 Executable baseline for an enterprise customer-support and knowledge platform built
 with FastAPI and Next.js.
 
@@ -249,17 +253,23 @@ Nginx publishes the application on ports 80 and 443. Backend port 8000 and
 frontend port 3000 are internal container ports and are not published directly.
 The local TLS certificate may require browser approval.
 
+Set `PUBLIC_BASE_URL` to the external origin only, for example
+`https://platform.example.com` (no path is required). The application safely removes a trailing
+slash before adding callback paths, so it never constructs a duplicated scheme such as
+`https://https://...`.
+
 | URL | Description | Access |
 | --- | --- | --- |
-| `https://localhost/` | Public landing page | Public |
-| `https://localhost/chat/{publicKey}` | Customer chat page | Valid public chat key required |
-| `https://localhost/staff/email` | Staff email review queue and assistant | Staff authentication required |
-| `https://localhost/staff/email/{id}` | Individual email review page | Staff authentication required |
-| `https://localhost/staff/support` | Staff support and handoff console | Staff authentication required |
-| `https://localhost/staff/admin` | Administrator operations dashboard | Administrator access required |
-| `https://localhost/staff/admin/authorization` | Connector authorization management | Administrator access required |
-| `http://localhost/health/live` | Process liveness endpoint | Public health check |
-| `https://localhost/health/ready` | Dependency readiness endpoint | Public health check |
+| `${PUBLIC_BASE_URL}/` | Public landing page | Public |
+| `${PUBLIC_BASE_URL}/api/v1/auth/login` | Google OIDC staff sign-in | Public entry; invited/active staff only |
+| `${PUBLIC_BASE_URL}/chat/{publicKey}` | Customer chat page | Valid public chat key required |
+| `${PUBLIC_BASE_URL}/staff/email` | Staff email review queue and assistant | Email application access and resource permissions required |
+| `${PUBLIC_BASE_URL}/staff/email/{id}` | Individual email review page | Email application access and resource permissions required |
+| `${PUBLIC_BASE_URL}/staff/support` | Staff support and handoff console | Support application access and operation permissions required |
+| `${PUBLIC_BASE_URL}/staff/admin` | Administrator operations dashboard | Active administrator required |
+| `${PUBLIC_BASE_URL}/staff/admin/authorization` | Application, connector, and Gmail push authorization management | Active administrator required |
+| `${NEXT_PUBLIC_LIVENESS_URL}` | Process liveness endpoint | Public health check |
+| `${PUBLIC_BASE_URL}/health/ready` | Minimal dependency readiness endpoint | Public health check |
 
 All other HTTP page requests redirect to HTTPS. The liveness check intentionally
 does not connect to PostgreSQL, Redis, or external APIs.
@@ -267,6 +277,11 @@ does not connect to PostgreSQL, Redis, or external APIs.
 See [the platform baseline runbook](docs/runbooks/platform-baseline.md) for
 operating commands and [the readiness checklist](docs/readiness/checklist.md) for
 the explicit not-ready delivery gates.
+
+See [staff identity and access](docs/runbooks/staff-identity-access.md) for the current Google OIDC,
+session, invitation, user-management, application-access, and initial-administrator status. No
+initial-administrator bootstrap command is available in this change; the documented bootstrap is
+the next small task and example commands must not be treated as executable.
 
 See [knowledge ingestion](docs/architecture/knowledge-ingestion.md) for PDF page
 semantics, chunk/embedding configuration, OCR limitations, atomic publication,

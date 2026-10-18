@@ -71,6 +71,9 @@ class JobIntent(Base):
     attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    attempt_cycle: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cycle_start_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cycle_attempt_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(150), nullable=True)
     error_class: Mapped[ErrorClass | None] = mapped_column(
