@@ -2,6 +2,7 @@ from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.service import AuditService
@@ -16,9 +17,10 @@ from app.modules.email.review import persist_generated_draft_version
 from app.modules.email.schemas import EmailCitation, EmailDraftProvenance, EmailDraftResult
 from app.modules.email.state_machine import transition
 from app.modules.identity.dependencies import Principal, ServicePrincipal
-from app.modules.jobs.service import JobService
+from app.modules.jobs.models import ErrorClass
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.answer_service import AnswerExecution
+from app.modules.rag.llm import ProviderTransientError
 from app.modules.rag.types import AnswerAudience, SourceCitation
 
 
@@ -32,10 +34,11 @@ class GroundedDraftService(Protocol):
     ) -> AnswerExecution: ...
 
 
-class _DraftFailure(RuntimeError):
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
+class EmailDraftFailure(RuntimeError):
+    def __init__(self, error_code: str, error_class: ErrorClass) -> None:
+        self.error_code = error_code
+        self.error_class = error_class
+        super().__init__(error_code)
 
 
 class EmailDraftingService:
@@ -45,14 +48,12 @@ class EmailDraftingService:
         grounded_answer_service: GroundedDraftService,
         principal: Principal,
         *,
-        job_service: JobService | None = None,
         outbox_service: OutboxService | None = None,
         audit_service: AuditService | None = None,
     ) -> None:
         self._db_session = db_session
         self._grounded = grounded_answer_service
         self._principal = principal
-        self._job_service = job_service or JobService()
         self._outbox_service = outbox_service or OutboxService()
         self._audit_service = audit_service or AuditService()
 
@@ -63,33 +64,30 @@ class EmailDraftingService:
         job_id: UUID | None = None,
         reviewer_instruction: str | None = None,
     ) -> EmailDraftResult:
-        item = await self._db_session.scalar(
-            select(EmailWorkItem).where(EmailWorkItem.id == work_item_id).with_for_update()
-        )
+        item = await self._db_session.get(EmailWorkItem, work_item_id)
         if item is None:
             raise LookupError("email work item not found")
         if item.state is EmailState.AWAITING_REVIEW:
             return self._result(item)
-        if item.state is EmailState.DRAFT_RETRY_WAIT and item.category is not None:
-            self._change_state(
-                item,
-                EmailAction.RETRY_DRAFT,
-                reason_code="AUTOMATIC_RETRY",
-                job_id=job_id,
-            )
-        if item.state is not EmailState.DRAFTING:
+        if item.state not in {EmailState.DRAFTING, EmailState.DRAFT_RETRY_WAIT}:
             raise ValueError("email is not ready for drafting")
+        organization_id = item.organization_id
+        knowledge_base_id = item.knowledge_base_id
+        query = _draft_query(item)
         try:
-            if self._principal.organization_id != item.organization_id:
-                raise _DraftFailure("EMAIL_DRAFT_PRINCIPAL_SCOPE_MISMATCH")
+            if self._principal.organization_id != organization_id:
+                raise EmailDraftFailure(
+                    "EMAIL_DRAFT_PRINCIPAL_SCOPE_MISMATCH", ErrorClass.SECURITY
+                )
             execution = await self._grounded.answer_with_evidence(
                 self._principal,
-                item.knowledge_base_id,
-                _draft_query(item),
+                knowledge_base_id,
+                query,
                 AnswerAudience.STAFF,
             )
             if execution.answer.refused or not execution.answer.citations:
-                raise _DraftFailure("EMAIL_DRAFT_GROUNDED_ANSWER_UNAVAILABLE")
+                raise classify_grounded_refusal(execution.outcome)
+            item = await self._lock_for_finalize(work_item_id, job_id)
             citations = _authorized_citations(item, execution)
             provenance = EmailDraftProvenance(
                 model=execution.answer.model,
@@ -108,10 +106,19 @@ class EmailDraftingService:
                 retrieval_actor_type=self._actor_type,
                 usage_complete=execution.answer.usage_complete,
             )
-        except _DraftFailure as error:
-            await self._fail(item, error.code, job_id=job_id)
-        except Exception:
-            await self._fail(item, "EMAIL_DRAFT_FAILED", job_id=job_id)
+        except EmailDraftFailure as error:
+            item = await self._lock_for_finalize(work_item_id, job_id)
+            await self._fail(item, error.error_code, job_id=job_id)
+            await self._db_session.flush()
+            raise
+        except SQLAlchemyError:
+            raise
+        except Exception as error:
+            failure = classify_draft_exception(error)
+            item = await self._lock_for_finalize(work_item_id, job_id)
+            await self._fail(item, failure.error_code, job_id=job_id)
+            await self._db_session.flush()
+            raise failure from error
         else:
             item.draft_body = execution.answer.text
             item.draft_citations = [citation.model_dump(mode="json") for citation in citations]
@@ -140,36 +147,40 @@ class EmailDraftingService:
         await self._db_session.flush()
         return self._result(item)
 
+    async def _lock_for_finalize(
+        self, work_item_id: UUID, job_id: UUID | None
+    ) -> EmailWorkItem:
+        item = await self._db_session.scalar(
+            select(EmailWorkItem)
+            .where(EmailWorkItem.id == work_item_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if item is None:
+            raise LookupError("email work item not found")
+        if job_id is not None and item.active_draft_job_id != job_id:
+            raise EmailDraftFailure(
+                "EMAIL_DRAFT_SUPERSEDED", ErrorClass.NON_RETRYABLE
+            )
+        if item.state not in {EmailState.DRAFTING, EmailState.DRAFT_RETRY_WAIT}:
+            raise EmailDraftFailure(
+                "EMAIL_DRAFT_SUPERSEDED", ErrorClass.NON_RETRYABLE
+            )
+        if item.state is EmailState.DRAFT_RETRY_WAIT and item.category is not None:
+            self._change_state(
+                item,
+                EmailAction.RETRY_DRAFT,
+                reason_code="AUTOMATIC_RETRY",
+                job_id=job_id,
+            )
+        return item
+
     async def _fail(self, item: EmailWorkItem, error_code: str, *, job_id: UUID | None) -> None:
         item.draft_body = None
         item.draft_citations = []
         item.draft_provenance = {}
         item.last_error_code = error_code
         self._change_state(item, EmailAction.DRAFT_FAILED, reason_code=error_code, job_id=job_id)
-        payload: dict[str, object] = {
-            "work_item_id": str(item.id),
-            "organization_id": str(item.organization_id),
-            "connector_id": str(item.connector_id),
-            "knowledge_base_id": str(item.knowledge_base_id),
-            "phase": "draft",
-        }
-        job = await self._job_service.enqueue(
-            self._db_session,
-            "email.draft",
-            f"email.draft:{item.id}:v{item.version}",
-            payload,
-        )
-        await self._outbox_service.add(
-            self._db_session,
-            "email.draft.retry_requested",
-            "job",
-            job.id,
-            {
-                "work_item_id": str(item.id),
-                "organization_id": str(item.organization_id),
-                "error_code": error_code,
-            },
-        )
         if self._principal.organization_id == item.organization_id:
             await self._record_audit(item, "FAILED", job_id=job_id, error_code=error_code)
 
@@ -270,12 +281,55 @@ def _draft_query(item: EmailWorkItem) -> str:
     )
 
 
+def classify_grounded_refusal(outcome: str) -> EmailDraftFailure:
+    mappings = {
+        "no_evidence": ("EMAIL_DRAFT_KNOWLEDGE_INSUFFICIENT", ErrorClass.NON_RETRYABLE),
+        "validation_refusal": ("EMAIL_DRAFT_MODEL_SAFETY_REFUSAL", ErrorClass.NON_RETRYABLE),
+        "provider_transient_error": (
+            "EMAIL_DRAFT_MODEL_TEMPORARY_FAILURE",
+            ErrorClass.RETRYABLE,
+        ),
+        "circuit_open": ("EMAIL_DRAFT_MODEL_TEMPORARY_FAILURE", ErrorClass.RETRYABLE),
+        "retrieval_error": ("EMAIL_DRAFT_RETRIEVAL_TEMPORARY_FAILURE", ErrorClass.RETRYABLE),
+        "provider_quota_error": (
+            "EMAIL_DRAFT_MODEL_QUOTA_EXHAUSTED",
+            ErrorClass.NON_RETRYABLE,
+        ),
+        "provider_configuration_error": (
+            "EMAIL_DRAFT_MODEL_CONFIGURATION_INVALID",
+            ErrorClass.NON_RETRYABLE,
+        ),
+        "authorization_refusal": (
+            "EMAIL_DRAFT_RETRIEVAL_UNAUTHORIZED",
+            ErrorClass.SECURITY,
+        ),
+        "scope_refusal": ("EMAIL_DRAFT_RETRIEVAL_UNAUTHORIZED", ErrorClass.SECURITY),
+    }
+    error_code, error_class = mappings.get(
+        outcome,
+        ("EMAIL_DRAFT_GROUNDED_ANSWER_UNAVAILABLE", ErrorClass.NON_RETRYABLE),
+    )
+    return EmailDraftFailure(error_code, error_class)
+
+
+def classify_draft_exception(error: Exception) -> EmailDraftFailure:
+    if isinstance(error, (ProviderTransientError, TimeoutError, ConnectionError)):
+        return EmailDraftFailure(
+            "EMAIL_DRAFT_MODEL_TEMPORARY_FAILURE", ErrorClass.RETRYABLE
+        )
+    return EmailDraftFailure(
+        "EMAIL_DRAFT_UNCLASSIFIED_FAILURE", ErrorClass.NON_RETRYABLE
+    )
+
+
 def _authorized_citations(item: EmailWorkItem, execution: AnswerExecution) -> list[EmailCitation]:
     chunks = {chunk.chunk_id: chunk for chunk in execution.retrieved_chunks}
     citations: list[EmailCitation] = []
     for raw_citation in execution.answer.citations:
         if not isinstance(raw_citation, SourceCitation):
-            raise _DraftFailure("EMAIL_DRAFT_UNAUTHORIZED_CITATION")
+            raise EmailDraftFailure(
+                "EMAIL_DRAFT_UNAUTHORIZED_CITATION", ErrorClass.SECURITY
+            )
         chunk = chunks.get(raw_citation.chunk_id)
         if (
             chunk is None
@@ -285,7 +339,9 @@ def _authorized_citations(item: EmailWorkItem, execution: AnswerExecution) -> li
             or not chunk.resource_authorized
             or not chunk.retrieval_eligible
         ):
-            raise _DraftFailure("EMAIL_DRAFT_UNAUTHORIZED_CITATION")
+            raise EmailDraftFailure(
+                "EMAIL_DRAFT_UNAUTHORIZED_CITATION", ErrorClass.SECURITY
+            )
         citations.append(
             EmailCitation(
                 organization_id=item.organization_id,
@@ -299,5 +355,7 @@ def _authorized_citations(item: EmailWorkItem, execution: AnswerExecution) -> li
             )
         )
     if not citations:
-        raise _DraftFailure("EMAIL_DRAFT_GROUNDED_ANSWER_UNAVAILABLE")
+        raise EmailDraftFailure(
+            "EMAIL_DRAFT_GROUNDED_ANSWER_UNAVAILABLE", ErrorClass.NON_RETRYABLE
+        )
     return citations

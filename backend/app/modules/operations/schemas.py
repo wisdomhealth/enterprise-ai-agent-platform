@@ -93,6 +93,11 @@ class JobRetryRead(BaseModel):
     version: int
 
 
+class JobRetryRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+    expected_version: int = Field(ge=1)
+
+
 class ConnectorReauthorizationRead(BaseModel):
     connector_id: UUID
     authorization_url: str
@@ -117,3 +122,53 @@ class ConnectorGrantReplace(BaseModel):
     actions: list[Literal["connector.create", "connector.reauthorize", "connector.revoke"]] = Field(
         default_factory=list
     )
+
+
+class ApplicationAccessRead(BaseModel):
+    staff_user_id: UUID
+    capability: Literal["email", "support"]
+    resource_id: UUID
+    grant_present: bool
+    role_status_eligible: bool
+    reviewable_knowledge_base_ids: list[UUID]
+    effective_allowed: bool
+
+
+class ApplicationGrantReplace(BaseModel):
+    granted: bool
+    expected_user_version: int = Field(ge=1)
+
+
+class GmailSyncStateRead(BaseModel):
+    connector_id: UUID
+    mailbox_address: str | None
+    auto_sync_enabled: bool
+    watch_status: str
+    sync_status: str
+    processed_history_id: str | None
+    pending_history_id: str | None
+    watch_expiration_at: datetime | None
+    recovery_batch_id: UUID | None
+    recovery_window_started_at: datetime | None
+    recovery_processed_count: int
+    recovery_message_limit: int
+    recovery_has_more: bool
+    last_error_code: str | None
+    version: int
+
+
+class GmailRecoveryContinueRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    additional_messages: int = Field(ge=1, le=10_000)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class GmailRecoveryAcceptRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    confirmed: bool
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class GmailManualSyncRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=1000)

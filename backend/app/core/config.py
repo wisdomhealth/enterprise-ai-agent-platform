@@ -191,6 +191,86 @@ class Settings(BaseSettings):
     google_gmail_client_secret: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_GMAIL_CLIENT_SECRET"
     )
+    gmail_push_enabled: bool = Field(default=False, validation_alias="GMAIL_PUSH_ENABLED")
+    gmail_pubsub_topic: str | None = Field(default=None, validation_alias="GMAIL_PUBSUB_TOPIC")
+    gmail_pubsub_subscription: str | None = Field(
+        default=None, validation_alias="GMAIL_PUBSUB_SUBSCRIPTION"
+    )
+    gmail_push_endpoint_url: AnyUrl | None = Field(
+        default=None, validation_alias="GMAIL_PUSH_ENDPOINT_URL"
+    )
+    gmail_push_oidc_audience: str | None = Field(
+        default=None, validation_alias="GMAIL_PUSH_OIDC_AUDIENCE"
+    )
+    gmail_push_service_account_email: str | None = Field(
+        default=None, validation_alias="GMAIL_PUSH_SERVICE_ACCOUNT_EMAIL"
+    )
+    gmail_push_max_body_bytes: int = Field(
+        default=65_536,
+        ge=1_024,
+        le=1_048_576,
+        validation_alias="GMAIL_PUSH_MAX_BODY_BYTES",
+    )
+    gmail_watch_renewal_interval_seconds: int = Field(
+        default=86_400,
+        ge=3_600,
+        le=604_800,
+        validation_alias="GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS",
+    )
+    gmail_watch_renew_before_seconds: int = Field(
+        default=172_800,
+        ge=3_600,
+        le=604_800,
+        validation_alias="GMAIL_WATCH_RENEW_BEFORE_SECONDS",
+    )
+    gmail_reconciliation_interval_seconds: int = Field(
+        default=21_600,
+        ge=3_600,
+        le=604_800,
+        validation_alias="GMAIL_RECONCILIATION_INTERVAL_SECONDS",
+    )
+    gmail_push_receipt_retention_days: int = Field(
+        default=14,
+        ge=1,
+        le=90,
+        validation_alias="GMAIL_PUSH_RECEIPT_RETENTION_DAYS",
+    )
+    gmail_recovery_lookback_days: int = Field(
+        default=7,
+        ge=1,
+        le=90,
+        validation_alias="GMAIL_RECOVERY_LOOKBACK_DAYS",
+    )
+    gmail_recovery_max_messages: int = Field(
+        default=500,
+        ge=1,
+        le=10_000,
+        validation_alias="GMAIL_RECOVERY_MAX_MESSAGES",
+    )
+    gmail_sync_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        validation_alias="GMAIL_SYNC_MAX_ATTEMPTS",
+    )
+    email_draft_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        validation_alias="EMAIL_DRAFT_MAX_ATTEMPTS",
+    )
+    email_draft_retry_base_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=3_600,
+        validation_alias="EMAIL_DRAFT_RETRY_BASE_SECONDS",
+    )
+    email_draft_retry_max_seconds: int = Field(
+        default=600,
+        ge=1,
+        le=86_400,
+        validation_alias="EMAIL_DRAFT_RETRY_MAX_SECONDS",
+    )
     gmail_message_id_domain: str = Field(
         default="mail.invalid",
         pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$",

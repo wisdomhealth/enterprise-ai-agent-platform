@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.authorization.application import require_email_application_access
 from app.modules.email.delivery import (
     EmailDeliveryAuthorizationError,
     EmailDeliveryConflict,
@@ -14,7 +15,6 @@ from app.modules.email.delivery import (
     EmailDeliveryService,
     ReconciliationRequired,
 )
-from app.modules.email.drafting import EmailDraftingService
 from app.modules.email.models import EmailState
 from app.modules.email.reads import EmailReadAuthorizationError, EmailReadService
 from app.modules.email.reconciliation import ReconciliationService
@@ -39,7 +39,11 @@ from app.modules.identity.dependencies import (
     require_staff_session,
 )
 
-router = APIRouter(prefix="/api/v1/staff/email", tags=["email-review"])
+router = APIRouter(
+    prefix="/api/v1/staff/email",
+    tags=["email-review"],
+    dependencies=[Depends(require_email_application_access)],
+)
 
 
 @router.get("", response_model=list[StaffEmailQueueItem])
@@ -281,16 +285,10 @@ async def regenerate(
     principal: Principal = Depends(require_staff_csrf),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, object]:
-    grounded = getattr(request.app.state, "grounded_answer_service", None)
-    if grounded is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Grounded drafting is not configured",
-        )
     review = EmailReviewService(
         db_session,
         principal,
-        drafting_service=EmailDraftingService(db_session, grounded, principal),
+        draft_attempt_limit=request.app.state.settings.email_draft_max_attempts,
     )
     return await _perform(
         operation="email.draft.regenerate",

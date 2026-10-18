@@ -45,9 +45,24 @@ def create_celery(settings: Settings | None = None) -> Celery:
                 "task": "app.modules.chat.tasks.dispatch_pending_chat_answer_jobs",
                 "schedule": 60,
             },
-            "gmail-history-poll": {
-                "task": "app.modules.email.tasks.gmail_history_poll",
+            "email-history-outbox-dispatch": {
+                "task": (
+                    "app.modules.email.tasks."
+                    "dispatch_pending_email_history_outbox_events"
+                ),
                 "schedule": 60,
+            },
+            "gmail-watch-renewal": {
+                "task": "app.modules.email.tasks.renew_gmail_watches",
+                "schedule": settings.gmail_watch_renewal_interval_seconds,
+            },
+            "gmail-low-frequency-reconciliation": {
+                "task": "app.modules.email.tasks.reconcile_gmail_history",
+                "schedule": settings.gmail_reconciliation_interval_seconds,
+            },
+            "gmail-push-receipt-cleanup": {
+                "task": "app.modules.email.tasks.cleanup_gmail_push_receipts",
+                "schedule": 24 * 60 * 60,
             },
             "email-intent-dispatch": {
                 "task": "app.modules.email.tasks.dispatch_pending_email_jobs",

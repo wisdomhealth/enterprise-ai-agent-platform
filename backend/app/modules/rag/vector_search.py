@@ -110,7 +110,9 @@ def _authorized_chunks_query(
                 ResourceGrant.subject_id == principal.subject_id,
                 ResourceGrant.resource_type == "knowledge",
                 ResourceGrant.resource_id == KnowledgeBase.id,
-                ResourceGrant.actions.contains(["knowledge.read"]),
+                ResourceGrant.actions.overlap(
+                    ["knowledge.read", "knowledge.review"]
+                ),
             ),
         )
     return query.where(

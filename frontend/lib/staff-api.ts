@@ -442,6 +442,34 @@ export type AdminConnectorAuthorization = {
   actions: { action: ConnectorGrantAction; granted: boolean }[];
 };
 
+export type AdminApplicationAccess = {
+  staff_user_id: string;
+  capability: "email" | "support";
+  resource_id: string;
+  grant_present: boolean;
+  role_status_eligible: boolean;
+  reviewable_knowledge_base_ids: string[];
+  effective_allowed: boolean;
+};
+
+export type AdminGmailSyncState = {
+  connector_id: string;
+  mailbox_address: string | null;
+  auto_sync_enabled: boolean;
+  watch_status: string;
+  sync_status: string;
+  processed_history_id: string | null;
+  pending_history_id: string | null;
+  watch_expiration_at: string | null;
+  recovery_batch_id: string | null;
+  recovery_window_started_at: string | null;
+  recovery_processed_count: number;
+  recovery_message_limit: number;
+  recovery_has_more: boolean;
+  last_error_code: string | null;
+  version: number;
+};
+
 export function getAdminOperationsSummary(): Promise<AdminOperationsSummary> {
   return adminRequest<AdminOperationsSummary>("/operations/summary");
 }
@@ -459,6 +487,95 @@ export function updateAdminConnectorAuthorization(
     method: "PUT",
     headers: { "Idempotency-Key": idempotencyKey("connector-grants", kind) },
     body: JSON.stringify({ staff_user_id: staffUserId, actions }),
+  });
+}
+
+export function getAdminApplicationAccess(
+  staffUserId: string,
+): Promise<AdminApplicationAccess[]> {
+  return adminRequest<AdminApplicationAccess[]>(
+    `/authorization/applications/${staffUserId}`,
+  );
+}
+
+export function updateAdminApplicationAccess(
+  user: AdminUser,
+  capability: AdminApplicationAccess["capability"],
+  granted: boolean,
+): Promise<AdminApplicationAccess> {
+  return adminRequest<AdminApplicationAccess>(
+    `/authorization/applications/${user.id}/${capability}`,
+    {
+      method: "PUT",
+      headers: {
+        "Idempotency-Key": idempotencyKey(
+          "application-access",
+          `${user.id}:${capability}`,
+        ),
+      },
+      body: JSON.stringify({ granted, expected_user_version: user.version }),
+    },
+  );
+}
+
+export function getAdminGmailSyncStates(): Promise<AdminGmailSyncState[]> {
+  return adminRequest<AdminGmailSyncState[]>("/gmail-sync");
+}
+
+function gmailAction(
+  connectorId: string,
+  action: string,
+  body?: Record<string, unknown>,
+): Promise<AdminGmailSyncState> {
+  return adminRequest<AdminGmailSyncState>(`/connectors/${connectorId}/${action}`, {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey("gmail", `${connectorId}:${action}`) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+export function startAdminGmailWatch(connectorId: string): Promise<AdminGmailSyncState> {
+  return gmailAction(connectorId, "gmail-watch/start");
+}
+
+export function renewAdminGmailWatch(connectorId: string): Promise<AdminGmailSyncState> {
+  return gmailAction(connectorId, "gmail-watch/renew");
+}
+
+export function stopAdminGmailWatch(connectorId: string): Promise<AdminGmailSyncState> {
+  return gmailAction(connectorId, "gmail-watch/stop");
+}
+
+export function requestAdminGmailManualSync(
+  state: AdminGmailSyncState,
+  reason: string,
+): Promise<AdminGmailSyncState> {
+  return gmailAction(state.connector_id, "gmail-sync/manual", {
+    expected_version: state.version,
+    reason,
+  });
+}
+
+export function continueAdminGmailRecovery(
+  state: AdminGmailSyncState,
+  additionalMessages: number,
+  reason: string,
+): Promise<AdminGmailSyncState> {
+  return gmailAction(state.connector_id, "gmail-recovery/continue", {
+    expected_version: state.version,
+    additional_messages: additionalMessages,
+    reason,
+  });
+}
+
+export function acceptAdminLimitedGmailRecovery(
+  state: AdminGmailSyncState,
+  reason: string,
+): Promise<AdminGmailSyncState> {
+  return gmailAction(state.connector_id, "gmail-recovery/accept-limited", {
+    expected_version: state.version,
+    confirmed: true,
+    reason,
   });
 }
 

@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.authorization.application import require_email_or_support_application_access
 from app.modules.authorization.policy import AuthorizationDenied, AuthorizationService
 from app.modules.authorization.types import ResourceRef, ResourceState
 from app.modules.identity.dependencies import Principal, get_db_session, require_staff_session
@@ -46,7 +47,7 @@ async def _staff_knowledge_base(
     try:
         await AuthorizationService(db_session).require(
             principal,
-            "knowledge.read",
+            "knowledge.review",
             ResourceRef(
                 organization_id=principal.organization_id,
                 resource_type="knowledge",
@@ -73,6 +74,9 @@ def _grounded_answer_service(request: Request) -> StaffAnswerService:
 async def staff_assist_search(
     payload: StaffAssistRequest,
     principal: Principal = Depends(require_staff_session),
+    _application_principal: Principal = Depends(
+        require_email_or_support_application_access
+    ),
     knowledge_base_id: UUID = Depends(_staff_knowledge_base),
     answer_service: StaffAnswerService = Depends(_grounded_answer_service),
 ) -> ValidatedAnswer:

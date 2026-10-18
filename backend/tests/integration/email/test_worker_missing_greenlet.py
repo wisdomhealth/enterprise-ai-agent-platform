@@ -68,8 +68,8 @@ async def test_exception_recovery_uses_fresh_state_and_preserves_business_error(
         with pytest.raises(RuntimeError, match="history business failure"):
             await _consume_email_job(job_id)
         persisted = await _job(job_id)
-        assert persisted.state is JobState.PENDING
-        assert persisted.last_error_code == "EMAIL_WORKER_TRANSIENT_FAILURE"
+        assert persisted.state is JobState.FAILED
+        assert persisted.last_error_code == "EMAIL_WORKER_NON_RETRYABLE_FAILURE"
     finally:
         async with async_sessionmaker() as session:
             await session.execute(JobIntent.__table__.delete().where(JobIntent.id == job_id))

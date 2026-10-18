@@ -11,6 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.main import create_app
+from app.modules.authorization.application import (
+    ApplicationCapability,
+    application_access_resource_id,
+)
 from app.modules.authorization.models import ResourceGrant
 from app.modules.chat.answering import ChatAnswerService
 from app.modules.chat.models import ChatActor, ChatMessage, ChatSession
@@ -108,14 +112,25 @@ async def test_live_routes_claim_reply_resume_and_fence_preexisting_answer(
     )
     db_session.add(reviewer)
     await db_session.flush()
-    db_session.add(
-        ResourceGrant(
-            organization_id=organization.id,
-            subject_id=reviewer.id,
-            resource_type="knowledge",
-            resource_id=knowledge_base.id,
-            actions=["knowledge.review"],
-        )
+    db_session.add_all(
+        [
+            ResourceGrant(
+                organization_id=organization.id,
+                subject_id=reviewer.id,
+                resource_type="knowledge",
+                resource_id=knowledge_base.id,
+                actions=["knowledge.review"],
+            ),
+            ResourceGrant(
+                organization_id=organization.id,
+                subject_id=reviewer.id,
+                resource_type="application",
+                resource_id=application_access_resource_id(
+                    organization.id, ApplicationCapability.SUPPORT
+                ),
+                actions=["application.access"],
+            ),
+        ]
     )
     await db_session.flush()
     handoff = await SupportService(db_session).request_handoff(

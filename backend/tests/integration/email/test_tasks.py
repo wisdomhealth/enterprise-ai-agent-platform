@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import async_sessionmaker
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
 from app.modules.email.classification import ClassificationExecution, EmailClassificationFailure
-from app.modules.email.gmail_gateway import GmailHistoryPage, GmailMessage
+from app.modules.email.gmail_gateway import (
+    GmailHistoryPage,
+    GmailMessage,
+    GmailMessagePage,
+    GmailProfile,
+)
 from app.modules.email.ingestion import EmailIngestionService
 from app.modules.email.models import (
     EmailCategory,
@@ -18,27 +23,26 @@ from app.modules.email.models import (
     EmailSyncState,
     EmailWorkItem,
 )
+from app.modules.email.push import GmailPushService, VerifiedGmailNotification
 from app.modules.email.schemas import EmailClassification
-from app.modules.email.tasks import _consume_email_job, _enqueue_gmail_history_jobs
+from app.modules.email.tasks import (
+    _consume_email_job,
+    _dispatch_email_history_outbox_event,
+    _enqueue_gmail_history_jobs,
+)
 from app.modules.identity.models import Organization
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobService
 from app.modules.knowledge.models import KnowledgeBase
+from app.modules.outbox.models import OutboxEvent
 
 
 @pytest.mark.asyncio
-async def test_each_completed_history_poll_gets_a_new_durable_job_key(
-    db_session: AsyncSession, email_context: dict[str, object], monkeypatch
+async def test_each_completed_reconciliation_gets_a_new_durable_job_and_outbox(
+    db_session: AsyncSession, email_context: dict[str, object]
 ) -> None:
     connector = email_context["connector"]
-    dispatched: list[UUID] = []
-    monkeypatch.setattr(
-        "app.modules.email.tasks.email_job.delay",
-        lambda job_id: dispatched.append(UUID(job_id)),
-    )
-
     for expected_count in (1, 2, 3):
-        dispatched_before = set(dispatched)
         await _enqueue_gmail_history_jobs(db_session=db_session)
         jobs = list(
             (
@@ -53,14 +57,21 @@ async def test_each_completed_history_poll_gets_a_new_durable_job_key(
             ).all()
         )
         assert len(jobs) == expected_count
-        newly_dispatched = set(dispatched) - dispatched_before
-        dispatched_job = next(job for job in jobs if job.id in newly_dispatched)
-        dispatched_job.state = JobState.SUCCEEDED
-        dispatched_job.version = 3
+        for dispatched_job in jobs:
+            dispatched_job.state = JobState.SUCCEEDED
+            dispatched_job.version = 3
         await db_session.commit()
 
     assert len(set(job.idempotency_key for job in jobs)) == 3
-    assert {job.id for job in jobs}.issubset(dispatched)
+    assert (
+        await db_session.scalar(
+                select(func.count(OutboxEvent.event_id)).where(
+                    OutboxEvent.event_type == "email.gmail_history.requested",
+                    OutboxEvent.aggregate_id.in_([job.id for job in jobs]),
+                )
+        )
+        == 3
+    )
 
 
 @pytest.mark.asyncio
@@ -72,8 +83,9 @@ async def test_history_job_key_is_bounded_for_provider_page_tokens(
         EmailSyncState(
             organization_id=connector.organization_id,
             connector_id=connector.id,
-            history_id="cursor-101",
+            processed_history_id="cursor-101",
             pending_page_token=f"history:{'x' * 900}",
+            auto_sync_enabled=True,
         )
     )
     await db_session.commit()
@@ -429,10 +441,19 @@ class OnePageGateway:
     def __init__(self, message: GmailMessage) -> None:
         self.message = message
 
+    async def get_profile(self) -> GmailProfile:
+        return GmailProfile("support@example.test", "101")
+
+    async def list_recent_inbox(
+        self, *, after, page_token: str | None, max_results: int  # type: ignore[no-untyped-def]
+    ) -> GmailMessagePage:
+        del after, page_token, max_results
+        return GmailMessagePage((self.message.id,), None)
+
     async def list_history(
         self, _history_id: str | None, _page_token: str | None = None
     ) -> GmailHistoryPage:
-        return GmailHistoryPage((self.message.id,), "cursor-2", None)
+        return GmailHistoryPage((self.message.id,), "120", None)
 
     async def get_message(self, _message_id: str) -> GmailMessage:
         return self.message
@@ -444,6 +465,7 @@ async def test_history_consumer_enqueues_classification_without_paid_model_call(
 ) -> None:
     classifier = BlockingClassifier()
     organization_id = uuid4()
+    mailbox_address = f"push-chain-{uuid4().hex}@example.test"
     async with async_sessionmaker() as setup:
         organization = Organization(id=organization_id, name=f"Lease owner {uuid4()}")
         setup.add(organization)
@@ -469,27 +491,47 @@ async def test_history_consumer_enqueues_classification_without_paid_model_call(
         )
         setup.add(connector)
         await setup.flush()
-        job = await JobService().enqueue(
-            setup,
-            "email.gmail_history",
-            f"renewal-{uuid4()}",
-            {
-                "connector_id": str(connector.id),
-                "organization_id": str(organization.id),
-                "knowledge_base_id": str(knowledge_base.id),
-                "history_id": None,
-                "page_token": None,
-            },
+        setup.add(
+            EmailSyncState(
+                organization_id=organization.id,
+                connector_id=connector.id,
+                mailbox_address=mailbox_address,
+                processed_history_id="100",
+                auto_sync_enabled=True,
+            )
         )
-        job_id = job.id
+        await setup.flush()
+        job_id = await GmailPushService(
+            setup, receipt_retention_days=14
+        ).accept(
+            VerifiedGmailNotification(
+                subscription_name="projects/p/subscriptions/gmail",
+                pubsub_message_id=f"chain-{uuid4()}",
+                published_at=datetime.now(UTC),
+                mailbox_address=mailbox_address,
+                history_id="120",
+            )
+        )
+        assert job_id is not None
         connector_id = connector.id
         knowledge_base_id = knowledge_base.id
-        await setup.commit()
+        event_id = await setup.scalar(
+            select(OutboxEvent.event_id).where(OutboxEvent.aggregate_id == job_id)
+        )
+        assert event_id is not None
+
+    published: list[str] = []
+    monkeypatch.setattr(
+        "app.modules.email.tasks.email_job.delay",
+        lambda value: published.append(value),
+    )
+    assert await _dispatch_email_history_outbox_event(event_id)
+    assert published == [str(job_id)]
 
     message = GmailMessage(
         id=f"gmail-{uuid4().hex}",
         thread_id="thread-renewal",
-        history_id="cursor-2",
+        history_id="120",
         sender="customer@example.test",
         recipients=("support@example.test",),
         subject="Slow classification",
@@ -532,7 +574,9 @@ async def test_history_consumer_enqueues_classification_without_paid_model_call(
             == 1
         )
         assert sync_state is not None
-        assert sync_state.history_id == "cursor-2"
+        assert sync_state.processed_history_id == "120"
+        assert sync_state.pending_history_id is None
+        assert sync_state.active_sync_job_id is None
         assert (
             await verify.scalar(
                 select(func.count(JobIntent.id)).where(

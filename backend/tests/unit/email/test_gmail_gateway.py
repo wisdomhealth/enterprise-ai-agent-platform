@@ -7,6 +7,8 @@ from app.modules.email.gmail_gateway import (
     GMAIL_READONLY_SCOPE,
     GMAIL_SCOPES,
     GMAIL_SEND_SCOPE,
+    GmailHistoryCursorExpired,
+    GmailPageTokenInvalid,
     GoogleGmailGatewayFactory,
     GoogleGmailReadClient,
 )
@@ -18,6 +20,16 @@ class _Request:
 
     def execute(self) -> dict[str, object]:
         return self._payload
+
+
+class _FailedRequest:
+    def __init__(self, status: int) -> None:
+        self._status = status
+
+    def execute(self) -> dict[str, object]:
+        error = RuntimeError("provider failure")
+        error.resp = SimpleNamespace(status=self._status)  # type: ignore[attr-defined]
+        raise error
 
 
 class _BootstrapMessages:
@@ -136,3 +148,68 @@ async def test_sent_reconciliation_requires_exact_recipient_binding() -> None:
     )
 
     assert found is None
+
+
+class _WatchUsers:
+    def __init__(self) -> None:
+        self.watch_kwargs: dict[str, object] | None = None
+        self.stop_kwargs: dict[str, object] | None = None
+
+    def getProfile(self, **kwargs: object) -> _Request:  # noqa: N802
+        assert kwargs == {"userId": "me"}
+        return _Request({"emailAddress": "employee@example.test", "historyId": "901"})
+
+    def watch(self, **kwargs: object) -> _Request:
+        self.watch_kwargs = kwargs
+        return _Request({"historyId": "902", "expiration": "1788336000000"})
+
+    def stop(self, **kwargs: object) -> _Request:
+        self.stop_kwargs = kwargs
+        return _Request({})
+
+
+@pytest.mark.asyncio
+async def test_watch_uses_the_exact_gmail_push_filter_parameters() -> None:
+    users = _WatchUsers()
+    client = GoogleGmailReadClient(SimpleNamespace(users=lambda: users))
+
+    profile = await client.get_profile()
+    watch = await client.start_watch("projects/example/topics/gmail-push")
+    await client.stop_watch()
+
+    assert profile.email_address == "employee@example.test"
+    assert profile.history_id == "901"
+    assert watch.history_id == "902"
+    assert watch.expiration == datetime.fromtimestamp(1788336000, tz=UTC)
+    assert users.watch_kwargs == {
+        "userId": "me",
+        "body": {
+            "topicName": "projects/example/topics/gmail-push",
+            "labelIds": ["INBOX"],
+            "labelFilterBehavior": "include",
+        },
+    }
+    assert users.stop_kwargs == {"userId": "me"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "page_token", "expected"),
+    [
+        (400, "history:bad-token", GmailPageTokenInvalid),
+        (404, None, GmailHistoryCursorExpired),
+    ],
+)
+async def test_history_errors_distinguish_page_token_from_expired_cursor(
+    status: int,
+    page_token: str | None,
+    expected: type[Exception],
+) -> None:
+    history = SimpleNamespace(
+        list=lambda **_kwargs: _FailedRequest(status),
+    )
+    users = SimpleNamespace(history=lambda: history)
+    client = GoogleGmailReadClient(SimpleNamespace(users=lambda: users))
+
+    with pytest.raises(expected):
+        await client.list_history("100", page_token)

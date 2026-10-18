@@ -8,7 +8,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.core.celery import create_celery
 from app.core.config import Settings
 from app.core.database import async_sessionmaker
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, log_event
 from app.core.telemetry import (
     DEPENDENCY_UP,
     HTTP_REQUEST_LATENCY_SECONDS,
@@ -22,6 +22,8 @@ from app.modules.connectors.encryption import envelope_cipher_from_settings
 from app.modules.connectors.router import router as connectors_router
 from app.modules.connectors.service import ConnectorService
 from app.modules.email.gmail_gateway import GoogleGmailGatewayFactory
+from app.modules.email.push import GmailPushAuthenticator
+from app.modules.email.push_router import router as gmail_push_router
 from app.modules.email.router import router as email_router
 from app.modules.identity.oidc import configure_google_oidc
 from app.modules.identity.router import admin_router as identity_admin_router
@@ -30,6 +32,7 @@ from app.modules.knowledge.drive_gateway import GoogleDriveGatewayFactory
 from app.modules.knowledge.router import router as knowledge_router
 from app.modules.operations.health import ConfiguredHealthReporter, HealthReport
 from app.modules.operations.router import router as operations_router
+from app.modules.operations.router import staff_router as operations_staff_router
 from app.modules.rag.answer_service import GroundedAnswerService
 from app.modules.rag.router import router as rag_router
 from app.modules.retention.router import router as retention_router
@@ -38,11 +41,33 @@ from app.modules.support.router import staff_router as support_staff_router
 from app.modules.webhooks.router import router as webhooks_router
 
 
+def _missing_gmail_push_settings(settings: Settings) -> tuple[str, ...]:
+    if not settings.gmail_push_enabled:
+        return ()
+    required = (
+        ("GMAIL_PUBSUB_TOPIC", settings.gmail_pubsub_topic),
+        ("GMAIL_PUBSUB_SUBSCRIPTION", settings.gmail_pubsub_subscription),
+        ("GMAIL_PUSH_ENDPOINT_URL", settings.gmail_push_endpoint_url),
+        ("GMAIL_PUSH_OIDC_AUDIENCE", settings.gmail_push_oidc_audience),
+        (
+            "GMAIL_PUSH_SERVICE_ACCOUNT_EMAIL",
+            settings.gmail_push_service_account_email,
+        ),
+    )
+    return tuple(name for name, value in required if value is None)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     configure_logging()
     settings = settings or Settings()
     app = FastAPI(title="Enterprise AI Agent Platform", version="0.1.0")
     app.state.settings = settings
+    missing_gmail_push_settings = _missing_gmail_push_settings(settings)
+    if missing_gmail_push_settings:
+        log_event(
+            "gmail_push_configuration_incomplete",
+            missing_settings=list(missing_gmail_push_settings),
+        )
     app.state.celery = create_celery(settings)
     app.state.google_oidc_client = None
     envelope_cipher = envelope_cipher_from_settings(settings)
@@ -52,6 +77,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.webhook_cipher = envelope_cipher
     app.state.drive_gateway_factory = GoogleDriveGatewayFactory.from_settings(settings)
     app.state.gmail_gateway_factory = GoogleGmailGatewayFactory.from_settings(settings)
+    app.state.gmail_push_authenticator = None
+    if (
+        settings.gmail_push_enabled
+        and settings.gmail_push_oidc_audience is not None
+        and settings.gmail_push_service_account_email is not None
+        and settings.gmail_pubsub_subscription is not None
+    ):
+        app.state.gmail_push_authenticator = GmailPushAuthenticator(
+            audience=settings.gmail_push_oidc_audience,
+            service_account_email=settings.gmail_push_service_account_email,
+            subscription_name=settings.gmail_pubsub_subscription,
+            max_body_bytes=settings.gmail_push_max_body_bytes,
+        )
     app.state.chat_rate_limiter = None
     app.state.chat_sse_redis = None
     if settings.redis_url is not None:
@@ -104,7 +142,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(support_public_router)
     app.include_router(support_staff_router)
     app.include_router(email_router)
+    app.include_router(gmail_push_router)
     app.include_router(operations_router)
+    app.include_router(operations_staff_router)
     app.include_router(retention_router)
     app.include_router(webhooks_router)
 

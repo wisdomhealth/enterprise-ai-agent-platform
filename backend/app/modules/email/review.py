@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -17,21 +16,11 @@ from app.modules.email.models import (
     EmailStateHistory,
     EmailWorkItem,
 )
-from app.modules.email.schemas import EmailDraftResult
 from app.modules.email.state_machine import InvalidEmailTransition, transition
 from app.modules.identity.dependencies import Principal, ServicePrincipal
 from app.modules.identity.models import UserRole
+from app.modules.jobs.service import JobService
 from app.modules.outbox.service import OutboxService
-
-
-class DraftRegenerator(Protocol):
-    async def generate(
-        self,
-        work_item_id: UUID,
-        *,
-        job_id: UUID | None = None,
-        reviewer_instruction: str | None = None,
-    ) -> EmailDraftResult: ...
 
 
 class EmailReviewAuthorizationError(PermissionError):
@@ -112,18 +101,20 @@ class EmailReviewService:
         db_session: AsyncSession,
         principal: Principal,
         *,
-        drafting_service: DraftRegenerator | None = None,
         authorization_service: AuthorizationService | None = None,
         audit_service: AuditService | None = None,
         outbox_service: OutboxService | None = None,
+        job_service: JobService | None = None,
+        draft_attempt_limit: int = 3,
         message_id_domain: str = "mail.invalid",
     ) -> None:
         self._db_session = db_session
         self._principal = principal
-        self._drafting_service = drafting_service
         self._authorization = authorization_service or AuthorizationService(db_session)
         self._audit = audit_service or AuditService()
         self._outbox = outbox_service or OutboxService()
+        self._jobs = job_service or JobService()
+        self._draft_attempt_limit = draft_attempt_limit
         self._message_id_domain = message_id_domain
 
     async def regenerate(
@@ -136,24 +127,48 @@ class EmailReviewService:
     ) -> EmailReviewResult:
         if not instruction.strip():
             raise ValueError("reviewer instruction is required")
-        if self._drafting_service is None:
-            raise RuntimeError("email drafting service is unavailable")
         item, _ = await self._lock_current(
             work_item_id, expected_version=expected_version, current_draft_id=current_draft_id
         )
         if item.state is not EmailState.AWAITING_REVIEW:
             raise EmailReviewConflict(item)
         self._change_state(item, EmailAction.START_DRAFT, reason_code="REVIEWER_REGENERATION")
-        await self._db_session.flush()
-        await self._drafting_service.generate(
-            item.id, reviewer_instruction=instruction.strip()
+        job = await self._jobs.enqueue(
+            self._db_session,
+            "email.draft",
+            f"email.draft:{item.id}:manual:{item.version}",
+            {
+                "work_item_id": str(item.id),
+                "organization_id": str(item.organization_id),
+                "connector_id": str(item.connector_id),
+                "knowledge_base_id": str(item.knowledge_base_id),
+                "phase": "REVIEWER_REGENERATION",
+                "reviewer_instruction": instruction.strip(),
+                "requested_by": str(self._principal.subject_id),
+            },
         )
-        event_type = (
-            "email.draft.regenerated"
-            if item.state is EmailState.AWAITING_REVIEW
-            else "email.draft.regeneration_failed"
+        job.attempt_cycle = 1
+        job.cycle_start_attempts = job.attempts
+        job.cycle_attempt_limit = self._draft_attempt_limit
+        item.active_draft_job_id = job.id
+        await self._outbox.add(
+            self._db_session,
+            "email.draft.requested",
+            "job",
+            job.id,
+            {
+                "job_id": str(job.id),
+                "work_item_id": str(item.id),
+                "organization_id": str(item.organization_id),
+                "attempt_cycle": job.attempt_cycle,
+                "trigger": "REVIEWER_REGENERATION",
+            },
         )
-        await self._record(item, "email.draft.regenerate", event_type)
+        await self._record(
+            item,
+            "email.draft.regenerate",
+            "email.draft.regeneration_requested",
+        )
         return await self._result(item)
 
     async def edit(

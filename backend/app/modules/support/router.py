@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.authorization.application import require_support_application_access
 from app.modules.chat.models import ChatActor, ChatMessage, ChatSession, ConversationState
 from app.modules.chat.router import _begin_idempotency, _credential_value, _request_hash
 from app.modules.chat.service import ChatSessionService
@@ -22,7 +23,11 @@ from app.modules.support.models import Handoff, HandoffTrigger
 from app.modules.support.service import SupportAuthorizationError, SupportService, VersionConflict
 
 public_router = APIRouter(prefix="/api/v1/public/chat", tags=["public-chat"])
-staff_router = APIRouter(prefix="/api/v1/staff/support", tags=["support"])
+staff_router = APIRouter(
+    prefix="/api/v1/staff/support",
+    tags=["support"],
+    dependencies=[Depends(require_support_application_access)],
+)
 
 
 class PublicHandoffCreate(BaseModel):
