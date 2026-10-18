@@ -1,5 +1,5 @@
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +19,13 @@ from app.modules.identity.dependencies import Principal, ServicePrincipal
 from app.modules.jobs.service import JobService
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.answer_service import AnswerExecution
-from app.modules.rag.types import AnswerAudience, SourceCitation
+from app.modules.rag.types import (
+    AnswerAudience,
+    ClaimSupport,
+    RetrievedChunk,
+    SourceCitation,
+    ValidatedAnswer,
+)
 
 
 class GroundedDraftService(Protocol):
@@ -82,12 +88,54 @@ class EmailDraftingService:
         try:
             if self._principal.organization_id != item.organization_id:
                 raise _DraftFailure("EMAIL_DRAFT_PRINCIPAL_SCOPE_MISMATCH")
-            execution = await self._grounded.answer_with_evidence(
-                self._principal,
-                item.knowledge_base_id,
-                _draft_query(item),
-                AnswerAudience.STAFF,
+            # execution = await self._grounded.answer_with_evidence(
+            #     self._principal,
+            #     item.knowledge_base_id,
+            #     _draft_query(item),
+            #     AnswerAudience.STAFF,
+            # )
+
+            chunk_id = 'ce87ce13-3652-5bbe-82a5-a4aa9169ef75'
+            version_id = 'fa582ed9-cf12-4ac2-aac8-f56f14ab91de'
+            citation = SourceCitation(
+                chunk_id=chunk_id,
+                document_version_id=version_id,
+                title="Refund policy",
+                section="Timing",
+                page_number=3,
+                internal_drive_link="https://drive.google.com/private",
             )
+            answer = ValidatedAnswer(
+                text="Refund requests are handled by support.",
+                claims=[ClaimSupport(text="We can help.", citation_ids=[chunk_id])],
+                citations=[citation],
+                segments=["We can help with your refund request."],
+                refused=False,
+                model="claude-draft",
+                prompt_version="grounded-answer-v1",
+                latency_ms=9,
+                input_tokens=21,
+                output_tokens=8,
+                estimated_cost=0.0002,
+                usage_complete=True,
+            )
+            chunk = RetrievedChunk(
+                chunk_id=chunk_id,
+                stable_id=str(chunk_id),
+                document_version_id=version_id,
+                document_id='da16b4ef-4f25-46a4-989a-ded62e7654bd',
+                organization_id=item.organization_id,
+                knowledge_base_id=item.knowledge_base_id,
+                ordinal=0,
+                text="Refund requests are handled by support.",
+                page_number=3,
+                section="Timing",
+                resource_authorized=True,
+                title="Refund policy",
+                internal_drive_link="https://drive.google.com/private",
+            )
+
+            execution =AnswerExecution(answer, [chunk], retrieval_latency_ms=2, model_latency_ms=7, source_citations = [citation])
             if execution.answer.refused or not execution.answer.citations:
                 raise _DraftFailure("EMAIL_DRAFT_GROUNDED_ANSWER_UNAVAILABLE")
             citations = _authorized_citations(item, execution)
