@@ -28,6 +28,7 @@ from app.modules.identity.dependencies import (
     require_staff_csrf,
     require_staff_session,
 )
+from app.modules.jobs.models import JobIntent
 from app.modules.operations.application_authorization import ApplicationAuthorizationService
 from app.modules.operations.connector_authorization import ConnectorAuthorizationService
 from app.modules.operations.schemas import (
@@ -130,11 +131,20 @@ def _gmail_watch_service(
     )
 
 
-def _gmail_sync_state_read(state) -> GmailSyncStateRead:  # type: ignore[no-untyped-def]
+async def _gmail_sync_state_read(
+    db_session: AsyncSession, state: EmailSyncState, settings: object
+) -> GmailSyncStateRead:
+    active_job = (
+        await db_session.get(JobIntent, state.active_sync_job_id)
+        if state.active_sync_job_id is not None
+        else None
+    )
     return GmailSyncStateRead(
         connector_id=state.connector_id,
         mailbox_address=state.mailbox_address,
         auto_sync_enabled=state.auto_sync_enabled,
+        polling_enabled=bool(getattr(settings, "gmail_polling_enabled", False)),
+        push_enabled=bool(getattr(settings, "gmail_push_enabled", False)),
         watch_status=state.watch_status.value,
         sync_status=state.sync_status.value,
         processed_history_id=state.processed_history_id,
@@ -146,13 +156,24 @@ def _gmail_sync_state_read(state) -> GmailSyncStateRead:  # type: ignore[no-unty
         recovery_message_limit=state.recovery_message_limit,
         recovery_has_more=state.recovery_has_more,
         last_error_code=state.watch_last_error_code or state.last_error_code,
+        last_success_at=state.last_success_at,
+        active_job_id=active_job.id if active_job is not None else None,
+        active_job_state=active_job.state.value if active_job is not None else None,
+        active_job_trigger=(
+            str(active_job.payload.get("trigger")) if active_job is not None else None
+        ),
         version=state.version,
     )
 
 
-async def _watch_action(action: Awaitable[object]) -> GmailSyncStateRead:
+async def _watch_action(
+    action: Awaitable[object], db_session: AsyncSession, settings: object
+) -> GmailSyncStateRead:
     try:
-        return _gmail_sync_state_read(await action)
+        state = await action
+        if not isinstance(state, EmailSyncState):
+            raise TypeError("Gmail action returned an invalid state")
+        return await _gmail_sync_state_read(db_session, state, settings)
     except LookupError:
         raise OperationsNotFound from None
 
@@ -228,6 +249,7 @@ async def operations_summary(
 
 @router.get("/gmail-sync", response_model=list[GmailSyncStateRead])
 async def gmail_sync_states(
+    request: Request,
     principal: Annotated[Principal, Depends(require_admin_session)],
     db_session: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> list[GmailSyncStateRead]:
@@ -240,7 +262,10 @@ async def gmail_sync_states(
             )
         ).all()
     )
-    return [_gmail_sync_state_read(state) for state in states]
+    return [
+        await _gmail_sync_state_read(db_session, state, request.app.state.settings)
+        for state in states
+    ]
 
 
 @router.get("/authorization/connectors", response_model=list[ConnectorAuthorizationRead])
@@ -354,7 +379,9 @@ async def start_gmail_watch(
         request_body={"action": "start"},
         response_type=GmailSyncStateRead,
         invoke=lambda: _watch_action(
-            service.start(connector_id, principal.organization_id)
+            service.start(connector_id, principal.organization_id),
+            db_session,
+            request.app.state.settings,
         ),
     )
 
@@ -380,7 +407,9 @@ async def renew_gmail_watch(
         request_body={"action": "renew"},
         response_type=GmailSyncStateRead,
         invoke=lambda: _watch_action(
-            service.renew(connector_id, principal.organization_id)
+            service.renew(connector_id, principal.organization_id),
+            db_session,
+            request.app.state.settings,
         ),
     )
 
@@ -406,7 +435,9 @@ async def stop_gmail_watch(
         request_body={"action": "stop"},
         response_type=GmailSyncStateRead,
         invoke=lambda: _watch_action(
-            service.stop(connector_id, principal.organization_id)
+            service.stop(connector_id, principal.organization_id),
+            db_session,
+            request.app.state.settings,
         ),
     )
 
@@ -417,6 +448,7 @@ async def stop_gmail_watch(
 )
 async def continue_gmail_recovery(
     connector_id: UUID,
+    request: Request,
     request_body: GmailRecoveryContinueRequest,
     principal: Annotated[Principal, Depends(require_admin_csrf)],
     db_session: Annotated[AsyncSession, Depends(get_db_session)],
@@ -438,7 +470,9 @@ async def continue_gmail_recovery(
                 expected_version=request_body.expected_version,
                 additional_messages=request_body.additional_messages,
                 reason=request_body.reason,
-            )
+            ),
+            db_session,
+            request.app.state.settings,
         ),
     )
 
@@ -449,6 +483,7 @@ async def continue_gmail_recovery(
 )
 async def accept_limited_gmail_recovery(
     connector_id: UUID,
+    request: Request,
     request_body: GmailRecoveryAcceptRequest,
     principal: Annotated[Principal, Depends(require_admin_csrf)],
     db_session: Annotated[AsyncSession, Depends(get_db_session)],
@@ -470,7 +505,9 @@ async def accept_limited_gmail_recovery(
                 expected_version=request_body.expected_version,
                 confirmed=request_body.confirmed,
                 reason=request_body.reason,
-            )
+            ),
+            db_session,
+            request.app.state.settings,
         ),
     )
 
@@ -481,6 +518,7 @@ async def accept_limited_gmail_recovery(
 )
 async def manual_gmail_sync(
     connector_id: UUID,
+    request: Request,
     request_body: GmailManualSyncRequest,
     principal: Annotated[Principal, Depends(require_admin_csrf)],
     db_session: Annotated[AsyncSession, Depends(get_db_session)],
@@ -501,7 +539,9 @@ async def manual_gmail_sync(
                 connector_id,
                 expected_version=request_body.expected_version,
                 reason=request_body.reason,
-            )
+            ),
+            db_session,
+            request.app.state.settings,
         ),
     )
 

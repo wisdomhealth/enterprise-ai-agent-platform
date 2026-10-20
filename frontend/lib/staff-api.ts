@@ -456,6 +456,8 @@ export type AdminGmailSyncState = {
   connector_id: string;
   mailbox_address: string | null;
   auto_sync_enabled: boolean;
+  polling_enabled: boolean;
+  push_enabled: boolean;
   watch_status: string;
   sync_status: string;
   processed_history_id: string | null;
@@ -467,6 +469,10 @@ export type AdminGmailSyncState = {
   recovery_message_limit: number;
   recovery_has_more: boolean;
   last_error_code: string | null;
+  last_success_at: string | null;
+  active_job_id: string | null;
+  active_job_state: string | null;
+  active_job_trigger: string | null;
   version: number;
 };
 

@@ -15,6 +15,7 @@ const stateLabel: Record<SupportHandoff["state"], string> = {
 export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff) => void }) {
   const [handoffs, setHandoffs] = useState<SupportHandoff[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const selectionButtons = useRef(new Map<string, HTMLButtonElement>());
 
   useEffect(() => {
@@ -24,6 +25,8 @@ export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff
   }, []);
 
   async function claim(handoff: SupportHandoff) {
+    if (busyId) return;
+    setBusyId(handoff.id);
     setNotice(null);
     try {
       const claimed = await claimHandoff(handoff.id, handoff.version);
@@ -52,15 +55,17 @@ export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff
         setNotice("Unable to claim the conversation.");
       }
     } finally {
+      setBusyId(null);
       selectionButtons.current.get(handoff.id)?.focus();
     }
   }
 
   return (
     <section aria-labelledby="support-queue-heading">
-      <h1 id="support-queue-heading">Support queue</h1>
-      <p aria-live="polite">{notice}</p>
-      <ul aria-label="Queued customer conversations">
+      <h2 id="support-queue-heading">Conversation queue</h2>
+      <p>Customer conversations waiting for review or human ownership.</p>
+      <p className="staff-notice" aria-live="polite">{notice}</p>
+      <ul className="staff-list" aria-label="Queued customer conversations">
         {handoffs.map((handoff) => (
           <li key={handoff.id}>
             <button
@@ -73,16 +78,17 @@ export function SupportQueue({ onSelect }: { onSelect?: (handoff: SupportHandoff
             >
               Conversation {handoff.session_id}
             </button>
-            <span> {stateLabel[handoff.state]}</span>
-            <span> Version {handoff.version}</span>
+            <span className="staff-status" data-tone={handoff.state === "HUMAN_ACTIVE" ? "success" : handoff.state === "HANDOFF_REQUESTED" || handoff.state === "QUEUED" ? "warning" : undefined}>{stateLabel[handoff.state]}</span>
+            <span className="staff-list-meta">Version {handoff.version}</span>
             {handoff.state === "QUEUED" ? (
-              <button type="button" onClick={() => void claim(handoff)}>
-                Claim
+              <button type="button" className="button-primary" disabled={busyId !== null} onClick={() => void claim(handoff)}>
+                {busyId === handoff.id ? "Claiming…" : "Claim"}
               </button>
             ) : null}
           </li>
         ))}
       </ul>
+      {handoffs.length === 0 && !notice ? <p>No conversations need attention.</p> : null}
     </section>
   );
 }

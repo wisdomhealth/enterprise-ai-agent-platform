@@ -8,6 +8,7 @@ from app.modules.audit.models import AuditEvent
 from app.modules.authorization.models import ResourceGrant
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
+from app.modules.email.models import EmailSyncState
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffUser, UserRole, UserStatus
 from app.modules.outbox.models import OutboxEvent
@@ -83,6 +84,42 @@ async def test_admin_authorization_emits_audit_and_outbox(db_session, tmp_path) 
         )
         is not None
     )
+
+
+@pytest.mark.asyncio
+async def test_gmail_authorization_creates_pollable_sync_state(db_session, tmp_path) -> None:
+    organization = Organization(name="Gmail polling authorization")
+    db_session.add(organization)
+    await db_session.flush()
+    key_path = tmp_path / "connector-master-key"
+    key_path.write_bytes(b"g" * 32)
+    service = ConnectorService.for_file_key(key_path, app_env="development")
+    principal = await _principal_for(
+        db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
+    )
+    db_session.add(
+        ResourceGrant(
+            organization_id=organization.id,
+            subject_id=principal.subject_id,
+            resource_type="connector",
+            resource_id=service.configuration_resource_id(organization.id, ConnectorKind.GMAIL),
+            actions=["connector.create"],
+        )
+    )
+    await db_session.flush()
+
+    connector = await service.create_or_reauthorize(
+        db_session,
+        principal=principal,
+        kind=ConnectorKind.GMAIL,
+        refresh_token="test-only-refresh-token",
+    )
+
+    state = await db_session.scalar(
+        select(EmailSyncState).where(EmailSyncState.connector_id == connector.id)
+    )
+    assert state is not None
+    assert state.organization_id == organization.id
 
 
 @pytest.mark.asyncio

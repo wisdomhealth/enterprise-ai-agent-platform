@@ -2,9 +2,9 @@ import { EmailDraft } from "../../lib/staff-api";
 
 export function DraftHistory({ drafts, currentDraftId }: { drafts: EmailDraft[]; currentDraftId: string }) {
   return (
-    <section aria-labelledby="draft-history-heading">
+    <section className="staff-card" aria-labelledby="draft-history-heading">
       <h2 id="draft-history-heading">Immutable draft history</h2>
-      <ol>
+      <ol className="staff-list">
         {drafts.map((draft) => (
           <li key={draft.id}>
             <details open={draft.id === currentDraftId}>

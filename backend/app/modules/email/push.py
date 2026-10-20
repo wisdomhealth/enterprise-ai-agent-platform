@@ -16,13 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.email.models import (
     EmailSyncState,
     GmailPushReceipt,
-    GmailSyncStatus,
 )
-from app.modules.email.tasks import EMAIL_HISTORY_KIND, EMAIL_HISTORY_OUTBOX_EVENT_TYPE
-from app.modules.jobs.models import JobIntent, JobState
-from app.modules.jobs.service import JobService
+from app.modules.email.sync import GmailSyncCoordinator, GmailSyncPaused
 from app.modules.knowledge.models import KnowledgeBase
-from app.modules.outbox.service import OutboxService
 
 
 class GmailPushValidationError(ValueError):
@@ -194,24 +190,6 @@ class GmailPushService:
             state.pending_history_id
         ):
             state.pending_history_id = notification.history_id
-        active = (
-            await self._db_session.get(JobIntent, state.active_sync_job_id)
-            if state.active_sync_job_id is not None
-            else None
-        )
-        if active is not None and active.state in {
-            JobState.PENDING,
-            JobState.RUNNING,
-            JobState.RECONCILIATION,
-        }:
-            await self._db_session.commit()
-            return active.id
-        if state.sync_status is GmailSyncStatus.PAUSED_ERROR:
-            await self._db_session.commit()
-            return None
-        state.sync_generation += 1
-        generation = state.sync_generation
-        state.sync_start_history_id = state.processed_history_id
         knowledge_base_id = await self._db_session.scalar(
             select(KnowledgeBase.id).where(
                 KnowledgeBase.organization_id == state.organization_id
@@ -219,33 +197,15 @@ class GmailPushService:
         )
         if knowledge_base_id is None:
             raise RuntimeError("Gmail mailbox organization has no knowledge base")
-        job = await JobService().enqueue(
-            self._db_session,
-            EMAIL_HISTORY_KIND,
-            f"email.gmail_history:{state.connector_id}:generation:{generation}",
-            {
-                "connector_id": str(state.connector_id),
-                "organization_id": str(state.organization_id),
-                "knowledge_base_id": str(knowledge_base_id),
-                "history_id": state.processed_history_id,
-                "sync_generation": generation,
-                "trigger": "PUSH",
-            },
-        )
-        await OutboxService().add(
-            self._db_session,
-            EMAIL_HISTORY_OUTBOX_EVENT_TYPE,
-            "job",
-            job.id,
-            {
-                "job_id": str(job.id),
-                "connector_id": str(state.connector_id),
-                "organization_id": str(state.organization_id),
-                "sync_generation": generation,
-            },
-        )
-        state.active_sync_job_id = job.id
-        state.sync_status = GmailSyncStatus.RUNNING
+        try:
+            sync_request = await GmailSyncCoordinator(self._db_session).schedule_locked(
+                state,
+                knowledge_base_id=knowledge_base_id,
+                trigger="PUSH",
+            )
+        except GmailSyncPaused:
+            await self._db_session.commit()
+            return None
         state.version += 1
         await self._db_session.commit()
-        return job.id
+        return sync_request.job.id

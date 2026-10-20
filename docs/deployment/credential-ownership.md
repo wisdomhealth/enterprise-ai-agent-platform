@@ -43,6 +43,9 @@ not a developer account.
 | `EMAIL_CLASSIFICATION_MAX_ATTEMPTS` | AI platform | Total durable attempts allowed for one email classification job. |
 | `EMAIL_CLASSIFICATION_RETRY_BASE_SECONDS` | AI platform | Base delay for durable email classification exponential backoff. |
 | `EMAIL_CLASSIFICATION_RETRY_MAX_SECONDS` | AI platform | Maximum email classification delay and provider `Retry-After` cap. |
+| `EMAIL_DRAFT_MAX_ATTEMPTS` | AI platform | Total durable attempts allowed for one email draft job. |
+| `EMAIL_DRAFT_RETRY_BASE_SECONDS` | AI platform | Base delay for durable email draft exponential backoff. |
+| `EMAIL_DRAFT_RETRY_MAX_SECONDS` | AI platform | Maximum email draft retry delay. |
 | `OPENAI_EMBEDDING_MODEL` | AI platform | Approved embedding model; changing vector compatibility requires a migration and re-embedding. |
 | `OPENAI_EMBEDDING_DIMENSIONS` | AI platform | Embedding vector size, fixed at 1536 to match the pgvector column. |
 | `OPENAI_EMBEDDING_BATCH_SIZE` | AI platform | Maximum texts submitted by each LlamaIndex embedding batch. |
@@ -61,6 +64,21 @@ not a developer account.
 | `GOOGLE_DRIVE_CLIENT_SECRET` | Google Cloud administrator | Read-only Drive OAuth client secret. |
 | `GOOGLE_GMAIL_CLIENT_ID` | Google Cloud administrator | Gmail OAuth client identifier. |
 | `GOOGLE_GMAIL_CLIENT_SECRET` | Google Cloud administrator | Gmail OAuth client secret. |
+| `GMAIL_POLLING_ENABLED` | Email operations | Enables independent scheduled Gmail synchronization. |
+| `GMAIL_PUSH_ENABLED` | Email operations | Enables Gmail Push watch and webhook processing independently of polling. |
+| `GMAIL_PUBSUB_TOPIC` | Google Cloud administrator | Gmail Push Pub/Sub topic resource name. |
+| `GMAIL_PUBSUB_SUBSCRIPTION` | Google Cloud administrator | Gmail Push Pub/Sub subscription resource name. |
+| `GMAIL_PUSH_ENDPOINT_URL` | Network operations | Public HTTPS Gmail Pub/Sub webhook URL. |
+| `GMAIL_PUSH_OIDC_AUDIENCE` | Security owner | Expected audience for Gmail Pub/Sub push OIDC tokens. |
+| `GMAIL_PUSH_SERVICE_ACCOUNT_EMAIL` | Security owner | Dedicated Pub/Sub push authentication service account. |
+| `GMAIL_PUSH_MAX_BODY_BYTES` | Security owner | Maximum accepted Gmail Pub/Sub request size. |
+| `GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS` | Email operations | Scheduler interval for checking Gmail Watch renewal. |
+| `GMAIL_WATCH_RENEW_BEFORE_SECONDS` | Email operations | Time before expiration when Gmail Watch renewal becomes due. |
+| `GMAIL_RECONCILIATION_INTERVAL_SECONDS` | Email operations | Due interval between successful scheduled Gmail synchronizations. |
+| `GMAIL_PUSH_RECEIPT_RETENTION_DAYS` | Data platform | Retention period for deduplication receipts from Gmail Push. |
+| `GMAIL_RECOVERY_LOOKBACK_DAYS` | Email operations | Gmail recovery lookback window after history expiration. |
+| `GMAIL_RECOVERY_MAX_MESSAGES` | Email operations | Maximum messages admitted by one bounded recovery cycle. |
+| `GMAIL_SYNC_MAX_ATTEMPTS` | Email operations | Total durable attempts allowed for one Gmail history synchronization job. |
 | `GMAIL_MESSAGE_ID_DOMAIN` | Email operations | Customer-controlled Message-ID domain. |
 | `GOOGLE_CLOUD_PROJECT` | Google Cloud administrator | Customer Google Cloud project identifier. |
 | `GOOGLE_KMS_KEY_NAME` | Google Cloud administrator | KMS key resource identifier for envelope wrapping. |

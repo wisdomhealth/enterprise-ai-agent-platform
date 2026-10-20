@@ -22,6 +22,7 @@ from app.modules.email.models import (
     EmailState,
     EmailSyncState,
     EmailWorkItem,
+    GmailSyncStatus,
 )
 from app.modules.email.push import GmailPushService, VerifiedGmailNotification
 from app.modules.email.schemas import EmailClassification
@@ -101,6 +102,101 @@ async def test_history_job_key_is_bounded_for_provider_page_tokens(
     )
     assert job is not None
     assert len(job.idempotency_key) <= 255
+
+
+@pytest.mark.asyncio
+async def test_scheduled_history_sync_only_creates_one_job_when_due(
+    db_session: AsyncSession, email_context: dict[str, object]
+) -> None:
+    connector = email_context["connector"]
+    now = datetime(2026, 10, 20, 8, 0, tzinfo=UTC)
+    state = EmailSyncState(
+        organization_id=connector.organization_id,
+        connector_id=connector.id,
+        processed_history_id="cursor-100",
+        auto_sync_enabled=False,
+        last_success_at=now,
+    )
+    db_session.add(state)
+    await db_session.commit()
+
+    await _enqueue_gmail_history_jobs(
+        db_session=db_session,
+        now=now + timedelta(minutes=59),
+        interval_seconds=3600,
+    )
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "email.gmail_history",
+            JobIntent.payload["connector_id"].astext == str(connector.id),
+        )
+    ) == 0
+
+    await _enqueue_gmail_history_jobs(
+        db_session=db_session,
+        now=now + timedelta(hours=1),
+        interval_seconds=3600,
+    )
+    await _enqueue_gmail_history_jobs(
+        db_session=db_session,
+        now=now + timedelta(hours=2),
+        interval_seconds=3600,
+    )
+
+    jobs = list(
+        (
+            await db_session.scalars(
+                select(JobIntent).where(
+                    JobIntent.kind == "email.gmail_history",
+                    JobIntent.payload["connector_id"].astext == str(connector.id),
+                )
+            )
+        ).all()
+    )
+    await db_session.refresh(state)
+    assert len(jobs) == 1
+    assert jobs[0].payload["trigger"] == "SCHEDULED"
+    assert state.active_sync_job_id == jobs[0].id
+    assert state.sync_status is GmailSyncStatus.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sync_status",
+    [
+        GmailSyncStatus.PAUSED_ERROR,
+        GmailSyncStatus.RECOVERY_REQUIRED,
+        GmailSyncStatus.RECOVERY_TRUNCATED,
+    ],
+)
+async def test_scheduled_history_sync_does_not_reactivate_paused_states(
+    db_session: AsyncSession,
+    email_context: dict[str, object],
+    sync_status: GmailSyncStatus,
+) -> None:
+    connector = email_context["connector"]
+    db_session.add(
+        EmailSyncState(
+            organization_id=connector.organization_id,
+            connector_id=connector.id,
+            processed_history_id="cursor-100",
+            sync_status=sync_status,
+        )
+    )
+    await db_session.commit()
+
+    await _enqueue_gmail_history_jobs(
+        db_session=db_session,
+        now=datetime(2026, 10, 20, 8, 0, tzinfo=UTC),
+        interval_seconds=3600,
+    )
+
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind == "email.gmail_history",
+            JobIntent.payload["connector_id"].astext == str(connector.id),
+        )
+    ) == 0
 
 
 class BlockingClassifier:

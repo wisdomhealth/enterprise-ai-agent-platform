@@ -16,6 +16,7 @@ from app.modules.connectors.encryption import (
     envelope_cipher_from_settings,
 )
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
+from app.modules.email.models import EmailSyncState
 from app.modules.identity.dependencies import Principal
 from app.modules.outbox.service import OutboxService
 
@@ -280,6 +281,18 @@ class ConnectorService:
             connector.secret_id = secret.id
             connector.status = ConnectorStatus.ACTIVE
         await db_session.flush()
+        if kind is ConnectorKind.GMAIL:
+            sync_state = await db_session.scalar(
+                select(EmailSyncState).where(EmailSyncState.connector_id == connector.id)
+            )
+            if sync_state is None:
+                db_session.add(
+                    EmailSyncState(
+                        organization_id=organization_id,
+                        connector_id=connector.id,
+                    )
+                )
+                await db_session.flush()
         return connector
 
     async def _require_action(

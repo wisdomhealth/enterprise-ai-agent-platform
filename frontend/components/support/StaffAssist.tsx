@@ -8,16 +8,20 @@ export function StaffAssist() {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<StaffKnowledgeAnswer | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   async function search(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!question.trim()) return;
+    if (!question.trim() || busy) return;
+    setBusy(true);
     setError(null);
     try {
       setAnswer(await searchStaffKnowledge(question.trim()));
     } catch {
       setAnswer(null);
       setError("Knowledge search is unavailable.");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -33,7 +37,7 @@ export function StaffAssist() {
           onChange={(event) => setQuestion(event.target.value)}
           maxLength={4000}
         />
-        <button type="submit">Search</button>
+        <button type="submit" disabled={busy || !question.trim()}>{busy ? "Searching…" : "Search"}</button>
       </form>
       {error ? <p role="alert">{error}</p> : null}
       {answer ? (

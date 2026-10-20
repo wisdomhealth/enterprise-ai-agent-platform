@@ -25,7 +25,7 @@ export function ConnectorStatus({
   return (
     <section aria-labelledby="connector-status-heading">
       <h2 id="connector-status-heading">Google connections</h2>
-      <ul>
+      <ul className="staff-list">
         {connectorKinds.map((kind) => {
           const connector = connectors.find((candidate) => candidate.kind === kind);
           const createGranted = authorizations === undefined || authorizations
@@ -37,10 +37,11 @@ export function ConnectorStatus({
               <strong>{name}</strong>
               {connector ? (
                 <>
-                  {` · ${statusLabel(connector.status)} · Updated ${formatUtc(connector.updated_at)}`}
+                  <span className="staff-status" data-tone={connector.status === "ACTIVE" ? "success" : "warning"}>{statusLabel(connector.status)}</span>
+                  {` · Updated ${formatUtc(connector.updated_at)}`}
                   <p>Requested scopes: {connector.requested_scopes.join(", ")}</p>
                   {connector.status !== "ACTIVE" ? (
-                    <button type="button" onClick={() => setPending(connector)}>
+                    <button className="button-primary" type="button" onClick={() => setPending(connector)}>
                       Reauthorize {name}
                     </button>
                   ) : null}
@@ -50,7 +51,7 @@ export function ConnectorStatus({
                   {createGranted ? " · Not connected" : " · Authorization required"}
                   <p>
                     {createGranted ? (
-                      <button
+                      <button className="button-primary"
                         type="button"
                         onClick={() => window.location.assign(`/api/v1/admin/connectors/${kind}/authorize`)}
                       >

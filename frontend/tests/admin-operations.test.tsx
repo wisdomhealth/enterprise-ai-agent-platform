@@ -348,6 +348,8 @@ it("requires an explicit warning confirmation before accepting limited Gmail rec
         connector_id: "gmail-1",
         mailbox_address: "support@example.test",
         auto_sync_enabled: true,
+        polling_enabled: true,
+        push_enabled: false,
         watch_status: "ACTIVE",
         sync_status: "RECOVERY_TRUNCATED",
         processed_history_id: null,
@@ -359,6 +361,10 @@ it("requires an explicit warning confirmation before accepting limited Gmail rec
         recovery_message_limit: 500,
         recovery_has_more: true,
         last_error_code: null,
+        last_success_at: "2026-10-20T08:00:00Z",
+        active_job_id: null,
+        active_job_state: null,
+        active_job_trigger: null,
         version: 7,
       }]}
       onWatch={vi.fn().mockResolvedValue(undefined)}

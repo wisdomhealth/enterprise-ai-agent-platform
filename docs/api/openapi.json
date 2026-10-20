@@ -33,6 +33,86 @@
         "title": "AdminUserRead",
         "type": "object"
       },
+      "ApplicationAccessRead": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "email",
+              "support"
+            ],
+            "title": "Capability",
+            "type": "string"
+          },
+          "effective_allowed": {
+            "title": "Effective Allowed",
+            "type": "boolean"
+          },
+          "grant_present": {
+            "title": "Grant Present",
+            "type": "boolean"
+          },
+          "resource_id": {
+            "format": "uuid",
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "reviewable_knowledge_base_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Reviewable Knowledge Base Ids",
+            "type": "array"
+          },
+          "role_status_eligible": {
+            "title": "Role Status Eligible",
+            "type": "boolean"
+          },
+          "staff_user_id": {
+            "format": "uuid",
+            "title": "Staff User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "staff_user_id",
+          "capability",
+          "resource_id",
+          "grant_present",
+          "role_status_eligible",
+          "reviewable_knowledge_base_ids",
+          "effective_allowed"
+        ],
+        "title": "ApplicationAccessRead",
+        "type": "object"
+      },
+      "ApplicationCapability": {
+        "enum": [
+          "email",
+          "support"
+        ],
+        "title": "ApplicationCapability",
+        "type": "string"
+      },
+      "ApplicationGrantReplace": {
+        "properties": {
+          "expected_user_version": {
+            "minimum": 1.0,
+            "title": "Expected User Version",
+            "type": "integer"
+          },
+          "granted": {
+            "title": "Granted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "granted",
+          "expected_user_version"
+        ],
+        "title": "ApplicationGrantReplace",
+        "type": "object"
+      },
       "ChatActor": {
         "enum": [
           "CUSTOMER",
@@ -779,6 +859,277 @@
         "title": "FailedJobRead",
         "type": "object"
       },
+      "GmailManualSyncRequest": {
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "reason": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_version",
+          "reason"
+        ],
+        "title": "GmailManualSyncRequest",
+        "type": "object"
+      },
+      "GmailRecoveryAcceptRequest": {
+        "properties": {
+          "confirmed": {
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "reason": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_version",
+          "confirmed",
+          "reason"
+        ],
+        "title": "GmailRecoveryAcceptRequest",
+        "type": "object"
+      },
+      "GmailRecoveryContinueRequest": {
+        "properties": {
+          "additional_messages": {
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Additional Messages",
+            "type": "integer"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "reason": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_version",
+          "additional_messages",
+          "reason"
+        ],
+        "title": "GmailRecoveryContinueRequest",
+        "type": "object"
+      },
+      "GmailSyncStateRead": {
+        "properties": {
+          "active_job_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Job Id"
+          },
+          "active_job_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Job State"
+          },
+          "active_job_trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Job Trigger"
+          },
+          "auto_sync_enabled": {
+            "title": "Auto Sync Enabled",
+            "type": "boolean"
+          },
+          "connector_id": {
+            "format": "uuid",
+            "title": "Connector Id",
+            "type": "string"
+          },
+          "last_error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Code"
+          },
+          "last_success_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Success At"
+          },
+          "mailbox_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mailbox Address"
+          },
+          "pending_history_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending History Id"
+          },
+          "polling_enabled": {
+            "title": "Polling Enabled",
+            "type": "boolean"
+          },
+          "processed_history_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Processed History Id"
+          },
+          "push_enabled": {
+            "title": "Push Enabled",
+            "type": "boolean"
+          },
+          "recovery_batch_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Batch Id"
+          },
+          "recovery_has_more": {
+            "title": "Recovery Has More",
+            "type": "boolean"
+          },
+          "recovery_message_limit": {
+            "title": "Recovery Message Limit",
+            "type": "integer"
+          },
+          "recovery_processed_count": {
+            "title": "Recovery Processed Count",
+            "type": "integer"
+          },
+          "recovery_window_started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Window Started At"
+          },
+          "sync_status": {
+            "title": "Sync Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          },
+          "watch_expiration_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watch Expiration At"
+          },
+          "watch_status": {
+            "title": "Watch Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "mailbox_address",
+          "auto_sync_enabled",
+          "polling_enabled",
+          "push_enabled",
+          "watch_status",
+          "sync_status",
+          "processed_history_id",
+          "pending_history_id",
+          "watch_expiration_at",
+          "recovery_batch_id",
+          "recovery_window_started_at",
+          "recovery_processed_count",
+          "recovery_message_limit",
+          "recovery_has_more",
+          "last_error_code",
+          "last_success_at",
+          "active_job_id",
+          "active_job_state",
+          "active_job_trigger",
+          "version"
+        ],
+        "title": "GmailSyncStateRead",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -795,6 +1146,7 @@
       "JobAction": {
         "enum": [
           "RETRY_DRIVE_SYNC",
+          "RETRY_EMAIL_CLASSIFICATION",
           "RETRY_EMAIL_DELIVERY",
           "RECONCILE_GMAIL",
           "NONE"
@@ -824,6 +1176,27 @@
           "version"
         ],
         "title": "JobRetryRead",
+        "type": "object"
+      },
+      "JobRetryRequest": {
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "reason": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "expected_version"
+        ],
+        "title": "JobRetryRequest",
         "type": "object"
       },
       "JobSummaryRead": {
@@ -2386,6 +2759,190 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/admin/authorization/applications/{staff_user_id}": {
+      "get": {
+        "operationId": "application_authorizations_api_v1_admin_authorization_applications__staff_user_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "staff_user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Staff User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ApplicationAccessRead"
+                  },
+                  "title": "Response Application Authorizations Api V1 Admin Authorization Applications  Staff User Id  Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Application Authorizations",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/authorization/applications/{staff_user_id}/{capability}": {
+      "put": {
+        "operationId": "replace_application_grant_api_v1_admin_authorization_applications__staff_user_id___capability__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "staff_user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Staff User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "capability",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ApplicationCapability"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplicationGrantReplace"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationAccessRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Replace Application Grant",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
     "/api/v1/admin/authorization/connectors": {
       "get": {
         "operationId": "connector_authorizations_api_v1_admin_authorization_connectors_get",
@@ -2544,6 +3101,618 @@
           }
         ],
         "summary": "Replace Connector Grants",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/connectors/{connector_id}/gmail-recovery/accept-limited": {
+      "post": {
+        "operationId": "accept_limited_gmail_recovery_api_v1_admin_connectors__connector_id__gmail_recovery_accept_limited_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GmailRecoveryAcceptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GmailSyncStateRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Accept Limited Gmail Recovery",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/connectors/{connector_id}/gmail-recovery/continue": {
+      "post": {
+        "operationId": "continue_gmail_recovery_api_v1_admin_connectors__connector_id__gmail_recovery_continue_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GmailRecoveryContinueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GmailSyncStateRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Continue Gmail Recovery",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/connectors/{connector_id}/gmail-sync/manual": {
+      "post": {
+        "operationId": "manual_gmail_sync_api_v1_admin_connectors__connector_id__gmail_sync_manual_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GmailManualSyncRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GmailSyncStateRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Manual Gmail Sync",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/connectors/{connector_id}/gmail-watch/renew": {
+      "post": {
+        "operationId": "renew_gmail_watch_api_v1_admin_connectors__connector_id__gmail_watch_renew_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GmailSyncStateRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Renew Gmail Watch",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/connectors/{connector_id}/gmail-watch/start": {
+      "post": {
+        "operationId": "start_gmail_watch_api_v1_admin_connectors__connector_id__gmail_watch_start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GmailSyncStateRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Start Gmail Watch",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
+    "/api/v1/admin/connectors/{connector_id}/gmail-watch/stop": {
+      "post": {
+        "operationId": "stop_gmail_watch_api_v1_admin_connectors__connector_id__gmail_watch_stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GmailSyncStateRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Stop Gmail Watch",
         "tags": [
           "administrator-operations"
         ],
@@ -2967,6 +4136,65 @@
         "x-security-classification": "administrator"
       }
     },
+    "/api/v1/admin/gmail-sync": {
+      "get": {
+        "operationId": "gmail_sync_states_api_v1_admin_gmail_sync_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GmailSyncStateRead"
+                  },
+                  "title": "Response Gmail Sync States Api V1 Admin Gmail Sync Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Gmail Sync States",
+        "tags": [
+          "administrator-operations"
+        ],
+        "x-security-classification": "administrator"
+      }
+    },
     "/api/v1/admin/jobs/failed": {
       "get": {
         "operationId": "failed_jobs_api_v1_admin_jobs_failed_get",
@@ -3089,6 +4317,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/JobRetryRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request Body"
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
             "content": {
@@ -4722,6 +5967,65 @@
         "x-security-classification": "public"
       }
     },
+    "/api/v1/staff/application-access": {
+      "get": {
+        "operationId": "own_application_access_api_v1_staff_application_access_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "staff_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Staff Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ApplicationAccessRead"
+                  },
+                  "title": "Response Own Application Access Api V1 Staff Application Access Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ],
+        "summary": "Own Application Access",
+        "tags": [
+          "staff-application-access"
+        ],
+        "x-security-classification": "staff"
+      }
+    },
     "/api/v1/staff/email": {
       "get": {
         "operationId": "list_email_queue_api_v1_staff_email_get",
@@ -6082,6 +7386,49 @@
           "support"
         ],
         "x-security-classification": "staff"
+      }
+    },
+    "/api/v1/webhooks/gmail/pubsub": {
+      "post": {
+        "operationId": "receive_gmail_push_api_v1_webhooks_gmail_pubsub_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Receive Gmail Push",
+        "tags": [
+          "gmail-push"
+        ],
+        "x-security-classification": "public"
       }
     },
     "/health/live": {

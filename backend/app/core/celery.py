@@ -58,7 +58,7 @@ def create_celery(settings: Settings | None = None) -> Celery:
             },
             "gmail-low-frequency-reconciliation": {
                 "task": "app.modules.email.tasks.reconcile_gmail_history",
-                "schedule": settings.gmail_reconciliation_interval_seconds,
+                "schedule": 60,
             },
             "gmail-push-receipt-cleanup": {
                 "task": "app.modules.email.tasks.cleanup_gmail_push_receipts",

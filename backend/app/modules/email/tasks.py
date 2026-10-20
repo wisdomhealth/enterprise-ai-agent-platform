@@ -3,11 +3,11 @@
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from uuid import UUID, uuid4
 
 from celery import shared_task  # type: ignore[import-untyped]
 from sqlalchemy import String, and_, delete, exists, func, not_, or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError, DisconnectionError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,12 @@ from app.modules.email.models import (
     GmailPushReceipt,
     GmailSyncStatus,
 )
+from app.modules.email.sync import (
+    EMAIL_HISTORY_KIND,
+    EMAIL_HISTORY_OUTBOX_EVENT_TYPE,
+    GmailSyncCoordinator,
+    GmailSyncPaused,
+)
 from app.modules.email.watch import GmailWatchService
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.jobs.service import JobLeaseLost, JobLeaseService, JobService, RetryPolicy
@@ -48,7 +54,6 @@ from app.modules.outbox.models import OutboxEvent, ProcessedEvent
 from app.modules.outbox.service import OutboxService
 from app.modules.rag.answer_service import GroundedAnswerService
 
-EMAIL_HISTORY_KIND = "email.gmail_history"
 EMAIL_CLASSIFY_KIND = "email.classify"
 EMAIL_DRAFT_KIND = "email.draft"
 EMAIL_JOB_TASK_NAME = "app.modules.email.tasks.email_job"
@@ -57,7 +62,6 @@ EMAIL_DELIVERY_OUTBOX_CONSUMER = "email-delivery-requested-v1"
 EMAIL_DELIVERY_OUTBOX_EVENT_TYPES = frozenset(
     {"email.delivery.requested", "email.delivery.retry_requested"}
 )
-EMAIL_HISTORY_OUTBOX_EVENT_TYPE = "email.gmail_history.requested"
 EMAIL_WORKER_ID = "celery-email"
 EMAIL_LEASE_SECONDS = 300
 logger = logging.getLogger(__name__)
@@ -120,97 +124,75 @@ def cleanup_gmail_push_receipts() -> None:
     asyncio.run(_cleanup_gmail_push_receipts())
 
 
-async def _enqueue_gmail_history_jobs(*, db_session: AsyncSession | None = None) -> None:
+async def _enqueue_gmail_history_jobs(
+    *,
+    db_session: AsyncSession | None = None,
+    now: datetime | None = None,
+    interval_seconds: int | None = None,
+) -> None:
     if db_session is None:
         async with async_sessionmaker() as owned_session:
-            await _enqueue_gmail_history_jobs(db_session=owned_session)
+            await _enqueue_gmail_history_jobs(
+                db_session=owned_session,
+                now=now,
+                interval_seconds=interval_seconds,
+            )
         return
+    settings = Settings()
+    scan_time = now or datetime.now(UTC)
+    due_interval = interval_seconds or settings.gmail_reconciliation_interval_seconds
     rows = (
         await db_session.execute(
-            select(Connector, KnowledgeBase.id, EmailSyncState)
+            select(Connector, KnowledgeBase.id)
             .join(
                 KnowledgeBase,
                 KnowledgeBase.organization_id == Connector.organization_id,
             )
-            .outerjoin(EmailSyncState, EmailSyncState.connector_id == Connector.id)
             .where(
                 Connector.kind == ConnectorKind.GMAIL,
                 Connector.status == ConnectorStatus.ACTIVE,
             )
         )
     ).all()
-    for connector, knowledge_base_id, sync_state in rows:
-        if sync_state is not None and not sync_state.auto_sync_enabled:
+    for connector, knowledge_base_id in rows:
+        await db_session.execute(
+            insert(EmailSyncState)
+            .values(
+                organization_id=connector.organization_id,
+                connector_id=connector.id,
+            )
+            .on_conflict_do_nothing(index_elements=[EmailSyncState.connector_id])
+        )
+        sync_state = await db_session.scalar(
+            select(EmailSyncState)
+            .where(EmailSyncState.connector_id == connector.id)
+            .with_for_update()
+        )
+        if sync_state is None:
             continue
-        cursor = sync_state.processed_history_id if sync_state is not None else None
-        page_token = sync_state.pending_page_token if sync_state is not None else None
-        fingerprint = sha256(f"{cursor or 'initial'}\0{page_token or 'first'}".encode()).hexdigest()
-        base_key = f"email.gmail_history:{connector.id}:{fingerprint}"
-        matching_jobs = list(
-            (
-                await db_session.scalars(
-                    select(JobIntent).where(
-                        JobIntent.kind == EMAIL_HISTORY_KIND,
-                        or_(
-                            JobIntent.idempotency_key == base_key,
-                            JobIntent.idempotency_key.like(f"{base_key}:after:%"),
-                        ),
-                    )
-                )
-            ).all()
-        )
-        referenced_predecessors = {
-            predecessor
-            for candidate in matching_jobs
-            if (predecessor := _history_job_predecessor(candidate.idempotency_key, base_key))
-            is not None
-        }
-        existing = next(
-            (
-                candidate
-                for candidate in matching_jobs
-                if candidate.id not in referenced_predecessors
-            ),
-            None,
-        )
-        if existing is not None and existing.state in {
-            JobState.PENDING,
-            JobState.RUNNING,
-            JobState.RECONCILIATION,
-        }:
+        if (
+            sync_state.last_success_at is not None
+            and sync_state.last_success_at > scan_time - timedelta(seconds=due_interval)
+        ):
             continue
-        key = base_key if existing is None else f"{base_key}:after:{existing.id}:{existing.version}"
-        job = await JobService().enqueue(
-            db_session,
-            EMAIL_HISTORY_KIND,
-            key,
-            {
-                "connector_id": str(connector.id),
-                "organization_id": str(connector.organization_id),
-                "knowledge_base_id": str(knowledge_base_id),
-                "history_id": cursor,
-                "page_token": page_token,
-            },
-        )
-        await OutboxService().add(
-            db_session,
-            "email.gmail_history.requested",
-            "job",
-            job.id,
-            {
-                "job_id": str(job.id),
-                "connector_id": str(connector.id),
-                "organization_id": str(connector.organization_id),
-            },
-        )
+        try:
+            await GmailSyncCoordinator(db_session).schedule_locked(
+                sync_state,
+                knowledge_base_id=knowledge_base_id,
+                trigger="SCHEDULED",
+            )
+        except GmailSyncPaused:
+            continue
     await db_session.commit()
 
 
 async def _reconcile_gmail_history() -> None:
     settings = Settings()
-    if not settings.gmail_push_enabled:
+    if not settings.gmail_polling_enabled:
         return
-    await _enqueue_gmail_history_jobs()
+    await _enqueue_gmail_history_jobs(
+        interval_seconds=settings.gmail_reconciliation_interval_seconds
+    )
 
 
 async def _renew_gmail_watches() -> None:
@@ -285,19 +267,6 @@ async def _cleanup_gmail_push_receipts() -> int:
             )
             await db_session.commit()
         return len(receipt_ids)
-
-
-def _history_job_predecessor(idempotency_key: str, base_key: str) -> UUID | None:
-    prefix = f"{base_key}:after:"
-    if not idempotency_key.startswith(prefix):
-        return None
-    raw_id, separator, _version = idempotency_key.removeprefix(prefix).partition(":")
-    if not separator:
-        return None
-    try:
-        return UUID(raw_id)
-    except ValueError:
-        return None
 
 
 async def _dispatch_pending_email_jobs() -> None:
@@ -746,6 +715,18 @@ async def _finalize_history_sync(
     ):
         state.pending_history_id = None
     state.sync_status = GmailSyncStatus.IDLE
+    state.last_success_at = datetime.now(UTC)
+    logger.info(
+        "Gmail synchronization completed",
+        extra={
+            "organization_id": str(state.organization_id),
+            "connector_id": str(connector_id),
+            "job_id": str(job_id),
+            "trigger": payload.get("trigger"),
+            "requested_by": payload.get("requested_by"),
+            "outcome": "SUCCEEDED",
+        },
+    )
     if state.pending_history_id is None or not state.auto_sync_enabled:
         state.version += 1
         return
@@ -797,6 +778,18 @@ async def _pause_history_sync(
     state.sync_status = GmailSyncStatus.PAUSED_ERROR
     state.last_error_code = error_code
     state.version += 1
+    logger.warning(
+        "Gmail synchronization paused",
+        extra={
+            "organization_id": str(state.organization_id),
+            "connector_id": str(state.connector_id),
+            "job_id": str(job_id),
+            "trigger": payload.get("trigger"),
+            "requested_by": payload.get("requested_by"),
+            "outcome": "PAUSED_ERROR",
+            "error_code": error_code,
+        },
+    )
 
 
 async def _recover_failed_email_job(
