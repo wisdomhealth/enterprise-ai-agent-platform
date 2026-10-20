@@ -191,6 +191,9 @@ class Settings(BaseSettings):
     google_gmail_client_secret: SecretStr | None = Field(
         default=None, validation_alias="GOOGLE_GMAIL_CLIENT_SECRET"
     )
+    gmail_polling_enabled: bool = Field(
+        default=False, validation_alias="GMAIL_POLLING_ENABLED"
+    )
     gmail_push_enabled: bool = Field(default=False, validation_alias="GMAIL_PUSH_ENABLED")
     gmail_pubsub_topic: str | None = Field(default=None, validation_alias="GMAIL_PUBSUB_TOPIC")
     gmail_pubsub_subscription: str | None = Field(
@@ -224,7 +227,7 @@ class Settings(BaseSettings):
         validation_alias="GMAIL_WATCH_RENEW_BEFORE_SECONDS",
     )
     gmail_reconciliation_interval_seconds: int = Field(
-        default=21_600,
+        default=3_600,
         ge=3_600,
         le=604_800,
         validation_alias="GMAIL_RECONCILIATION_INTERVAL_SECONDS",

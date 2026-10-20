@@ -31,6 +31,8 @@ def _classification(path: str) -> tuple[str, list[dict[str, list[str]]] | None]:
         if path == "/api/v1/public/chat/sessions":
             return "public", None
         return "public", [{"PublicChatCredential": []}]
+    if path == "/api/v1/webhooks/gmail/pubsub":
+        return "public", None
     if path in {"/api/v1/auth/login", "/api/v1/auth/callback"}:
         return "public", None
     if path in {"/api/v1/auth/me", "/api/v1/auth/logout"}:

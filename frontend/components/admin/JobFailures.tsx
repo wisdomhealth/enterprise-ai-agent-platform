@@ -19,7 +19,7 @@ export function JobFailures({
   return (
     <section aria-labelledby="job-failures-heading">
       <h2 id="job-failures-heading">Failed and uncertain work</h2>
-      <ul>
+      <ul className="staff-list">
         {jobs.map((job) => (
           <li key={job.job_id}>
             <strong>{statusLabel(job.kind)}</strong>
@@ -39,6 +39,7 @@ export function JobFailures({
           </li>
         ))}
       </ul>
+      {jobs.length === 0 ? <p>No failed or uncertain work requires attention.</p> : null}
       {pending ? (
         <ConfirmDialog
           label={`${pending.action === "RETRY_DRIVE_SYNC" ? "Retry Drive sync" : "Retry email delivery"} confirmation`}

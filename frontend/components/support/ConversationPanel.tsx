@@ -19,6 +19,7 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
   const [reply, setReply] = useState("");
   const [confirmResume, setConfirmResume] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const replyBox = useRef<HTMLTextAreaElement>(null);
   const selectedConversationId = useRef(conversation.id);
 
@@ -50,7 +51,8 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
 
   async function submitReply(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!humanOwned || !reply.trim()) return;
+    if (!humanOwned || !reply.trim() || busy) return;
+    setBusy(true);
     try {
       const message = await replyToHandoff(current.id, current.version, reply.trim());
       setCurrent((value) => ({
@@ -71,25 +73,30 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
     } catch {
       setNotice("Unable to send reply.");
     } finally {
+      setBusy(false);
       replyBox.current?.focus();
     }
   }
 
   async function confirmResumeAi() {
+    if (busy) return;
+    setBusy(true);
     try {
       update(await resumeAi(current.id, current.version));
       setNotice("AI will wait for the next customer message.");
       setConfirmResume(false);
     } catch {
       setNotice("Unable to resume AI.");
+    } finally {
+      setBusy(false);
     }
   }
 
   return (
     <section aria-labelledby="conversation-heading">
-      <h2 id="conversation-heading">Customer conversation</h2>
-      <p aria-live="polite">{notice}</p>
-      <ol aria-label="Authorized conversation transcript">
+      <div className="staff-toolbar"><div><h2 id="conversation-heading">Customer conversation</h2><p>Authorized transcript and human reply controls.</p></div><span className="staff-status" data-tone={humanOwned ? "success" : "warning"}>{humanOwned ? "Human handling" : "AI or queue handling"}</span></div>
+      <p className="staff-notice" aria-live="polite">{notice}</p>
+      <ol className="staff-message-list" aria-label="Authorized conversation transcript">
         {current.messages.map((message) => (
           <li key={message.sequence}>
             <strong>{message.actor}</strong>
@@ -118,24 +125,22 @@ export function ConversationPanel({ conversation, onUpdate }: ConversationPanelP
             value={reply}
             onChange={(event) => setReply(event.target.value)}
             maxLength={4000}
+            disabled={busy}
           />
-          <button type="submit">Send reply</button>
+          <button type="submit" disabled={busy || !reply.trim()}>{busy ? "Sending…" : "Send reply"}</button>
         </form>
       ) : null}
       {humanOwned ? (
-        <button type="button" onClick={() => setConfirmResume(true)}>
+        <button type="button" disabled={busy} onClick={() => setConfirmResume(true)}>
           Resume AI
         </button>
       ) : null}
       {confirmResume ? (
-        <div role="dialog" aria-modal="true" aria-label="Resume AI confirmation">
-          <p>Resume AI only for the customer&apos;s next message?</p>
-          <button type="button" onClick={() => void confirmResumeAi()}>
-            Confirm resume AI
-          </button>
-          <button type="button" onClick={() => setConfirmResume(false)}>
-            Cancel
-          </button>
+        <div className="staff-dialog" role="dialog" aria-modal="true" aria-label="Resume AI confirmation">
+          <div><p>Resume AI only for the customer&apos;s next message?</p><div className="staff-actions">
+            <button type="button" className="button-primary" disabled={busy} onClick={() => void confirmResumeAi()}>{busy ? "Resuming…" : "Confirm resume AI"}</button>
+            <button type="button" disabled={busy} onClick={() => setConfirmResume(false)}>Cancel</button>
+          </div></div>
         </div>
       ) : null}
     </section>

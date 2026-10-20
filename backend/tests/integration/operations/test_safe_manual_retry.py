@@ -8,12 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.models import AuditEvent
 from app.modules.authorization.models import ResourceGrant
-from app.modules.connectors.models import Connector, ConnectorStatus
+from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.email.models import (
     DeliveryIntent,
     EmailApproval,
     EmailDraftVersion,
     EmailState,
+    EmailSyncState,
     EmailWorkItem,
 )
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
@@ -144,6 +145,63 @@ async def test_manual_sync_records_audit_and_durable_dispatch_intent(
             OutboxEvent.aggregate_id == UUID(job_id),
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_gmail_manual_sync_is_admin_only_and_works_without_push_configuration(
+    db_session: AsyncSession, operations_context: dict[str, object]
+) -> None:
+    organization = operations_context["organization"]
+    drive_connector = operations_context["connector"]
+    gmail_connector = Connector(
+        organization_id=organization.id,
+        kind=ConnectorKind.GMAIL,
+        status=ConnectorStatus.ACTIVE,
+        secret_id=drive_connector.secret_id,
+    )
+    db_session.add(gmail_connector)
+    await db_session.flush()
+    state = EmailSyncState(
+        organization_id=organization.id,
+        connector_id=gmail_connector.id,
+        processed_history_id="100",
+    )
+    db_session.add(state)
+    await db_session.commit()
+    gmail_connector_id = gmail_connector.id
+    state_version = state.version
+
+    async with operations_context["client_for"](operations_context["reviewer"]) as client:
+        forbidden = await client.post(
+            f"/api/v1/admin/connectors/{gmail_connector_id}/gmail-sync/manual",
+            headers={"Idempotency-Key": "reviewer-gmail-sync"},
+            json={"expected_version": state_version, "reason": "Not authorized"},
+        )
+    assert forbidden.status_code == 404
+    await db_session.refresh(operations_context["foreign_admin"])
+    await db_session.refresh(operations_context["session"])
+
+    async with operations_context["client_for"](operations_context["foreign_admin"]) as client:
+        hidden = await client.post(
+            f"/api/v1/admin/connectors/{gmail_connector_id}/gmail-sync/manual",
+            headers={"Idempotency-Key": "foreign-gmail-sync"},
+            json={"expected_version": state_version, "reason": "Wrong organization"},
+        )
+    assert hidden.status_code == 404
+    await db_session.refresh(operations_context["admin"])
+    await db_session.refresh(operations_context["session"])
+
+    async with operations_context["client_for"](operations_context["admin"]) as client:
+        accepted = await client.post(
+            f"/api/v1/admin/connectors/{gmail_connector_id}/gmail-sync/manual",
+            headers={"Idempotency-Key": "admin-gmail-sync"},
+            json={"expected_version": state_version, "reason": "Fetch new mail"},
+        )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["active_job_id"] is not None
+    assert accepted.json()["active_job_state"] == "PENDING"
+    assert accepted.json()["active_job_trigger"] == "MANUAL"
 
 
 @pytest.mark.asyncio

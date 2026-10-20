@@ -27,14 +27,15 @@ export function KnowledgeStatus({
   return (
     <section aria-labelledby="knowledge-status-heading">
       <h2 id="knowledge-status-heading">Knowledge sources</h2>
-      <form
+      <form className="staff-form-grid"
         onSubmit={(event) => {
           event.preventDefault();
           setScopePending(true);
         }}
       >
-        <label htmlFor="drive-root-folder">Drive root folder ID</label>
+        <label className="staff-field-wide" htmlFor="drive-root-folder">Drive root folder ID</label>
         <input
+          className="staff-field-wide"
           id="drive-root-folder"
           required
           value={rootFolderId}
@@ -50,7 +51,7 @@ export function KnowledgeStatus({
         </label>
         <button type="submit">Save Drive scope</button>
       </form>
-      <ul>
+      <ul className="staff-list">
         {sources.map((source) => (
           <li key={source.source_id}>
             <strong>{statusLabel(source.status)}</strong>
@@ -66,7 +67,7 @@ export function KnowledgeStatus({
               </p>
             ) : null}
             {source.recent_error_codes.map((code) => <p key={code}>Error: {code}</p>)}
-            <button type="button" onClick={() => setPending(source.source_id)}>Sync Drive now</button>
+            <button className="button-primary" type="button" onClick={() => setPending(source.source_id)}>Sync Drive now</button>
           </li>
         ))}
       </ul>

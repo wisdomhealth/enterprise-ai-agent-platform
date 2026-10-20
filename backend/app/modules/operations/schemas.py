@@ -143,6 +143,8 @@ class GmailSyncStateRead(BaseModel):
     connector_id: UUID
     mailbox_address: str | None
     auto_sync_enabled: bool
+    polling_enabled: bool
+    push_enabled: bool
     watch_status: str
     sync_status: str
     processed_history_id: str | None
@@ -154,6 +156,10 @@ class GmailSyncStateRead(BaseModel):
     recovery_message_limit: int
     recovery_has_more: bool
     last_error_code: str | None
+    last_success_at: datetime | None
+    active_job_id: UUID | None
+    active_job_state: str | None
+    active_job_trigger: str | None
     version: int
 
 

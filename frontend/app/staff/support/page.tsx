@@ -34,10 +34,19 @@ export default function StaffSupportPage() {
   }
 
   return (
-    <section aria-label="Staff support console">
-      <SupportQueue onSelect={select} />
-      {conversation ? <ConversationPanel conversation={conversation} onUpdate={select} /> : null}
+    <div className="staff-stack" aria-label="Staff support console">
+      <div className="staff-page-grid staff-support-grid">
+        <SupportQueue onSelect={select} />
+        {conversation ? (
+          <ConversationPanel conversation={conversation} onUpdate={select} />
+        ) : (
+          <section className="staff-card" aria-label="No conversation selected">
+            <h2>Select a conversation</h2>
+            <p>Choose a queue item to review the transcript and available actions.</p>
+          </section>
+        )}
+      </div>
       <StaffAssist />
-    </section>
+    </div>
   );
 }

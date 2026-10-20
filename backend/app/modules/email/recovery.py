@@ -4,10 +4,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.service import AuditService
+from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.email.models import EmailSyncState, GmailSyncStatus
-from app.modules.email.tasks import EMAIL_HISTORY_KIND, EMAIL_HISTORY_OUTBOX_EVENT_TYPE
+from app.modules.email.sync import GmailSyncCoordinator, GmailSyncRequest
 from app.modules.identity.dependencies import Principal
-from app.modules.jobs.models import JobIntent, JobState
 from app.modules.jobs.service import JobService
 from app.modules.knowledge.models import KnowledgeBase
 from app.modules.outbox.service import OutboxService
@@ -46,7 +46,9 @@ class GmailRecoveryService:
         self._require_truncated(state)
         state.recovery_message_limit += additional_messages
         state.sync_status = GmailSyncStatus.RECOVERY_RUNNING
-        await self._schedule(state, trigger="RECOVERY_CONTINUE")
+        sync_request = await self._schedule(
+            state, trigger="RECOVERY_CONTINUE", allow_recovery=True
+        )
         await self._record(
             principal,
             state,
@@ -54,6 +56,7 @@ class GmailRecoveryService:
             reason=reason,
             choice="CONTINUE",
             additional_messages=additional_messages,
+            sync_request=sync_request,
         )
         state.version += 1
         await self._db_session.flush()
@@ -75,7 +78,9 @@ class GmailRecoveryService:
         state.recovery_has_more = False
         state.recovery_page_token = None
         state.sync_status = GmailSyncStatus.RECOVERY_RUNNING
-        await self._schedule(state, trigger="RECOVERY_ACCEPT_LIMITED")
+        sync_request = await self._schedule(
+            state, trigger="RECOVERY_ACCEPT_LIMITED", allow_recovery=True
+        )
         await self._record(
             principal,
             state,
@@ -83,6 +88,7 @@ class GmailRecoveryService:
             reason=reason,
             choice="ACCEPT_LIMITED",
             additional_messages=0,
+            sync_request=sync_request,
         )
         state.version += 1
         await self._db_session.flush()
@@ -99,9 +105,11 @@ class GmailRecoveryService:
         if not reason.strip():
             raise ValueError("reason is required")
         state = await self._locked_state(principal, connector_id, expected_version)
-        if state.sync_status is GmailSyncStatus.RECOVERY_TRUNCATED:
-            raise GmailRecoveryConflict("truncated recovery requires continue or accept")
-        await self._schedule(state, trigger="MANUAL")
+        sync_request = await self._schedule(
+            state,
+            trigger="MANUAL",
+            requested_by=principal.subject_id,
+        )
         await self._record(
             principal,
             state,
@@ -109,6 +117,7 @@ class GmailRecoveryService:
             reason=reason,
             choice="MANUAL",
             additional_messages=0,
+            sync_request=sync_request,
         )
         state.version += 1
         await self._db_session.flush()
@@ -119,9 +128,13 @@ class GmailRecoveryService:
     ) -> EmailSyncState:
         state = await self._db_session.scalar(
             select(EmailSyncState)
+            .join(Connector, Connector.id == EmailSyncState.connector_id)
             .where(
                 EmailSyncState.connector_id == connector_id,
                 EmailSyncState.organization_id == principal.organization_id,
+                Connector.organization_id == principal.organization_id,
+                Connector.kind == ConnectorKind.GMAIL,
+                Connector.status == ConnectorStatus.ACTIVE,
             )
             .with_for_update()
         )
@@ -140,18 +153,14 @@ class GmailRecoveryService:
         ):
             raise GmailRecoveryConflict("Gmail recovery is not truncated")
 
-    async def _schedule(self, state: EmailSyncState, *, trigger: str) -> None:
-        active = (
-            await self._db_session.get(JobIntent, state.active_sync_job_id)
-            if state.active_sync_job_id is not None
-            else None
-        )
-        if active is not None and active.state in {
-            JobState.PENDING,
-            JobState.RUNNING,
-            JobState.RECONCILIATION,
-        }:
-            raise GmailRecoveryConflict("Gmail synchronization is already active")
+    async def _schedule(
+        self,
+        state: EmailSyncState,
+        *,
+        trigger: str,
+        requested_by: UUID | None = None,
+        allow_recovery: bool = False,
+    ) -> GmailSyncRequest:
         knowledge_base_id = await self._db_session.scalar(
             select(KnowledgeBase.id).where(
                 KnowledgeBase.organization_id == state.organization_id
@@ -159,36 +168,17 @@ class GmailRecoveryService:
         )
         if knowledge_base_id is None:
             raise GmailRecoveryConflict("organization has no knowledge base")
-        state.sync_generation += 1
-        job = await self._jobs.enqueue(
+        return await GmailSyncCoordinator(
             self._db_session,
-            EMAIL_HISTORY_KIND,
-            f"email.gmail_history:{state.connector_id}:generation:{state.sync_generation}",
-            {
-                "connector_id": str(state.connector_id),
-                "organization_id": str(state.organization_id),
-                "knowledge_base_id": str(knowledge_base_id),
-                "history_id": state.processed_history_id,
-                "sync_generation": state.sync_generation,
-                "trigger": trigger,
-            },
+            job_service=self._jobs,
+            outbox_service=self._outbox,
+        ).schedule_locked(
+            state,
+            knowledge_base_id=knowledge_base_id,
+            trigger=trigger,
+            requested_by=requested_by,
+            allow_recovery=allow_recovery,
         )
-        await self._outbox.add(
-            self._db_session,
-            EMAIL_HISTORY_OUTBOX_EVENT_TYPE,
-            "job",
-            job.id,
-            {
-                "job_id": str(job.id),
-                "connector_id": str(state.connector_id),
-                "organization_id": str(state.organization_id),
-                "sync_generation": state.sync_generation,
-                "trigger": trigger,
-            },
-        )
-        state.active_sync_job_id = job.id
-        if state.sync_status is not GmailSyncStatus.RECOVERY_RUNNING:
-            state.sync_status = GmailSyncStatus.RUNNING
 
     async def _record(
         self,
@@ -199,6 +189,7 @@ class GmailRecoveryService:
         reason: str,
         choice: str,
         additional_messages: int,
+        sync_request: GmailSyncRequest,
     ) -> None:
         details = {
             "connector_id": str(state.connector_id),
@@ -214,6 +205,8 @@ class GmailRecoveryService:
             "choice": choice,
             "additional_messages": additional_messages,
             "reason": reason.strip(),
+            "job_id": str(sync_request.job.id),
+            "deduplicated": sync_request.deduplicated,
         }
         await self._audit.record(
             self._db_session,

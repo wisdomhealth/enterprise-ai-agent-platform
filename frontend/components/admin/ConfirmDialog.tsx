@@ -48,20 +48,11 @@ export function ConfirmDialog({
   }
 
   return (
-    <div
-      ref={dialogRef}
-      role="dialog"
-      aria-modal="true"
-      aria-label={label}
-      onKeyDown={keepFocusInside}
-    >
-      {children}
-      <button type="button" onClick={onConfirm}>
-        {confirmLabel}
-      </button>
-      <button ref={cancelRef} type="button" onClick={onCancel}>
-        Cancel
-      </button>
+    <div className="staff-dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-label={label} onKeyDown={keepFocusInside}>
+      <div>
+        {children}
+        <div className="staff-actions"><button className="button-primary" type="button" onClick={onConfirm}>{confirmLabel}</button><button ref={cancelRef} type="button" onClick={onCancel}>Cancel</button></div>
+      </div>
     </div>
   );
 }

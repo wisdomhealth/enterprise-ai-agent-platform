@@ -1,8 +1,8 @@
 # Enterprise AI Agent Platform
 
-> Gmail push deployment note: the one-minute Gmail poll is removed. Enable deployment only after
-> the authenticated Pub/Sub receiver, transactional Outbox publication, and Worker consumption
-> chain pass in the target environment. See `docs/runbooks/gmail-push.md`.
+> Gmail synchronization uses one durable incremental history pipeline. Local Compose enables
+> hourly polling and disables Push; deployments may enable either trigger independently. See
+> `docs/runbooks/gmail-push.md`.
 
 Executable baseline for an enterprise customer-support and knowledge platform built
 with FastAPI and Next.js.
@@ -58,7 +58,9 @@ OIDC authenticates staff members.
 
 ### Gmail workflows
 
-- Gmail ingestion and classification.
+- Hourly incremental polling, administrator manual synchronization, and optional Gmail Push all
+  reuse the persisted history cursor, JobIntent, Outbox, and leased worker pipeline.
+- Gmail ingestion and classification with business-record deduplication.
 - Knowledge-grounded draft generation and immutable draft versions.
 - Reviewer approval, approval invalidation on material changes, controlled Gmail
   delivery, reconciliation for uncertain delivery outcomes, and durable auditability.

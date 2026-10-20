@@ -36,7 +36,7 @@ export function RetentionPolicyControl({
       <h2 id="retention-policy-heading">Content retention</h2>
       <p>Product defaults are configurable for each organization.</p>
       <p>These settings are not a legal or compliance guarantee.</p>
-      <form onSubmit={submit}>
+      <form className="staff-form-grid" onSubmit={submit}>
         <label htmlFor="retention-chat-days">Chat content days</label>
         <input
           id="retention-chat-days"

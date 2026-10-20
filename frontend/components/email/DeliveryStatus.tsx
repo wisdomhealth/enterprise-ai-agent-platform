@@ -58,10 +58,10 @@ export function DeliveryStatus({
   }
 
   return (
-    <section aria-labelledby="delivery-heading">
+    <section className="staff-card" aria-labelledby="delivery-heading">
       <h2 id="delivery-heading">Delivery</h2>
-      <p>{stateLabel(delivery.state)}</p>
-      <p aria-live="polite">{notice}</p>
+      <p><span className="staff-status" data-tone={delivery.state === "SENT" ? "success" : delivery.state === "DELIVERY_UNKNOWN" ? "warning" : undefined}>{stateLabel(delivery.state)}</span></p>
+      <p className="staff-notice" aria-live="polite">{notice}</p>
       {delivery.state === "DELIVERY_UNKNOWN" ? (
         <>
           <p>
@@ -88,7 +88,7 @@ export function DeliveryStatus({
       ) : null}
       <p>Message identity: {delivery.deterministic_message_id}</p>
       {delivery.last_error_code ? <p>Error: {delivery.last_error_code}</p> : null}
-      <ol aria-label="Delivery attempts">
+      <details className="staff-detail" open><summary>Delivery attempts and message identity</summary><p>Message identity: {delivery.deterministic_message_id}</p><ol className="staff-list" aria-label="Delivery attempts">
         {delivery.attempts.map((attempt) => (
           <li key={attempt.id}>
             Attempt {attempt.attempt_number}: {stateLabel(attempt.outcome as EmailState)}
@@ -97,7 +97,7 @@ export function DeliveryStatus({
             {attempt.completed_at ? ` · Completed ${attempt.completed_at}` : ""}
           </li>
         ))}
-      </ol>
+      </ol></details>
     </section>
   );
 }

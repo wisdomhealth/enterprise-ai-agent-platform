@@ -136,13 +136,14 @@ class EmailIngestionService:
         job_id: UUID | None = None,
     ) -> EmailIngestionResult:
         connector = await self._db_session.scalar(
-            select(Connector).where(Connector.id == connector_id).with_for_update()
+            select(Connector).where(Connector.id == connector_id)
         )
         if connector is None or connector.kind is not ConnectorKind.GMAIL:
             raise LookupError("Gmail connector not found")
         if connector.status is not ConnectorStatus.ACTIVE:
             return EmailIngestionResult(connector.id, None, 0, None, reauth_required=True)
         sync_state = await self._sync_state(connector)
+        await self._db_session.commit()
         gateway = await self._resolve_gateway(connector)
         try:
             if sync_state.processed_history_id is None:
@@ -167,11 +168,13 @@ class EmailIngestionService:
                 try:
                     page = await gateway.list_history(start_history_id, page_token)
                 except GmailPageTokenInvalid:
+                    sync_state = await self._locked_sync_state(connector.id)
                     sync_state.pending_page_token = None
                     page_token = None
                     await self._db_session.commit()
                     continue
                 except GmailHistoryCursorExpired:
+                    sync_state = await self._locked_sync_state(connector.id)
                     sync_state.processed_history_id = None
                     sync_state.pending_page_token = None
                     sync_state.sync_start_history_id = None
@@ -185,8 +188,11 @@ class EmailIngestionService:
                         knowledge_base_id,
                         job_id=job_id,
                     )
-                for message_id in page.message_ids:
-                    message = await gateway.get_message(message_id)
+                messages = [
+                    await gateway.get_message(message_id) for message_id in page.message_ids
+                ]
+                sync_state = await self._locked_sync_state(connector.id)
+                for message in messages:
                     before = await self._db_session.scalar(
                         select(EmailWorkItem.id).where(
                             EmailWorkItem.organization_id == connector.organization_id,
@@ -211,7 +217,6 @@ class EmailIngestionService:
                     break
                 page_token = page.next_page_token
             sync_state.last_error_code = None
-            sync_state.last_success_at = datetime.now(UTC)
             if commit:
                 await self._db_session.commit()
             else:
@@ -240,6 +245,7 @@ class EmailIngestionService:
     ) -> EmailIngestionResult:
         if sync_state.recovery_baseline_history_id is None:
             profile = await gateway.get_profile()
+            sync_state = await self._locked_sync_state(connector.id)
             sync_state.recovery_batch_id = uuid4()
             sync_state.recovery_baseline_history_id = profile.history_id
             sync_state.recovery_window_started_at = datetime.now(UTC) - timedelta(
@@ -253,6 +259,9 @@ class EmailIngestionService:
             await self._db_session.commit()
         ingested = 0
         while sync_state.recovery_has_more:
+            recovery_window_started_at = sync_state.recovery_window_started_at
+            if recovery_window_started_at is None:
+                raise RuntimeError("Gmail recovery window is not initialized")
             remaining = (
                 sync_state.recovery_message_limit - sync_state.recovery_processed_count
             )
@@ -262,13 +271,16 @@ class EmailIngestionService:
                 return EmailIngestionResult(
                     connector.id, None, ingested, sync_state.recovery_page_token
                 )
-            page = await gateway.list_recent_inbox(
-                after=sync_state.recovery_window_started_at,
+            recent_page = await gateway.list_recent_inbox(
+                after=recovery_window_started_at,
                 page_token=sync_state.recovery_page_token,
                 max_results=min(100, remaining),
             )
-            for message_id in page.message_ids:
-                message = await gateway.get_message(message_id)
+            messages = [
+                await gateway.get_message(message_id) for message_id in recent_page.message_ids
+            ]
+            sync_state = await self._locked_sync_state(connector.id)
+            for message in messages:
                 before = await self._db_session.scalar(
                     select(EmailWorkItem.id).where(
                         EmailWorkItem.organization_id == connector.organization_id,
@@ -283,17 +295,20 @@ class EmailIngestionService:
                     job_id=job_id,
                 )
                 ingested += int(before is None)
-            sync_state.recovery_processed_count += len(page.message_ids)
-            sync_state.recovery_page_token = page.next_page_token
-            sync_state.recovery_has_more = page.next_page_token is not None
+            sync_state.recovery_processed_count += len(recent_page.message_ids)
+            sync_state.recovery_page_token = recent_page.next_page_token
+            sync_state.recovery_has_more = recent_page.next_page_token is not None
             await self._db_session.commit()
         baseline = sync_state.recovery_baseline_history_id
         page_token = None
         final_history_id = baseline
         while True:
-            page = await gateway.list_history(baseline, page_token)
-            for message_id in page.message_ids:
-                message = await gateway.get_message(message_id)
+            history_page = await gateway.list_history(baseline, page_token)
+            messages = [
+                await gateway.get_message(message_id) for message_id in history_page.message_ids
+            ]
+            sync_state = await self._locked_sync_state(connector.id)
+            for message in messages:
                 before = await self._db_session.scalar(
                     select(EmailWorkItem.id).where(
                         EmailWorkItem.organization_id == connector.organization_id,
@@ -308,11 +323,12 @@ class EmailIngestionService:
                     job_id=job_id,
                 )
                 ingested += int(before is None)
-            final_history_id = page.history_id
-            page_token = page.next_page_token
+            final_history_id = history_page.history_id
+            page_token = history_page.next_page_token
             await self._db_session.commit()
             if page_token is None:
                 break
+        sync_state = await self._locked_sync_state(connector.id)
         sync_state.processed_history_id = final_history_id
         if (
             sync_state.pending_history_id is not None
@@ -328,7 +344,6 @@ class EmailIngestionService:
         sync_state.recovery_has_more = False
         sync_state.recovery_started_at = None
         sync_state.sync_status = GmailSyncStatus.IDLE
-        sync_state.last_success_at = datetime.now(UTC)
         await self._db_session.commit()
         return EmailIngestionResult(connector.id, final_history_id, ingested, None)
 
@@ -501,7 +516,6 @@ class EmailIngestionService:
         state = await self._db_session.scalar(
             select(EmailSyncState)
             .where(EmailSyncState.connector_id == connector.id)
-            .with_for_update()
         )
         if state is None:
             state = EmailSyncState(
@@ -509,6 +523,17 @@ class EmailIngestionService:
             )
             self._db_session.add(state)
             await self._db_session.flush()
+        return state
+
+    async def _locked_sync_state(self, connector_id: UUID) -> EmailSyncState:
+        state = await self._db_session.scalar(
+            select(EmailSyncState)
+            .where(EmailSyncState.connector_id == connector_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if state is None:
+            raise LookupError("Gmail sync state not found")
         return state
 
     async def _resolve_gateway(self, connector: Connector) -> GmailGateway:

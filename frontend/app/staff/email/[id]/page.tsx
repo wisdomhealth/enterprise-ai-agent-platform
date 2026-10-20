@@ -18,12 +18,12 @@ export default function StaffEmailDetailPage() {
       .catch(() => setError("Unable to load this email."));
   }, [id]);
 
-  if (error) return <p role="alert">{error}</p>;
-  if (!item) return <p>Loading email…</p>;
+  if (error) return <p className="staff-notice" role="alert">{error}</p>;
+  if (!item) return <p className="staff-notice" role="status">Loading email…</p>;
   return (
-    <section aria-label="Email review detail">
+    <div className="staff-page-grid" aria-label="Email review detail">
       <EmailReviewPanel item={item} />
       <StaffAssist />
-    </section>
+    </div>
   );
 }

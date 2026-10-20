@@ -5,9 +5,11 @@ import { EmailQueue } from "../components/email/EmailQueue";
 import { EmailReviewPanel } from "../components/email/EmailReviewPanel";
 import {
   approveEmail,
+  getAdminGmailSyncStates,
   getEmailDetail,
   listEmailQueue,
   regenerateEmailDraft,
+  requestAdminGmailManualSync,
 } from "../lib/staff-api";
 import { emailDetail } from "./fixtures/email";
 
@@ -17,9 +19,11 @@ vi.mock("../lib/staff-api", async (importOriginal) => {
     ...actual,
     approveEmail: vi.fn(),
     editEmailDraft: vi.fn(),
+    getAdminGmailSyncStates: vi.fn(),
     getEmailDetail: vi.fn(),
     listEmailQueue: vi.fn(),
     regenerateEmailDraft: vi.fn(),
+    requestAdminGmailManualSync: vi.fn(),
   };
 });
 
@@ -48,6 +52,111 @@ it("renders the state-filtered queue and its durable classification fields", asy
     "href",
     "/staff/email/email-1",
   );
+});
+
+it("shows administrator sync acceptance without claiming completion", async () => {
+  vi.mocked(listEmailQueue).mockResolvedValue([]);
+  vi.mocked(getAdminGmailSyncStates).mockResolvedValue([
+    {
+      connector_id: "gmail-1",
+      mailbox_address: "staff@example.test",
+      auto_sync_enabled: false,
+      polling_enabled: true,
+      push_enabled: false,
+      watch_status: "STOPPED",
+      sync_status: "IDLE",
+      processed_history_id: "100",
+      pending_history_id: null,
+      watch_expiration_at: null,
+      recovery_batch_id: null,
+      recovery_window_started_at: null,
+      recovery_processed_count: 0,
+      recovery_message_limit: 0,
+      recovery_has_more: false,
+      last_error_code: null,
+      last_success_at: "2026-10-20T08:00:00Z",
+      active_job_id: null,
+      active_job_state: null,
+      active_job_trigger: null,
+      version: 1,
+    },
+  ]);
+  vi.mocked(requestAdminGmailManualSync).mockResolvedValue({
+    ...(await getAdminGmailSyncStates())[0],
+    sync_status: "RUNNING",
+    active_job_id: "job-1",
+    active_job_state: "PENDING",
+    active_job_trigger: "MANUAL",
+    version: 2,
+  });
+
+  render(<EmailQueue canSync />);
+  const syncButton = await screen.findByRole("button", { name: "Sync emails" });
+  fireEvent.click(syncButton);
+  fireEvent.click(syncButton);
+
+  await waitFor(() => expect(requestAdminGmailManualSync).toHaveBeenCalledTimes(1));
+  expect(screen.getByText(/accepted.*classification and draft generation may still be pending/i)).toBeVisible();
+  expect(screen.queryByText("Synchronization completed")).not.toBeInTheDocument();
+  expect(screen.getByText("Polling enabled")).toBeVisible();
+  expect(screen.getByText("Push disabled · Watch stopped")).toBeVisible();
+});
+
+it("does not expose mailbox synchronization to non-administrators", async () => {
+  vi.mocked(listEmailQueue).mockResolvedValue([]);
+
+  render(<EmailQueue />);
+
+  await waitFor(() => expect(listEmailQueue).toHaveBeenCalled());
+  expect(screen.queryByRole("button", { name: "Sync emails" })).not.toBeInTheDocument();
+  expect(getAdminGmailSyncStates).not.toHaveBeenCalled();
+});
+
+it("refreshes the queue only after the accepted sync actually succeeds", async () => {
+  const idle = {
+    connector_id: "gmail-1",
+    mailbox_address: "staff@example.test",
+    auto_sync_enabled: false,
+    polling_enabled: true,
+    push_enabled: false,
+    watch_status: "STOPPED",
+    sync_status: "IDLE",
+    processed_history_id: "100",
+    pending_history_id: null,
+    watch_expiration_at: null,
+    recovery_batch_id: null,
+    recovery_window_started_at: null,
+    recovery_processed_count: 0,
+    recovery_message_limit: 0,
+    recovery_has_more: false,
+    last_error_code: null,
+    last_success_at: "2026-10-20T08:00:00Z",
+    active_job_id: null,
+    active_job_state: null,
+    active_job_trigger: null,
+    version: 1,
+  };
+  const running = {
+    ...idle,
+    sync_status: "RUNNING",
+    active_job_id: "job-1",
+    active_job_state: "PENDING",
+    active_job_trigger: "MANUAL",
+    version: 2,
+  };
+  vi.mocked(listEmailQueue).mockResolvedValue([]);
+  vi.mocked(getAdminGmailSyncStates)
+    .mockResolvedValueOnce([idle])
+    .mockResolvedValueOnce([{ ...idle, last_success_at: "2026-10-20T09:00:00Z", version: 3 }]);
+  vi.mocked(requestAdminGmailManualSync).mockResolvedValue(running);
+
+  render(<EmailQueue canSync />);
+  fireEvent.click(await screen.findByRole("button", { name: "Sync emails" }));
+
+  expect(await screen.findByText(/Synchronization accepted/)).toBeVisible();
+  expect(listEmailQueue).toHaveBeenCalledTimes(1);
+  expect(await screen.findByText(/Email synchronization completed/, {}, { timeout: 3000 })).toBeVisible();
+  expect(listEmailQueue).toHaveBeenCalledTimes(2);
 });
 
 it("shows original mail, rationale, current source details, history, and audit transitions", () => {

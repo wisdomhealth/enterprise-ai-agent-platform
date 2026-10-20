@@ -10,7 +10,13 @@ from app.modules.email.gmail_gateway import (
     GmailProfile,
 )
 from app.modules.email.ingestion import EmailIngestionService
-from app.modules.email.models import EmailCategory, EmailPriority, EmailState, EmailWorkItem
+from app.modules.email.models import (
+    EmailCategory,
+    EmailPriority,
+    EmailState,
+    EmailSyncState,
+    EmailWorkItem,
+)
 from app.modules.email.schemas import EmailClassification
 from app.modules.jobs.models import JobIntent
 
@@ -177,6 +183,41 @@ async def test_history_page_persists_messages_and_cursor_together(
         )
         == 1
     )
+
+
+async def test_empty_increment_advances_cursor_without_downstream_jobs(
+    db_session: AsyncSession, email_context: dict[str, object]
+) -> None:
+    connector = email_context["connector"]
+    knowledge_base = email_context["knowledge_base"]
+    state = EmailSyncState(
+        organization_id=connector.organization_id,
+        connector_id=connector.id,
+        processed_history_id="101",
+    )
+    db_session.add(state)
+    await db_session.commit()
+    downstream_jobs_before = await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind.in_(("email.classify", "email.draft"))
+        )
+    )
+
+    result = await EmailIngestionService(
+        db_session,
+        gateway=FakeGmailGateway([]),
+        classifier=FixedClassifier(),
+    ).ingest_history(connector.id, knowledge_base.id)
+
+    await db_session.refresh(state)
+    assert result.ingested == 0
+    assert state.processed_history_id == "102"
+    assert state.last_success_at is None
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind.in_(("email.classify", "email.draft"))
+        )
+    ) == downstream_jobs_before
 
 
 async def test_bootstrap_anchor_is_committed_with_each_page_for_crash_safe_resume(

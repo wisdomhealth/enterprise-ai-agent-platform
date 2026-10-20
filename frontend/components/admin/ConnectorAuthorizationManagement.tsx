@@ -23,13 +23,18 @@ export function ConnectorAuthorizationManagement({
 }) {
   const [selected, setSelected] = useState<Record<string, ConnectorGrantAction[]>>({});
   const [saving, setSaving] = useState<AdminConnectorAuthorization["kind"] | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const selectedFor = (authorization: AdminConnectorAuthorization) =>
     selected[authorization.kind] ?? authorization.actions.filter((item) => item.granted).map((item) => item.action);
   const save = async (authorization: AdminConnectorAuthorization, next: ConnectorGrantAction[]) => {
     setSaving(authorization.kind);
+    setNotice(null);
     try {
       await onSave(authorization.kind, next);
       setSelected((current) => ({ ...current, [authorization.kind]: next }));
+      setNotice(`${connectorName(authorization.kind)} staff permissions updated.`);
+    } catch {
+      setNotice(`Unable to update ${connectorName(authorization.kind)} staff permissions.`);
     } finally {
       setSaving(null);
     }
@@ -37,15 +42,16 @@ export function ConnectorAuthorizationManagement({
 
   return (
     <section aria-labelledby="connector-authorization-heading">
-      <h1 id="connector-authorization-heading">Connector authorization</h1>
-      <p>Manage the fixed permissions used to connect Google Drive and Gmail.</p>
-      {authorizations.map((authorization) => {
+      <h2 id="connector-authorization-heading">Connector authorization</h2>
+      <p>These staff permissions control who may create, reauthorize, or revoke Google OAuth connections. They do not grant Email or Support application access.</p>
+      <p className="staff-notice" aria-live="polite">{notice}</p>
+      <div className="staff-summary-grid">{authorizations.map((authorization) => {
         const current = selectedFor(authorization);
         const name = connectorName(authorization.kind);
         return (
           <fieldset key={authorization.kind} aria-label={`${name} connector permissions`}>
             <legend>{name}</legend>
-            <p>{authorization.authorize_endpoint}</p>
+            <p><span className="staff-status">Google OAuth authorization</span></p>
             {actions.map((action) => (
               <label key={action}>
                 <input
@@ -62,25 +68,27 @@ export function ConnectorAuthorizationManagement({
                 {action} · {current.includes(action) ? "Granted" : "Missing"}
               </label>
             ))}
-            <p>
+            <div className="staff-actions">
               <button
+                className="button-primary"
                 type="button"
                 onClick={() => void save(authorization, actions)}
                 disabled={saving === authorization.kind}
               >
-                Grant recommended {authorization.kind === "DRIVE" ? "Drive" : "Gmail"} permissions
+                {saving === authorization.kind ? "Saving…" : `Grant recommended ${authorization.kind === "DRIVE" ? "Drive" : "Gmail"} permissions`}
               </button>
               <button
                 type="button"
                 onClick={() => void save(authorization, current)}
                 disabled={saving === authorization.kind}
               >
-                Save {authorization.kind === "DRIVE" ? "Drive" : "Gmail"} permissions
+                {saving === authorization.kind ? "Saving…" : `Save ${authorization.kind === "DRIVE" ? "Drive" : "Gmail"} permissions`}
               </button>
-            </p>
+            </div>
+            <details className="staff-detail" open><summary>Technical endpoint</summary><p>{authorization.authorize_endpoint}</p></details>
           </fieldset>
         );
-      })}
+      })}</div>
     </section>
   );
 }

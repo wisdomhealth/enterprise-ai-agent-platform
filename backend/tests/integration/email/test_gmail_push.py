@@ -55,6 +55,7 @@ async def test_push_atomically_persists_receipt_high_water_job_and_outbox(
     assert duplicate is None
     assert state.pending_history_id == "105"
     assert state.active_sync_job_id == job_id
+    assert state.last_success_at is None
     assert await db_session.scalar(
         select(func.count(GmailPushReceipt.id)).where(
             GmailPushReceipt.connector_id == state.connector_id
@@ -126,6 +127,7 @@ async def test_push_outbox_and_worker_form_one_durable_ingestion_chain(
     assert state.pending_history_id is None
     assert state.active_sync_job_id is None
     assert state.sync_status is GmailSyncStatus.IDLE
+    assert state.last_success_at is not None
 
 
 @pytest.mark.asyncio

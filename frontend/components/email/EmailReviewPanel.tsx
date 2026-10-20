@@ -154,15 +154,23 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
   }
 
   return (
-    <article aria-labelledby="email-review-heading">
-      <h1 id="email-review-heading">Review {current.subject}</h1>
-      <p aria-live="polite">{notice}</p>
-      <p aria-label="Email state">{stateLabel(displayState)}</p>
+    <article className="staff-stack" aria-labelledby="email-review-heading">
+      <header className="staff-toolbar">
+        <div><h2 id="email-review-heading">{current.subject}</h2><p>Review the original message and proposed response before approval.</p></div>
+        <div className="staff-actions">
+          <span className="staff-status" aria-label="Email state">{stateLabel(displayState)}</span>
+          {draft && !conflictLocked && current.state === "AWAITING_REVIEW" ? <>
+            <button type="button" className="button-primary" disabled={busy} onClick={() => void review("approve")}>{busy ? "Working…" : "Approve"}</button>
+            <button type="button" className="button-danger" disabled={busy} onClick={() => void review("reject")}>Reject</button>
+          </> : null}
+        </div>
+      </header>
+      <p className="staff-notice" aria-live="polite">{notice}</p>
       {dirty && ["APPROVED", "SEND_PENDING"].includes(current.state) ? (
         <p role="status">Approval will be cleared when these changes are saved.</p>
       ) : null}
 
-      <section aria-labelledby="original-email-heading">
+      <section className="staff-card" aria-labelledby="original-email-heading">
         <h2 id="original-email-heading">Original email</h2>
         <p>From: {current.sender}</p>
         <p>To: {current.recipients.join(", ")}</p>
@@ -170,13 +178,13 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
         <p>{current.body}</p>
       </section>
 
-      <section aria-labelledby="classification-heading">
+      <section className="staff-card" aria-labelledby="classification-heading">
         <h2 id="classification-heading">Classification</h2>
         <p>{current.classification_rationale}</p>
       </section>
 
       {draft ? (
-        <form onSubmit={save} aria-label="Current email draft">
+        <form className="staff-card staff-form-grid" onSubmit={save} aria-label="Current email draft">
           <h2>Current draft</h2>
           <label htmlFor="draft-to">To</label>
           <input
@@ -206,16 +214,17 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
             disabled={!editable || busy}
             onChange={(event) => setThreadId(event.target.value)}
           />
-          <label htmlFor="draft-body">Reply body</label>
+          <label className="staff-field-wide" htmlFor="draft-body">Reply body</label>
           <textarea
+            className="staff-field-wide"
             id="draft-body"
             value={body}
             disabled={!editable || busy}
             onChange={(event) => setBody(event.target.value)}
           />
-          <p>Model {draft.model} · Prompt {draft.prompt_version}</p>
-          {draft.reviewer_instruction ? <p>Reviewer instruction: {draft.reviewer_instruction}</p> : null}
-          <ul aria-label="Current draft sources">
+          <p className="staff-field-wide">Model {draft.model} · Prompt {draft.prompt_version}</p>
+          {draft.reviewer_instruction ? <p className="staff-field-wide">Reviewer instruction: {draft.reviewer_instruction}</p> : null}
+          <section className="staff-field-wide" aria-labelledby="draft-sources-heading"><h3 id="draft-sources-heading">Supporting citations</h3><ul className="staff-list" aria-label="Current draft sources">
             {draft.citations.map((citation) => (
               <li key={citation.chunk_id}>
                 <p>Internal source: {citation.title}</p>
@@ -225,10 +234,10 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
                 ) : null}
               </li>
             ))}
-          </ul>
+          </ul></section>
           {editable ? (
-            <button type="submit" disabled={!dirty || busy}>
-              Save changes
+            <button className="staff-field-wide" type="submit" disabled={!dirty || busy}>
+              {busy ? "Saving…" : "Save changes"}
             </button>
           ) : null}
         </form>
@@ -237,13 +246,8 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
       )}
 
       {draft && !conflictLocked && current.state === "AWAITING_REVIEW" ? (
-        <section aria-label="Review actions">
-          <button type="button" disabled={busy} onClick={() => void review("approve")}>
-            Approve
-          </button>
-          <button type="button" disabled={busy} onClick={() => void review("reject")}>
-            Reject
-          </button>
+        <section className="staff-card" aria-label="Review actions">
+          <h2>Regenerate draft</h2>
           <label htmlFor="regeneration-instruction">Regeneration instruction</label>
           <textarea
             id="regeneration-instruction"
@@ -262,20 +266,16 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
       ) : null}
 
       {confirmRegeneration ? (
-        <div role="dialog" aria-modal="true" aria-label="Regenerate draft confirmation">
-          <p>Create a new immutable draft using this instruction?</p>
-          <button type="button" disabled={busy} onClick={() => void regenerate()}>
-            Confirm regeneration
-          </button>
-          <button type="button" onClick={() => setConfirmRegeneration(false)}>
-            Cancel
-          </button>
+        <div className="staff-dialog" role="dialog" aria-modal="true" aria-label="Regenerate draft confirmation">
+          <div><p>Create a new immutable draft using this instruction?</p><div className="staff-actions"><button type="button" className="button-primary" disabled={busy} onClick={() => void regenerate()}>{busy ? "Regenerating…" : "Confirm regeneration"}</button><button type="button" disabled={busy} onClick={() => setConfirmRegeneration(false)}>Cancel</button></div></div>
         </div>
       ) : null}
 
       {current.current_draft_id ? (
         <DraftHistory drafts={current.drafts} currentDraftId={current.current_draft_id} />
       ) : null}
+      <details className="staff-card staff-detail" open>
+        <summary>Audit transitions</summary>
       <section aria-labelledby="audit-heading">
         <h2 id="audit-heading">Audit transitions</h2>
         <ol>
@@ -288,6 +288,7 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
           ))}
         </ol>
       </section>
+      </details>
       {current.delivery ? (
         <DeliveryStatus delivery={current.delivery} onRefresh={refreshCurrent} />
       ) : null}
