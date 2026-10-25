@@ -111,22 +111,13 @@ class OpenAIEmailClassifier:
     async def classify(self, subject: str, body: str) -> ClassificationExecution:
         started = time.monotonic()
         try:
-            # result = await self._client.invoke(
-            #     EmailClassification,
-            #     system=_SYSTEM_PROMPT,
-            #     user=(
-            #         f"<untrusted_subject>{escape(subject, quote=False)}</untrusted_subject>"
-            #         f"<untrusted_body>{escape(body, quote=False)}</untrusted_body>"
-            #     ),
-            # )
-            result = StructuredModelResult(
-                value=EmailClassification(
-                    category=EmailCategory.UNKNOWN,
-                    priority=EmailPriority.NORMAL,
-                    reply_required=True,
+            result = await self._client.invoke(
+                EmailClassification,
+                system=_SYSTEM_PROMPT,
+                user=(
+                    f"<untrusted_subject>{escape(subject, quote=False)}</untrusted_subject>"
+                    f"<untrusted_body>{escape(body, quote=False)}</untrusted_body>"
                 ),
-                model="gpt-classifier",
-                usage=ModelUsage(input_tokens=11, output_tokens=5, complete=True),
             )
         except OpenAIStructuredResponseError as error:
             raise EmailClassifierResponseError(
