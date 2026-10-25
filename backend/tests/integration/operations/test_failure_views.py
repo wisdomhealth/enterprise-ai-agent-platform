@@ -68,9 +68,9 @@ async def test_failure_views_and_summary_expose_safe_status_not_bodies(
         summary = await client.get("/api/v1/admin/operations/summary")
 
     assert failures.status_code == 200
-    assert failures.json()[0]["job_id"] == str(job.id)
-    assert failures.json()[0]["action"] == "RETRY_DRIVE_SYNC"
-    assert failures.json()[0]["error_code"] == "UNSAFE_ERROR_REDACTED"
+    assert failures.json()["items"][0]["job_id"] == str(job.id)
+    assert failures.json()["items"][0]["action"] == "RETRY_DRIVE_SYNC"
+    assert failures.json()["items"][0]["last_error_code"] == "UNSAFE_ERROR_REDACTED"
     serialized = f"{failures.text} {summary.text}"
     assert "must-not-leak" not in serialized
     assert "private subject" not in serialized

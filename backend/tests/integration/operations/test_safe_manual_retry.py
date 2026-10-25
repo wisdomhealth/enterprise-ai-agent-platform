@@ -93,7 +93,9 @@ async def test_admin_retries_failed_classification_on_same_job_intent(
             headers={"Idempotency-Key": "classification-retry"},
         )
 
-    visible = next(entry for entry in listed.json() if entry["job_id"] == str(job_id))
+    visible = next(
+        entry for entry in listed.json()["items"] if entry["job_id"] == str(job_id)
+    )
     assert visible["action"] == "RETRY_EMAIL_CLASSIFICATION"
     assert retried.status_code == 202
     assert retried.json()["job_id"] == str(job_id)
@@ -498,7 +500,9 @@ async def test_drive_retry_rejects_non_retryable_error_classes(
         "state": "FAILED",
         "error_class": error_class.value,
     }
-    visible = next(entry for entry in listed.json() if entry["job_id"] == str(job_id))
+    visible = next(
+        entry for entry in listed.json()["items"] if entry["job_id"] == str(job_id)
+    )
     assert visible["action"] == "NONE"
     db_session.expire_all()
     unchanged = await db_session.get(JobIntent, job_id)
@@ -600,7 +604,9 @@ async def test_safe_email_retry_uses_delivery_owner_service(db_session, operatio
         )
 
     assert unauthorized.status_code == 404
-    assert str(job_id) not in {entry["job_id"] for entry in ungranted_list.json()}
+    assert str(job_id) not in {
+        entry["job_id"] for entry in ungranted_list.json()["items"]
+    }
     db_session.add(
         ResourceGrant(
             organization_id=organization_id,
@@ -621,7 +627,9 @@ async def test_safe_email_retry_uses_delivery_owner_service(db_session, operatio
             headers={"Idempotency-Key": "safe-email-retry"},
         )
 
-    visible = next(entry for entry in listed.json() if entry["job_id"] == str(job_id))
+    visible = next(
+        entry for entry in listed.json()["items"] if entry["job_id"] == str(job_id)
+    )
     assert visible["action"] == "RETRY_EMAIL_DELIVERY"
     assert retried.status_code == 202
     db_session.expire_all()

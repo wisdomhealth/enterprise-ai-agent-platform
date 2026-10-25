@@ -795,6 +795,47 @@
         "title": "ErasureScope",
         "type": "string"
       },
+      "FailedJobPageRead": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FailedJobRead"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "page_size": {
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "total_pages": {
+            "title": "Total Pages",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total",
+          "count",
+          "total_pages"
+        ],
+        "title": "FailedJobPageRead",
+        "type": "object"
+      },
       "FailedJobRead": {
         "properties": {
           "action": {
@@ -816,7 +857,12 @@
             "title": "Attempts",
             "type": "integer"
           },
-          "error_code": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "error_category": {
             "anyOf": [
               {
                 "type": "string"
@@ -825,7 +871,7 @@
                 "type": "null"
               }
             ],
-            "title": "Error Code"
+            "title": "Error Category"
           },
           "job_id": {
             "format": "uuid",
@@ -835,6 +881,17 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "last_error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Code"
           },
           "state": {
             "title": "State",
@@ -851,7 +908,9 @@
           "kind",
           "state",
           "attempts",
-          "error_code",
+          "last_error_code",
+          "error_category",
+          "created_at",
           "updated_at",
           "action",
           "action_resource_id"
@@ -4328,6 +4387,102 @@
         "operationId": "failed_jobs_api_v1_admin_jobs_failed_get",
         "parameters": [
           {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 150,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "PENDING",
+                    "FAILED",
+                    "RECONCILIATION"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated To"
+            }
+          },
+          {
             "in": "cookie",
             "name": "staff_session",
             "required": false,
@@ -4349,11 +4504,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/FailedJobRead"
-                  },
-                  "title": "Response Failed Jobs Api V1 Admin Jobs Failed Get",
-                  "type": "array"
+                  "$ref": "#/components/schemas/FailedJobPageRead"
                 }
               }
             },

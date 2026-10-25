@@ -145,7 +145,9 @@ async def test_admin_read_projections_hide_resources_without_current_grants(
     assert without_grant.json()["knowledge_sources"] == []
     assert without_grant.json()["email_quality"] is None
     assert failures.status_code == 200
-    assert str(ungranted_job_id) not in {entry["job_id"] for entry in failures.json()}
+    assert str(ungranted_job_id) not in {
+        entry["job_id"] for entry in failures.json()["items"]
+    }
     assert retry.status_code == 404
     assert configure.status_code == 404
     assert sync.status_code == 404

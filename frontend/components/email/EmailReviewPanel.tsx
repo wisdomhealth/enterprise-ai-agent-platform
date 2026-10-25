@@ -185,35 +185,43 @@ export function EmailReviewPanel({ item }: { item: EmailDetail }) {
 
       {draft ? (
         <form className="staff-card staff-form-grid" onSubmit={save} aria-label="Current email draft">
-          <h2>Current draft</h2>
-          <label htmlFor="draft-to">To</label>
-          <input
-            id="draft-to"
-            value={to}
-            disabled={!editable || busy}
-            onChange={(event) => setTo(event.target.value)}
-          />
-          <label htmlFor="draft-cc">CC</label>
-          <input
-            id="draft-cc"
-            value={cc}
-            disabled={!editable || busy}
-            onChange={(event) => setCc(event.target.value)}
-          />
-          <label htmlFor="draft-subject">Reply subject</label>
-          <input
-            id="draft-subject"
-            value={subject}
-            disabled={!editable || busy}
-            onChange={(event) => setSubject(event.target.value)}
-          />
-          <label htmlFor="draft-thread">Gmail thread</label>
-          <input
-            id="draft-thread"
-            value={threadId}
-            disabled={!editable || busy}
-            onChange={(event) => setThreadId(event.target.value)}
-          />
+          <h2 className="staff-field-wide">Current draft</h2>
+          <div className="staff-draft-field staff-field-wide">
+            <label htmlFor="draft-to">To</label>
+            <input
+              id="draft-to"
+              value={to}
+              disabled={!editable || busy}
+              onChange={(event) => setTo(event.target.value)}
+            />
+          </div>
+          <div className="staff-draft-field staff-field-wide">
+            <label htmlFor="draft-cc">CC</label>
+            <input
+              id="draft-cc"
+              value={cc}
+              disabled={!editable || busy}
+              onChange={(event) => setCc(event.target.value)}
+            />
+          </div>
+          <div className="staff-draft-field staff-field-wide">
+            <label htmlFor="draft-subject">Reply subject</label>
+            <input
+              id="draft-subject"
+              value={subject}
+              disabled={!editable || busy}
+              onChange={(event) => setSubject(event.target.value)}
+            />
+          </div>
+          <div className="staff-draft-field staff-field-wide">
+            <label htmlFor="draft-thread">Gmail thread</label>
+            <input
+              id="draft-thread"
+              value={threadId}
+              disabled={!editable || busy}
+              onChange={(event) => setThreadId(event.target.value)}
+            />
+          </div>
           <label className="staff-field-wide" htmlFor="draft-body">Reply body</label>
           <textarea
             className="staff-field-wide"

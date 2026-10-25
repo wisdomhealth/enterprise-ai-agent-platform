@@ -409,10 +409,30 @@ export type AdminFailedJob = {
   kind: string;
   state: "PENDING" | "FAILED" | "RECONCILIATION";
   attempts: number;
-  error_code: string | null;
+  last_error_code: string | null;
+  error_category: string | null;
+  created_at: string;
   updated_at: string;
-  action: "RETRY_DRIVE_SYNC" | "RETRY_EMAIL_DELIVERY" | "RECONCILE_GMAIL" | "NONE";
+  action: "RETRY_DRIVE_SYNC" | "RETRY_EMAIL_CLASSIFICATION" | "RETRY_EMAIL_DELIVERY" | "RECONCILE_GMAIL" | "NONE";
   action_resource_id: string | null;
+};
+
+export type AdminFailedJobsPage = {
+  items: AdminFailedJob[];
+  page: number;
+  page_size: number;
+  total: number;
+  count: number;
+  total_pages: number;
+};
+
+export type AdminFailedJobQuery = {
+  page?: number;
+  pageSize?: number;
+  kind?: string;
+  state?: AdminFailedJob["state"];
+  updatedFrom?: string;
+  updatedTo?: string;
 };
 
 export type AdminUser = {
@@ -595,8 +615,18 @@ export function resumeAdminGmailRecovery(
   });
 }
 
-export function listAdminFailedJobs(): Promise<AdminFailedJob[]> {
-  return adminRequest<AdminFailedJob[]>("/jobs/failed");
+export function listAdminFailedJobs(
+  query: AdminFailedJobQuery = {},
+): Promise<AdminFailedJobsPage> {
+  const parameters = new URLSearchParams({
+    page: String(query.page ?? 1),
+    page_size: String(query.pageSize ?? 20),
+  });
+  if (query.kind) parameters.set("kind", query.kind);
+  if (query.state) parameters.set("state", query.state);
+  if (query.updatedFrom) parameters.set("updated_from", query.updatedFrom);
+  if (query.updatedTo) parameters.set("updated_to", query.updatedTo);
+  return adminRequest<AdminFailedJobsPage>(`/jobs/failed?${parameters.toString()}`);
 }
 
 export function retryAdminJob(jobId: string): Promise<void> {

@@ -67,7 +67,14 @@ function summary(status: "ACTIVE" | "REAUTH_REQUIRED") {
 beforeEach(() => {
   vi.mocked(getAdminConnectorAuthorizations).mockResolvedValue([]);
   vi.mocked(getAdminGmailSyncStates).mockResolvedValue([]);
-  vi.mocked(listAdminFailedJobs).mockResolvedValue([]);
+  vi.mocked(listAdminFailedJobs).mockResolvedValue({
+    items: [],
+    page: 1,
+    page_size: 20,
+    total: 0,
+    count: 0,
+    total_pages: 0,
+  });
   vi.mocked(listAdminUsers).mockResolvedValue([]);
   vi.mocked(getAdminRetentionPolicy).mockResolvedValue({
     id: "retention",
@@ -131,4 +138,116 @@ it("shows an understandable error when reauthorization cannot start", async () =
       screen.getByText("Unable to start Google Drive reauthorization."),
     ).toBeVisible(),
   );
+});
+
+it("renders failed work and users while the summary request is still pending", async () => {
+  vi.mocked(getAdminOperationsSummary).mockReturnValue(new Promise(() => undefined));
+  vi.mocked(listAdminFailedJobs).mockResolvedValue({
+    items: [{
+      job_id: "job-visible",
+      kind: "knowledge.drive_source.sync",
+      state: "FAILED",
+      attempts: 2,
+      last_error_code: "DRIVE_RATE_LIMITED",
+      error_category: "RETRYABLE",
+      created_at: "2026-10-24T08:00:00Z",
+      updated_at: "2026-10-24T09:00:00Z",
+      action: "RETRY_DRIVE_SYNC",
+      action_resource_id: "source-1",
+    }],
+    page: 1,
+    page_size: 20,
+    total: 1007,
+    count: 1,
+    total_pages: 51,
+  });
+  vi.mocked(listAdminUsers).mockResolvedValue([{
+    id: "admin-1",
+    email: "visible-admin@example.test",
+    role: "ADMIN",
+    status: "ACTIVE",
+    version: 1,
+  }]);
+
+  render(<AdminOperationsPage />);
+
+  expect(await screen.findByText(/DRIVE_RATE_LIMITED/)).toBeVisible();
+  expect(screen.getByText("visible-admin@example.test")).toBeVisible();
+  expect(screen.getByText("Loading operational status…")).toBeVisible();
+});
+
+it("keeps failed work and users visible when the summary request fails", async () => {
+  vi.mocked(getAdminOperationsSummary).mockRejectedValue(new Error("summary unavailable"));
+  vi.mocked(listAdminFailedJobs).mockResolvedValue({
+    items: [{
+      job_id: "job-visible-after-summary-error",
+      kind: "knowledge.drive_source.sync",
+      state: "FAILED",
+      attempts: 1,
+      last_error_code: "DRIVE_TEMPORARY_FAILURE",
+      error_category: "RETRYABLE",
+      created_at: "2026-10-24T08:00:00Z",
+      updated_at: "2026-10-24T09:00:00Z",
+      action: "RETRY_DRIVE_SYNC",
+      action_resource_id: "source-1",
+    }],
+    page: 1,
+    page_size: 20,
+    total: 1,
+    count: 1,
+    total_pages: 1,
+  });
+  vi.mocked(listAdminUsers).mockResolvedValue([{
+    id: "admin-1",
+    email: "independent-admin@example.test",
+    role: "ADMIN",
+    status: "ACTIVE",
+    version: 1,
+  }]);
+
+  render(<AdminOperationsPage />);
+
+  expect(await screen.findByText(/DRIVE_TEMPORARY_FAILURE/)).toBeVisible();
+  expect(screen.getByText("independent-admin@example.test")).toBeVisible();
+  expect(screen.getByText("Operational status is unavailable or not authorized.")).toBeVisible();
+});
+
+it("loads only one failed-work page and keeps filters while paging", async () => {
+  vi.mocked(getAdminOperationsSummary).mockResolvedValue(summary("ACTIVE"));
+  vi.mocked(listAdminFailedJobs)
+    .mockResolvedValueOnce({
+      items: [],
+      page: 1,
+      page_size: 20,
+      total: 1007,
+      count: 20,
+      total_pages: 51,
+    })
+    .mockResolvedValueOnce({
+      items: [],
+      page: 1,
+      page_size: 20,
+      total: 12,
+      count: 0,
+      total_pages: 1,
+    });
+
+  render(<AdminOperationsPage />);
+  await screen.findByText("1–20 of 1007");
+  fireEvent.change(screen.getByLabelText("Task type"), {
+    target: { value: "email.classify" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Apply failed-work filters" }));
+
+  await waitFor(() =>
+    expect(listAdminFailedJobs).toHaveBeenLastCalledWith({
+      page: 1,
+      pageSize: 20,
+      kind: "email.classify",
+      state: undefined,
+      updatedFrom: undefined,
+      updatedTo: undefined,
+    }),
+  );
+  expect(listAdminFailedJobs).toHaveBeenCalledTimes(2);
 });

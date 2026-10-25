@@ -1,10 +1,13 @@
 import re
+from collections import defaultdict
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import String, and_, case, cast, exists, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import CompoundSelect
 
 from app.core.config import Settings
 from app.modules.audit.models import AuditEvent
@@ -36,6 +39,7 @@ from app.modules.operations.schemas import (
     ConnectorReauthorizationRead,
     ConnectorStatusRead,
     EmailSummaryRead,
+    FailedJobPageRead,
     FailedJobRead,
     JobAction,
     JobRetryRead,
@@ -109,85 +113,59 @@ class OperationsService:
             if can_manage_sources
             else []
         )
-        source_statuses = [await self._source_status(source) for source in sources]
+        source_statuses = await self._source_statuses(sources)
         source_ids = {str(source.id) for source in sources}
         reviewable_knowledge_base_ids = await self._granted_resource_ids(
             principal, "knowledge", action="knowledge.review"
         )
-        reviewable_work_item_ids = set(
-            (
-                await self._db_session.scalars(
-                    select(EmailWorkItem.id).where(
+        queue_depth, failed_count = await self._job_counts(
+            principal.organization_id,
+            source_ids=source_ids,
+            reviewable_knowledge_base_ids=reviewable_knowledge_base_ids,
+        )
+        if reviewable_knowledge_base_ids:
+            email_retry_wait = int(
+                await self._db_session.scalar(
+                    select(func.count(EmailWorkItem.id)).where(
                         EmailWorkItem.organization_id == principal.organization_id,
                         EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                        EmailWorkItem.state.in_(
+                            [EmailState.DRAFT_RETRY_WAIT, EmailState.SEND_RETRY_WAIT]
+                        ),
                     )
                 )
-            ).all()
-        )
-        delivery_job_ids = set(
-            (
-                await self._db_session.scalars(
-                    select(DeliveryIntent.job_id)
+                or 0
+            )
+            delivery_unknown = int(
+                await self._db_session.scalar(
+                    select(func.count(DeliveryIntent.id))
                     .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
                     .where(
                         DeliveryIntent.organization_id == principal.organization_id,
                         EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                        DeliveryIntent.state == EmailState.DELIVERY_UNKNOWN,
                     )
                 )
-            ).all()
-        )
-        jobs = list((await self._db_session.scalars(select(JobIntent))).all())
-        visible_jobs = [
-            job
-            for job in jobs
-            if (
-                job.kind == "knowledge.drive_source.sync"
-                and str(job.payload.get("source_id")) in source_ids
+                or 0
             )
-            or job.id in delivery_job_ids
-            or (
-                job.kind == "email.classify"
-                and self._payload_uuid(job, "work_item_id") in reviewable_work_item_ids
-            )
-        ]
-        email_retry_wait = int(
-            await self._db_session.scalar(
-                select(func.count(EmailWorkItem.id)).where(
-                    EmailWorkItem.organization_id == principal.organization_id,
-                    EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
-                    EmailWorkItem.state.in_(
-                        [EmailState.DRAFT_RETRY_WAIT, EmailState.SEND_RETRY_WAIT]
-                    ),
+            support_backlog = int(
+                await self._db_session.scalar(
+                    select(func.count(Handoff.id))
+                    .join(ChatSession, ChatSession.id == Handoff.session_id)
+                    .where(
+                        Handoff.organization_id == principal.organization_id,
+                        ChatSession.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                        Handoff.state.in_(
+                            [ConversationState.HANDOFF_REQUESTED, ConversationState.QUEUED]
+                        ),
+                    )
                 )
+                or 0
             )
-            or 0
-        )
-        delivery_unknown = int(
-            await self._db_session.scalar(
-                select(func.count(DeliveryIntent.id))
-                .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
-                .where(
-                    DeliveryIntent.organization_id == principal.organization_id,
-                    EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
-                    DeliveryIntent.state == EmailState.DELIVERY_UNKNOWN,
-                )
-            )
-            or 0
-        )
-        support_backlog = int(
-            await self._db_session.scalar(
-                select(func.count(Handoff.id))
-                .join(ChatSession, ChatSession.id == Handoff.session_id)
-                .where(
-                    Handoff.organization_id == principal.organization_id,
-                    ChatSession.knowledge_base_id.in_(reviewable_knowledge_base_ids),
-                    Handoff.state.in_(
-                        [ConversationState.HANDOFF_REQUESTED, ConversationState.QUEUED]
-                    ),
-                )
-            )
-            or 0
-        )
+        else:
+            email_retry_wait = 0
+            delivery_unknown = 0
+            support_backlog = 0
         generated_at = await self._db_session.scalar(select(func.clock_timestamp()))
         if not isinstance(generated_at, datetime):
             raise RuntimeError("database clock is unavailable")
@@ -205,11 +183,8 @@ class OperationsService:
             ],
             knowledge_sources=source_statuses,
             jobs=JobSummaryRead(
-                queue_depth=sum(
-                    job.state in {JobState.PENDING, JobState.RUNNING, JobState.RECONCILIATION}
-                    for job in visible_jobs
-                ),
-                failed=sum(job.state is JobState.FAILED for job in visible_jobs),
+                queue_depth=queue_depth,
+                failed=failed_count,
             ),
             support=SupportSummaryRead(backlog=support_backlog),
             email=EmailSummaryRead(
@@ -225,7 +200,17 @@ class OperationsService:
             ),
         )
 
-    async def failed_jobs(self, principal: Principal) -> list[FailedJobRead]:
+    async def failed_jobs(
+        self,
+        principal: Principal,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        kind: str | None = None,
+        state: str | None = None,
+        updated_from: datetime | None = None,
+        updated_to: datetime | None = None,
+    ) -> FailedJobPageRead:
         self.require_admin(principal)
         can_manage_sources = await self._has_action_grant(
             principal,
@@ -233,103 +218,212 @@ class OperationsService:
             resource_id=KnowledgeSourceService.configuration_resource_id(principal.organization_id),
             action="knowledge.write",
         )
-        source_ids = set(
-            (
-                await self._db_session.scalars(
-                    select(DriveSource.id).where(
-                        DriveSource.organization_id == principal.organization_id
+        source_ids = {
+            str(source_id)
+            for source_id in (
+                (
+                    await self._db_session.scalars(
+                        select(DriveSource.id).where(
+                            DriveSource.organization_id == principal.organization_id
+                        )
                     )
-                )
-            ).all()
-            if can_manage_sources
-            else []
-        )
+                ).all()
+                if can_manage_sources
+                else []
+            )
+        }
         reviewable_knowledge_base_ids = await self._granted_resource_ids(
             principal, "knowledge", action="knowledge.review"
         )
-        delivery_intents = list(
-            (
-                await self._db_session.scalars(
-                    select(DeliveryIntent)
-                    .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
-                    .where(
-                        DeliveryIntent.organization_id == principal.organization_id,
-                        EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
-                    )
-                )
-            ).all()
+        visible_jobs = self._failed_job_rows(
+            principal.organization_id,
+            source_ids=source_ids,
+            reviewable_knowledge_base_ids=reviewable_knowledge_base_ids,
+        ).subquery()
+        filters = []
+        if kind is not None:
+            filters.append(visible_jobs.c.kind == kind)
+        if state is not None:
+            filters.append(visible_jobs.c.state == state)
+        if updated_from is not None:
+            filters.append(visible_jobs.c.updated_at >= updated_from)
+        if updated_to is not None:
+            filters.append(visible_jobs.c.updated_at <= updated_to)
+        total = int(
+            await self._db_session.scalar(
+                select(func.count()).select_from(visible_jobs).where(*filters)
+            )
+            or 0
         )
-        delivery_by_job = {intent.job_id: intent for intent in delivery_intents}
-        reviewable_items = list(
-            (
-                await self._db_session.scalars(
-                    select(EmailWorkItem).where(
-                        EmailWorkItem.organization_id == principal.organization_id,
-                        EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
-                    )
-                )
-            ).all()
+        rows = (
+            await self._db_session.execute(
+                select(visible_jobs)
+                .where(*filters)
+                .order_by(visible_jobs.c.updated_at.desc(), visible_jobs.c.job_id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).mappings()
+        items = [
+            FailedJobRead(
+                job_id=row["job_id"],
+                kind=row["kind"],
+                state=row["state"],
+                attempts=row["attempts"],
+                last_error_code=self._safe_error_code(row["last_error_code"]),
+                error_category=row["error_category"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                action=row["action"],
+                action_resource_id=row["action_resource_id"],
+            )
+            for row in rows
+        ]
+        return FailedJobPageRead(
+            items=items,
+            page=page,
+            page_size=page_size,
+            total=total,
+            count=len(items),
+            total_pages=(total + page_size - 1) // page_size,
         )
-        reviewable_items_by_id = {item.id: item for item in reviewable_items}
-        jobs = list(
-            (
-                await self._db_session.scalars(
-                    select(JobIntent)
-                    .where(
-                        JobIntent.state.in_(
-                            [JobState.PENDING, JobState.FAILED, JobState.RECONCILIATION]
-                        )
-                    )
-                    .order_by(JobIntent.updated_at.desc(), JobIntent.id)
-                )
-            ).all()
+
+    def _failed_job_rows(
+        self,
+        organization_id: UUID,
+        *,
+        source_ids: set[str],
+        reviewable_knowledge_base_ids: set[UUID],
+    ) -> CompoundSelect[Any]:
+        source_id = JobIntent.payload["source_id"].astext
+        work_item_id = JobIntent.payload["work_item_id"].astext
+        columns = (
+            JobIntent.id.label("job_id"),
+            JobIntent.kind,
+            JobIntent.state,
+            JobIntent.attempts,
+            JobIntent.last_error_code,
+            cast(JobIntent.error_class, String).label("error_category"),
+            JobIntent.created_at,
+            JobIntent.updated_at,
         )
-        results: list[FailedJobRead] = []
-        for job in jobs:
-            intent = delivery_by_job.get(job.id)
-            source_id = self._payload_uuid(job, "source_id")
-            if (
-                source_id in source_ids
-                and job.kind == "knowledge.drive_source.sync"
-                and job.state in {JobState.FAILED, JobState.RECONCILIATION}
-            ):
-                action = (
-                    JobAction.RETRY_DRIVE_SYNC
-                    if job.state is JobState.FAILED and job.error_class is ErrorClass.RETRYABLE
-                    else JobAction.NONE
-                )
-                action_resource_id = source_id
-            elif intent is not None:
-                action_resource_id = intent.work_item_id
-                if intent.state is EmailState.DELIVERY_UNKNOWN:
-                    action = JobAction.RECONCILE_GMAIL
-                elif intent.state is EmailState.SEND_RETRY_WAIT:
-                    action = JobAction.RETRY_EMAIL_DELIVERY
-                else:
-                    continue
-            elif (
-                job.kind == "email.classify"
-                and job.state is JobState.FAILED
-                and (work_item_id := self._payload_uuid(job, "work_item_id"))
-                in reviewable_items_by_id
-            ):
-                action = JobAction.RETRY_EMAIL_CLASSIFICATION
-                action_resource_id = work_item_id
-            else:
-                continue
-            results.append(
-                FailedJobRead(
-                    job_id=job.id,
-                    kind=job.kind,
-                    state=job.state.value,
-                    attempts=job.attempts,
-                    error_code=self._safe_error_code(job.last_error_code),
-                    updated_at=job.updated_at,
-                    action=action,
-                    action_resource_id=action_resource_id,
+        drive_jobs = select(
+            *columns,
+            case(
+                (
+                    and_(
+                        JobIntent.state == JobState.FAILED,
+                        JobIntent.error_class == ErrorClass.RETRYABLE,
+                    ),
+                    literal(JobAction.RETRY_DRIVE_SYNC.value),
+                ),
+                else_=literal(JobAction.NONE.value),
+            ).label("action"),
+            source_id.label("action_resource_id"),
+        ).where(
+            JobIntent.kind == "knowledge.drive_source.sync",
+            JobIntent.state.in_([JobState.FAILED, JobState.RECONCILIATION]),
+            source_id.in_(source_ids),
+        )
+        classify_jobs = (
+            select(
+                *columns,
+                literal(JobAction.RETRY_EMAIL_CLASSIFICATION.value).label("action"),
+                cast(EmailWorkItem.id, String).label("action_resource_id"),
+            )
+            .join(EmailWorkItem, cast(EmailWorkItem.id, String) == work_item_id)
+            .where(
+                JobIntent.kind == "email.classify",
+                JobIntent.state == JobState.FAILED,
+                EmailWorkItem.organization_id == organization_id,
+                EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+            )
+        )
+        delivery_jobs = (
+            select(
+                *columns,
+                case(
+                    (
+                        DeliveryIntent.state == EmailState.DELIVERY_UNKNOWN,
+                        literal(JobAction.RECONCILE_GMAIL.value),
+                    ),
+                    else_=literal(JobAction.RETRY_EMAIL_DELIVERY.value),
+                ).label("action"),
+                cast(DeliveryIntent.work_item_id, String).label("action_resource_id"),
+            )
+            .join(DeliveryIntent, DeliveryIntent.job_id == JobIntent.id)
+            .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
+            .where(
+                JobIntent.state.in_(
+                    [JobState.PENDING, JobState.FAILED, JobState.RECONCILIATION]
+                ),
+                DeliveryIntent.organization_id == organization_id,
+                EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                DeliveryIntent.state.in_(
+                    [EmailState.DELIVERY_UNKNOWN, EmailState.SEND_RETRY_WAIT]
+                ),
+            )
+        )
+        return union_all(drive_jobs, classify_jobs, delivery_jobs)
+
+    async def _job_counts(
+        self,
+        organization_id: UUID,
+        *,
+        source_ids: set[str],
+        reviewable_knowledge_base_ids: set[UUID],
+    ) -> tuple[int, int]:
+        conditions = []
+        if source_ids:
+            conditions.append(
+                and_(
+                    JobIntent.kind == "knowledge.drive_source.sync",
+                    JobIntent.payload["source_id"].astext.in_(source_ids),
                 )
             )
-        return results
+        if reviewable_knowledge_base_ids:
+            delivery_visible = exists(
+                select(DeliveryIntent.id)
+                .join(EmailWorkItem, EmailWorkItem.id == DeliveryIntent.work_item_id)
+                .where(
+                    DeliveryIntent.job_id == JobIntent.id,
+                    DeliveryIntent.organization_id == organization_id,
+                    EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                )
+            )
+            classify_visible = exists(
+                select(EmailWorkItem.id).where(
+                    cast(EmailWorkItem.id, String)
+                    == JobIntent.payload["work_item_id"].astext,
+                    EmailWorkItem.organization_id == organization_id,
+                    EmailWorkItem.knowledge_base_id.in_(reviewable_knowledge_base_ids),
+                )
+            )
+            conditions.extend(
+                (
+                    delivery_visible,
+                    and_(JobIntent.kind == "email.classify", classify_visible),
+                )
+            )
+        if not conditions:
+            return 0, 0
+        row = (
+            await self._db_session.execute(
+                select(
+                    func.count()
+                    .filter(
+                        JobIntent.state.in_(
+                            [JobState.PENDING, JobState.RUNNING, JobState.RECONCILIATION]
+                        )
+                    )
+                    .label("queue_depth"),
+                    func.count()
+                    .filter(JobIntent.state == JobState.FAILED)
+                    .label("failed"),
+                ).where(or_(*conditions))
+            )
+        ).one()
+        return int(row.queue_depth), int(row.failed)
 
     async def retry_job(
         self,
@@ -605,65 +699,89 @@ class OperationsService:
         if principal.role is not UserRole.ADMIN:
             raise OperationsNotFound(principal.subject_id)
 
-    async def _source_status(self, source: DriveSource) -> KnowledgeSourceStatusRead:
-        jobs = list(
-            (
-                await self._db_session.scalars(
-                    select(JobIntent).where(JobIntent.kind == "knowledge.drive_source.sync")
+    async def _source_statuses(
+        self, sources: list[DriveSource]
+    ) -> list[KnowledgeSourceStatusRead]:
+        if not sources:
+            return []
+        source_ids = {str(source.id) for source in sources}
+        source_key = JobIntent.payload["source_id"].astext
+        job_rows = (
+            await self._db_session.execute(
+                select(
+                    source_key.label("source_id"),
+                    func.max(JobIntent.updated_at)
+                    .filter(JobIntent.state == JobState.SUCCEEDED)
+                    .label("last_success_at"),
+                    func.count()
+                    .filter(JobIntent.state.in_([JobState.PENDING, JobState.RUNNING]))
+                    .label("backlog"),
+                    func.coalesce(func.sum(JobIntent.attempts), 0).label("retry_count"),
                 )
-            ).all()
-        )
-        source_jobs = [job for job in jobs if job.payload.get("source_id") == str(source.id)]
-        document_ids = list(
-            (
-                await self._db_session.scalars(
-                    select(Document.id).where(Document.source_id == source.id)
+                .where(
+                    JobIntent.kind == "knowledge.drive_source.sync",
+                    source_key.in_(source_ids),
                 )
-            ).all()
-        )
-        isolated = 0
-        if document_ids:
-            isolated = int(
-                await self._db_session.scalar(
-                    select(func.count(DocumentVersion.id)).where(
-                        DocumentVersion.document_id.in_(document_ids),
-                        DocumentVersion.state.in_(
-                            [DocumentVersionState.FAILED, DocumentVersionState.REVOKED]
-                        ),
-                    )
-                )
-                or 0
+                .group_by(source_key)
             )
-        successful = [job.updated_at for job in source_jobs if job.state is JobState.SUCCEEDED]
-        errors = [
-            self._safe_error_code(job.last_error_code) for job in source_jobs if job.last_error_code
-        ]
-        disabled_reason = await self._source_disabled_reason(source)
-        return KnowledgeSourceStatusRead(
-            source_id=source.id,
-            status=source.status.value,
-            root_folder_id=source.root_folder_id,
-            include_descendants=source.include_descendants,
-            descendant_count=len(source.allowed_descendant_ids),
-            cursor=source.sync_cursor,
-            last_success_at=max(successful, default=None),
-            backlog=sum(job.state in {JobState.PENDING, JobState.RUNNING} for job in source_jobs),
-            isolated_files=isolated,
-            retry_count=sum(job.attempts for job in source_jobs),
-            recent_error_codes=[error for error in errors[-5:] if error is not None],
-            disabled_reason=disabled_reason,
-        )
+        ).mappings()
+        jobs_by_source = {row["source_id"]: row for row in job_rows}
 
-    async def _source_disabled_reason(self, source: DriveSource) -> str | None:
-        if source.status.value != "DISABLED":
-            return None
-        events = list(
-            (
+        ranked_errors = (
+            select(
+                source_key.label("source_id"),
+                JobIntent.last_error_code.label("error_code"),
+                func.row_number()
+                .over(
+                    partition_by=source_key,
+                    order_by=(JobIntent.updated_at.desc(), JobIntent.id.desc()),
+                )
+                .label("position"),
+            )
+            .where(
+                JobIntent.kind == "knowledge.drive_source.sync",
+                source_key.in_(source_ids),
+                JobIntent.last_error_code.is_not(None),
+            )
+            .subquery()
+        )
+        error_rows = (
+            await self._db_session.execute(
+                select(ranked_errors.c.source_id, ranked_errors.c.error_code)
+                .where(ranked_errors.c.position <= 5)
+                .order_by(ranked_errors.c.source_id, ranked_errors.c.position)
+            )
+        ).all()
+        errors_by_source: dict[str, list[str]] = defaultdict(list)
+        for source_id, error_code in error_rows:
+            safe_code = self._safe_error_code(error_code)
+            if safe_code is not None:
+                errors_by_source[source_id].append(safe_code)
+
+        isolated_rows = (
+            await self._db_session.execute(
+                select(Document.source_id, func.count(DocumentVersion.id))
+                .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+                .where(
+                    cast(Document.source_id, String).in_(source_ids),
+                    DocumentVersion.state.in_(
+                        [DocumentVersionState.FAILED, DocumentVersionState.REVOKED]
+                    ),
+                )
+                .group_by(Document.source_id)
+            )
+        ).all()
+        isolated_by_source = {str(source_id): int(count) for source_id, count in isolated_rows}
+
+        disabled_sources = [source for source in sources if source.status.value == "DISABLED"]
+        disabled_reasons: dict[UUID, str] = {}
+        if disabled_sources:
+            events = (
                 await self._db_session.scalars(
                     select(AuditEvent)
                     .where(
-                        AuditEvent.organization_id == source.organization_id,
-                        AuditEvent.object_id == source.id,
+                        AuditEvent.organization_id == disabled_sources[0].organization_id,
+                        AuditEvent.object_id.in_([source.id for source in disabled_sources]),
                         AuditEvent.action.in_(
                             (
                                 "knowledge.drive_source.root_unavailable",
@@ -671,15 +789,46 @@ class OperationsService:
                             )
                         ),
                     )
-                    .order_by(AuditEvent.occurred_at.desc(), AuditEvent.id.desc())
-                    .limit(1)
+                    .distinct(AuditEvent.object_id)
+                    .order_by(
+                        AuditEvent.object_id,
+                        AuditEvent.occurred_at.desc(),
+                        AuditEvent.id.desc(),
+                    )
                 )
             ).all()
-        )
-        if not events or events[0].action != "knowledge.drive_source.root_unavailable":
-            return None
-        reason = events[0].details.get("reason")
-        return f"ROOT_UNAVAILABLE_{reason}" if isinstance(reason, str) else None
+            for event in events:
+                reason = event.details.get("reason")
+                if event.action == "knowledge.drive_source.root_unavailable" and isinstance(
+                    reason, str
+                ):
+                    disabled_reasons[event.object_id] = f"ROOT_UNAVAILABLE_{reason}"
+
+        results = []
+        for source in sources:
+            source_id = str(source.id)
+            statistics = jobs_by_source.get(source_id)
+            results.append(
+                KnowledgeSourceStatusRead(
+                    source_id=source.id,
+                    status=source.status.value,
+                    root_folder_id=source.root_folder_id,
+                    include_descendants=source.include_descendants,
+                    descendant_count=len(source.allowed_descendant_ids),
+                    cursor=source.sync_cursor,
+                    last_success_at=(
+                        statistics["last_success_at"] if statistics is not None else None
+                    ),
+                    backlog=int(statistics["backlog"]) if statistics is not None else 0,
+                    isolated_files=isolated_by_source.get(source_id, 0),
+                    retry_count=(
+                        int(statistics["retry_count"]) if statistics is not None else 0
+                    ),
+                    recent_error_codes=errors_by_source[source_id],
+                    disabled_reason=disabled_reasons.get(source.id),
+                )
+            )
+        return results
 
     @classmethod
     def _safe_error_code(cls, value: str | None) -> str | None:

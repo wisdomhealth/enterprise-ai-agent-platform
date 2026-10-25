@@ -81,10 +81,21 @@ class FailedJobRead(BaseModel):
     kind: str
     state: str
     attempts: int
-    error_code: str | None
+    last_error_code: str | None
+    error_category: str | None
+    created_at: datetime
     updated_at: datetime
     action: JobAction
     action_resource_id: UUID | None
+
+
+class FailedJobPageRead(BaseModel):
+    items: list[FailedJobRead]
+    page: int
+    page_size: int
+    total: int
+    count: int
+    total_pages: int
 
 
 class JobRetryRead(BaseModel):
