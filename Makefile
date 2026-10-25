@@ -1,4 +1,4 @@
-.PHONY: install test test-backend test-frontend lint lint-backend lint-frontend typecheck typecheck-backend typecheck-frontend test-integration test-e2e check-prometheus check-operability verify-release-gates benchmark-baseline
+.PHONY: install test test-backend test-frontend lint lint-backend lint-frontend typecheck typecheck-backend typecheck-frontend test-integration test-e2e local-tls check-tls check-prometheus check-operability verify-release-gates benchmark-baseline
 
 PYTHON ?= $(shell \
 	for candidate in python3.13 python3.12 python3; do \
@@ -58,6 +58,12 @@ test-integration:
 test-e2e:
 	cd backend && "$(BACKEND_PYTHON)" -m pytest --import-mode=importlib tests/e2e -q
 	cd frontend && npm run test:e2e
+
+local-tls:
+	scripts/generate-local-tls
+
+check-tls:
+	scripts/check-tls-material "$${TLS_CERT_DIR:?TLS_CERT_DIR is required}"
 
 check-prometheus:
 	docker run --rm --entrypoint /bin/promtool \

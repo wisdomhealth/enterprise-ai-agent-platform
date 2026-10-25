@@ -15,10 +15,12 @@ function connectorName(kind: AdminConnectorStatus["kind"]) {
 export function ConnectorStatus({
   connectors,
   authorizations,
+  reauthorizationRequiredConnectorIds = new Set(),
   onReauthorize,
 }: {
   connectors: AdminConnectorStatus[];
   authorizations?: AdminConnectorAuthorization[];
+  reauthorizationRequiredConnectorIds?: ReadonlySet<string>;
   onReauthorize: (connectorId: string) => Promise<void>;
 }) {
   const [pending, setPending] = useState<AdminConnectorStatus | null>(null);
@@ -40,7 +42,7 @@ export function ConnectorStatus({
                   <span className="staff-status" data-tone={connector.status === "ACTIVE" ? "success" : "warning"}>{statusLabel(connector.status)}</span>
                   {` · Updated ${formatUtc(connector.updated_at)}`}
                   <p>Requested scopes: {connector.requested_scopes.join(", ")}</p>
-                  {connector.status !== "ACTIVE" ? (
+                  {connector.status !== "ACTIVE" || reauthorizationRequiredConnectorIds.has(connector.id) ? (
                     <button className="button-primary" type="button" onClick={() => setPending(connector)}>
                       Reauthorize {name}
                     </button>

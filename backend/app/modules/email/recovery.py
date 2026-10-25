@@ -123,6 +123,41 @@ class GmailRecoveryService:
         await self._db_session.flush()
         return state
 
+    async def resume_sync(
+        self,
+        principal: Principal,
+        connector_id: UUID,
+        *,
+        expected_version: int,
+        reason: str,
+    ) -> EmailSyncState:
+        if not reason.strip():
+            raise ValueError("reason is required")
+        state = await self._locked_state(principal, connector_id, expected_version)
+        if (
+            state.sync_status is not GmailSyncStatus.PAUSED_ERROR
+            or state.last_error_code != "GMAIL_REAUTH_REQUIRED"
+        ):
+            raise GmailRecoveryConflict("Gmail synchronization is not paused for reauthorization")
+        sync_request = await self._schedule(
+            state,
+            trigger="RECOVERY_RESUME",
+            requested_by=principal.subject_id,
+            allow_recovery=True,
+        )
+        await self._record(
+            principal,
+            state,
+            "gmail.recovery.resume",
+            reason=reason,
+            choice="RESUME",
+            additional_messages=0,
+            sync_request=sync_request,
+        )
+        state.version += 1
+        await self._db_session.flush()
+        return state
+
     async def _locked_state(
         self, principal: Principal, connector_id: UUID, expected_version: int
     ) -> EmailSyncState:

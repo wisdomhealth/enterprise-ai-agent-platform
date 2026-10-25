@@ -11,12 +11,14 @@ import { UserManagement } from "../../../components/admin/UserManagement";
 import {
   AdminConnectorAuthorization,
   AdminFailedJob,
+  AdminGmailSyncState,
   AdminOperationsSummary,
   AdminRetentionPolicy,
   AdminUser,
   beginConnectorReauthorization,
   configureAdminDriveScope,
   getAdminConnectorAuthorizations,
+  getAdminGmailSyncStates,
   getAdminOperationsSummary,
   getAdminRetentionPolicy,
   inviteAdminUser,
@@ -36,21 +38,24 @@ export default function AdminOperationsPage() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [retentionPolicy, setRetentionPolicy] = useState<AdminRetentionPolicy | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [gmailStates, setGmailStates] = useState<AdminGmailSyncState[]>([]);
 
   const refresh = useCallback(async () => {
     try {
-      const [nextSummary, nextJobs, nextUsers, nextRetentionPolicy, nextAuthorizations] = await Promise.all([
+      const [nextSummary, nextJobs, nextUsers, nextRetentionPolicy, nextAuthorizations, nextGmailStates] = await Promise.all([
         getAdminOperationsSummary(),
         listAdminFailedJobs(),
         listAdminUsers(),
         getAdminRetentionPolicy(),
         getAdminConnectorAuthorizations(),
+        getAdminGmailSyncStates(),
       ]);
       setSummary(nextSummary);
       setJobs(nextJobs);
       setUsers(nextUsers);
       setRetentionPolicy(nextRetentionPolicy);
       setAuthorizations(nextAuthorizations);
+      setGmailStates(nextGmailStates);
       setNotice(null);
     } catch {
       setNotice("Administrator operations are unavailable or not authorized.");
@@ -79,7 +84,7 @@ export default function AdminOperationsPage() {
       </section>
       <div className="staff-page-grid">
         <div className="staff-stack">
-          <ConnectorStatus connectors={summary.connectors} authorizations={authorizations} onReauthorize={async (id) => {
+          <ConnectorStatus connectors={summary.connectors} authorizations={authorizations} reauthorizationRequiredConnectorIds={new Set(gmailStates.filter((state) => state.last_error_code === "GMAIL_REAUTH_REQUIRED").map((state) => state.connector_id))} onReauthorize={async (id) => {
             try {
               const result = await beginConnectorReauthorization(id);
               window.location.assign(result.authorization_url);

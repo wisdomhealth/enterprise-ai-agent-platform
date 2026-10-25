@@ -16,7 +16,7 @@ from app.modules.connectors.encryption import (
     envelope_cipher_from_settings,
 )
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorSecret, ConnectorStatus
-from app.modules.email.models import EmailSyncState
+from app.modules.email.models import EmailSyncState, GmailSyncStatus
 from app.modules.identity.dependencies import Principal
 from app.modules.outbox.service import OutboxService
 
@@ -203,16 +203,35 @@ class ConnectorService:
                 ),
             )
         else:
+            authorization_resource = self._resource_ref(connector)
             if connector.status is ConnectorStatus.ACTIVE:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="connector is active; revoke it before reauthorization",
+                gmail_sync_state = (
+                    await db_session.scalar(
+                        select(EmailSyncState).where(
+                            EmailSyncState.connector_id == connector.id,
+                            EmailSyncState.sync_status == GmailSyncStatus.PAUSED_ERROR,
+                            EmailSyncState.last_error_code == "GMAIL_REAUTH_REQUIRED",
+                        )
+                    )
+                    if connector.kind is ConnectorKind.GMAIL
+                    else None
+                )
+                if gmail_sync_state is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="connector is active; revoke it before reauthorization",
+                    )
+                authorization_resource = ResourceRef(
+                    organization_id=connector.organization_id,
+                    resource_type="connector",
+                    resource_id=connector.id,
+                    state=ResourceState.REAUTH_REQUIRED,
                 )
             await self._require_action(
                 db_session,
                 principal,
                 "connector.reauthorize",
-                self._resource_ref(connector),
+                authorization_resource,
             )
         return connector
 

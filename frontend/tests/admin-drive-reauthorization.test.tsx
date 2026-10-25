@@ -6,6 +6,7 @@ import {
   beginConnectorReauthorization,
   configureAdminDriveScope,
   getAdminConnectorAuthorizations,
+  getAdminGmailSyncStates,
   getAdminOperationsSummary,
   getAdminRetentionPolicy,
   listAdminFailedJobs,
@@ -20,6 +21,7 @@ vi.mock("../lib/staff-api", async (importOriginal) => {
     beginConnectorReauthorization: vi.fn(),
     configureAdminDriveScope: vi.fn(),
     getAdminConnectorAuthorizations: vi.fn(),
+    getAdminGmailSyncStates: vi.fn(),
     getAdminOperationsSummary: vi.fn(),
     getAdminRetentionPolicy: vi.fn(),
     listAdminFailedJobs: vi.fn(),
@@ -64,6 +66,7 @@ function summary(status: "ACTIVE" | "REAUTH_REQUIRED") {
 
 beforeEach(() => {
   vi.mocked(getAdminConnectorAuthorizations).mockResolvedValue([]);
+  vi.mocked(getAdminGmailSyncStates).mockResolvedValue([]);
   vi.mocked(listAdminFailedJobs).mockResolvedValue([]);
   vi.mocked(listAdminUsers).mockResolvedValue([]);
   vi.mocked(getAdminRetentionPolicy).mockResolvedValue({

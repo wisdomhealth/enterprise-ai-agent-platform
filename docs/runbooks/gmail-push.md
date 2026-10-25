@@ -85,6 +85,7 @@ Administrator operations are exposed under `${PUBLIC_BASE_URL}/api/v1/admin`:
 - `POST /connectors/{connector_id}/gmail-sync/manual` starts an authorized manual synchronization.
 - `POST /connectors/{connector_id}/gmail-recovery/continue` increases a truncated recovery bound.
 - `POST /connectors/{connector_id}/gmail-recovery/accept-limited` records explicit limited-recovery acceptance and still schedules H0 catch-up.
+- `POST /connectors/{connector_id}/gmail-recovery/resume` resumes a synchronization paused by `GMAIL_REAUTH_REQUIRED` after OAuth succeeds.
 
 All mutating operations require an active same-organization administrator, CSRF protection,
 optimistic state validation where applicable, and an `Idempotency-Key`.
@@ -93,6 +94,10 @@ Manual synchronization works with Push disabled, Watch stopped, and no Pub/Sub c
 returns after durable acceptance. The status response exposes the active job and trigger; only a
 later successful worker completion updates `last_success_at`. `PAUSED_ERROR`, `RECOVERY_REQUIRED`,
 and `RECOVERY_TRUNCATED` require the existing authorized reauthorization or recovery operations.
+For `GMAIL_REAUTH_REQUIRED`, first use the existing connector reauthorization endpoint and complete
+Google OAuth. Reauthorization rotates credentials but intentionally preserves the paused sync state;
+an administrator must then use the recovery resume action. Resume preserves Gmail cursors, creates
+only a generation-fenced Gmail History job, and does not restart failed classification or draft jobs.
 
 ## Migration and deployment sequence
 

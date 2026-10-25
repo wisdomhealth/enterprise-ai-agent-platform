@@ -92,8 +92,8 @@ class EmailDraftingService:
             #     AnswerAudience.STAFF,
             # )
 
-            chunk_id = 'ce87ce13-3652-5bbe-82a5-a4aa9169ef75'
-            version_id = 'fa582ed9-cf12-4ac2-aac8-f56f14ab91de'
+            chunk_id = UUID("ce87ce13-3652-5bbe-82a5-a4aa9169ef75")
+            version_id = UUID("fa582ed9-cf12-4ac2-aac8-f56f14ab91de")
             citation = SourceCitation(
                 chunk_id=chunk_id,
                 document_version_id=version_id,

@@ -300,3 +300,61 @@ async def test_manual_sync_cannot_bypass_recovery_authorization(
             expected_version=state.version,
             reason="Do not bypass recovery.",
         )
+
+
+@pytest.mark.asyncio
+async def test_resume_after_reauthorization_preserves_cursor_and_downstream_jobs(
+    db_session: AsyncSession, email_context: dict[str, object]
+) -> None:
+    connector = email_context["connector"]
+    organization = email_context["organization"]
+    staff_user = email_context["staff_user"]
+    staff_user.role = UserRole.ADMIN
+    state = EmailSyncState(
+        organization_id=organization.id,
+        connector_id=connector.id,
+        processed_history_id="cursor-100",
+        pending_history_id="cursor-105",
+        sync_status=GmailSyncStatus.PAUSED_ERROR,
+        last_error_code="GMAIL_REAUTH_REQUIRED",
+    )
+    db_session.add(state)
+    await db_session.flush()
+    downstream_before = await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind.in_(("email.classify", "email.draft"))
+        )
+    )
+    principal = Principal(
+        staff_user.id,
+        organization.id,
+        staff_user.email,
+        UserRole.ADMIN,
+        uuid4(),
+        "csrf",
+    )
+
+    resumed = await GmailRecoveryService(db_session).resume_sync(
+        principal,
+        connector.id,
+        expected_version=state.version,
+        reason="Gmail credentials were reauthorized.",
+    )
+
+    assert resumed.sync_status is GmailSyncStatus.RUNNING
+    assert resumed.processed_history_id == "cursor-100"
+    assert resumed.pending_history_id == "cursor-105"
+    job = await db_session.get(JobIntent, resumed.active_sync_job_id)
+    assert job is not None
+    assert job.payload["trigger"] == "RECOVERY_RESUME"
+    assert await db_session.scalar(
+        select(func.count(JobIntent.id)).where(
+            JobIntent.kind.in_(("email.classify", "email.draft"))
+        )
+    ) == downstream_before
+    assert await db_session.scalar(
+        select(AuditEvent.id).where(
+            AuditEvent.action == "gmail.recovery.resume",
+            AuditEvent.object_id == state.id,
+        )
+    ) is not None

@@ -230,7 +230,7 @@ services:
       - "${HTTPS_PORT:-443}:443"
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ${TLS_CERT_DIR:-./infra/nginx/tls}:/etc/nginx/tls:ro
+      - ${TLS_CERT_DIR:-./.enterprise-ai-agent-platform/tls}:/etc/nginx/tls:ro
     restart: unless-stopped
     depends_on:
       backend:

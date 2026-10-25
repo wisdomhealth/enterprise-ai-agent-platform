@@ -41,6 +41,7 @@ from app.modules.operations.schemas import (
     GmailManualSyncRequest,
     GmailRecoveryAcceptRequest,
     GmailRecoveryContinueRequest,
+    GmailRecoveryResumeRequest,
     GmailSyncStateRead,
     JobRetryRead,
     JobRetryRequest,
@@ -504,6 +505,40 @@ async def accept_limited_gmail_recovery(
                 connector_id,
                 expected_version=request_body.expected_version,
                 confirmed=request_body.confirmed,
+                reason=request_body.reason,
+            ),
+            db_session,
+            request.app.state.settings,
+        ),
+    )
+
+
+@router.post(
+    "/connectors/{connector_id}/gmail-recovery/resume",
+    response_model=GmailSyncStateRead,
+)
+async def resume_gmail_sync(
+    connector_id: UUID,
+    request: Request,
+    request_body: GmailRecoveryResumeRequest,
+    principal: Annotated[Principal, Depends(require_admin_csrf)],
+    db_session: Annotated[AsyncSession, Depends(get_db_session)],
+    idempotency_key: Annotated[str, Depends(_write_key)],
+) -> GmailSyncStateRead:
+    service = GmailRecoveryService(db_session)
+    return await _idempotent_action(
+        db_session=db_session,
+        principal=principal,
+        key=idempotency_key,
+        operation="admin.gmail_recovery.resume",
+        object_id=connector_id,
+        request_body=request_body.model_dump(mode="json"),
+        response_type=GmailSyncStateRead,
+        invoke=lambda: _watch_action(
+            service.resume_sync(
+                principal,
+                connector_id,
+                expected_version=request_body.expected_version,
                 reason=request_body.reason,
             ),
             db_session,

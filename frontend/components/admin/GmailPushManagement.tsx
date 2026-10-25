@@ -10,6 +10,7 @@ export function GmailPushManagement({
   onManualSync,
   onContinueRecovery,
   onAcceptLimitedRecovery,
+  onResumeRecovery,
 }: {
   states: AdminGmailSyncState[];
   onWatch: (state: AdminGmailSyncState, action: "start" | "renew" | "stop") => Promise<void>;
@@ -20,6 +21,7 @@ export function GmailPushManagement({
     reason: string,
   ) => Promise<void>;
   onAcceptLimitedRecovery: (state: AdminGmailSyncState, reason: string) => Promise<void>;
+  onResumeRecovery: (state: AdminGmailSyncState, reason: string) => Promise<void>;
 }) {
   const [reason, setReason] = useState("");
   const [additionalMessages, setAdditionalMessages] = useState(500);
@@ -47,7 +49,9 @@ export function GmailPushManagement({
         <article className="staff-card" key={state.connector_id}>
           <h3>{state.mailbox_address ?? "Mailbox registration pending"}</h3>
           <div className="staff-summary-grid"><div><strong>Push listener</strong><p><span className="staff-status" data-tone={state.watch_status === "ACTIVE" ? "success" : "warning"}>{state.push_enabled ? `Enabled · ${state.watch_status}` : `Disabled · ${state.watch_status}`}</span></p><p>Expires: {state.watch_expiration_at ?? "Not available"}</p></div><div><strong>Scheduled polling</strong><p><span className="staff-status" data-tone={state.polling_enabled ? "success" : "warning"}>{state.polling_enabled ? "Enabled" : "Disabled"}</span></p><p>Sync state: {state.sync_status}</p><p>Last success: {state.last_success_at ?? "Never"}</p></div></div>
-          {state.last_error_code ? <p role="alert">Last error: {state.last_error_code}</p> : null}
+          {state.last_error_code === "GMAIL_REAUTH_REQUIRED" ? (
+            <p role="alert">Gmail authorization was revoked or expired. Reauthorize Gmail, then resume synchronization. Error code: GMAIL_REAUTH_REQUIRED.</p>
+          ) : state.last_error_code ? <p role="alert">Last error: {state.last_error_code}</p> : null}
           <div className="staff-actions">
             <button type="button" className="button-primary" disabled={busyAction !== null} onClick={() => void run(`${state.connector_id}:start`, () => onWatch(state, "start"))}>{busyAction === `${state.connector_id}:start` ? "Starting…" : "Start watch"}</button>
             <button type="button" disabled={busyAction !== null} onClick={() => void run(`${state.connector_id}:renew`, () => onWatch(state, "renew"))}>{busyAction === `${state.connector_id}:renew` ? "Renewing…" : "Renew watch"}</button>
@@ -61,6 +65,16 @@ export function GmailPushManagement({
             {busyAction === `${state.connector_id}:sync` ? "Starting sync…" : state.active_job_state && ["PENDING", "RUNNING", "RECONCILIATION"].includes(state.active_job_state) ? "Sync in progress" : "Run manual sync"}
           </button>
           {["PAUSED_ERROR", "RECOVERY_REQUIRED"].includes(state.sync_status) ? <p role="alert">Manual sync is paused. Reauthorize or use the existing authorized recovery action before retrying.</p> : null}
+          {state.sync_status === "PAUSED_ERROR" && state.last_error_code === "GMAIL_REAUTH_REQUIRED" ? (
+            <button
+              type="button"
+              className="button-primary"
+              disabled={!reason.trim() || busyAction !== null}
+              onClick={() => void run(`${state.connector_id}:resume`, () => onResumeRecovery(state, reason))}
+            >
+              {busyAction === `${state.connector_id}:resume` ? "Resuming…" : "Resume synchronization"}
+            </button>
+          ) : null}
           {state.sync_status === "RECOVERY_TRUNCATED" ? <div>
             <p role="alert">
               Recovery scanned from {state.recovery_window_started_at ?? "the configured window"},

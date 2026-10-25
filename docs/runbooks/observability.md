@@ -82,7 +82,26 @@ management system; the checked-in receiver intentionally has no external sink.
 
 ## TLS and SSE
 
-Provision `tls.crt` and `tls.key` in `TLS_CERT_DIR` before starting Nginx. Nginx
+For local development, run `make local-tls`. It creates ignored material under
+`.enterprise-ai-agent-platform/tls`, includes SAN entries for `localhost`, `127.0.0.1`,
+and `::1`, protects the private key with mode `0600`, and refuses to overwrite either
+existing file.
+
+To replace the exposed local development pair deliberately:
+
+```bash
+docker compose stop nginx
+rm .enterprise-ai-agent-platform/tls/tls.crt \
+   .enterprise-ai-agent-platform/tls/tls.key
+make local-tls
+docker compose up -d --force-recreate nginx
+```
+
+For production, provision `tls.crt` and `tls.key` in an external, access-controlled
+directory, set `TLS_CERT_DIR` explicitly, run `scripts/check-tls-material
+"$TLS_CERT_DIR"`, and start with `-f compose.yaml -f compose.production.yaml`.
+The production override fails when `TLS_CERT_DIR` is absent and mounts it read-only.
+Nginx
 redirects HTTP to HTTPS, enforces body/time limits and security headers, does not
 follow an application redirect, and disables proxy buffering/cache for API/SSE
 traffic so durable PostgreSQL replay remains the reconnect authority.

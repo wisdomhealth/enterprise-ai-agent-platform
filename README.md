@@ -201,8 +201,9 @@ The platform enforces organization isolation, role/action checks, and resource-l
 authorization. Connector credentials are envelope-encrypted; Drive access is
 read-only. Idempotent writes, transactional Outbox records, durable PostgreSQL job
 state, and worker leases make asynchronous work recoverable. Customer-facing errors
-are safe, and output is validated before customer delivery. The repository contains
-no customer credentials or secrets.
+are safe, and output is validated before customer delivery. Do not add credentials or
+private keys to Git. A previously committed localhost development TLS key is documented
+as exposed in the [TLS key exposure record](docs/operations/tls-key-exposure.md).
 
 For detailed boundaries and operating guidance, see the
 [security boundaries](docs/architecture/security-boundaries.md),
@@ -217,6 +218,9 @@ Requirement: Docker Compose.
 # Create the local environment file.
 cp .env.example .env
 
+# Generate an ignored localhost certificate and private key. This refuses to overwrite.
+make local-tls
+
 # Build and start the application stack in the background.
 docker compose up -d --build
 
@@ -225,7 +229,9 @@ docker compose ps
 ```
 
 The environment example contains empty placeholders only. Supply customer-owned
-credentials through the environment; do not commit `.env`.
+credentials through the environment; do not commit `.env`. Local TLS material is
+written to `.enterprise-ai-agent-platform/tls`; `tls.key` has mode `0600`, supports
+`localhost`, `127.0.0.1`, and `::1`, and is never committed.
 
 The command above starts the application stack in the background; it does not run
 pytest. To build and start the backend test container in the background, where the
@@ -253,7 +259,10 @@ provider calls.
 
 Nginx publishes the application on ports 80 and 443. Backend port 8000 and
 frontend port 3000 are internal container ports and are not published directly.
-The local TLS certificate may require browser approval.
+The local self-signed TLS certificate may require browser approval. To replace local
+material, stop Nginx, remove both ignored local files, run `make local-tls`, then run
+`docker compose up -d --force-recreate nginx`. Production must instead set an external
+`TLS_CERT_DIR` and use `compose.production.yaml`; it never falls back to local material.
 
 Set `PUBLIC_BASE_URL` to the external origin only, for example
 `https://platform.example.com` (no path is required). The application safely removes a trailing

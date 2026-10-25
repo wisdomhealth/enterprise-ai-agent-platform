@@ -23,6 +23,7 @@ import {
   requestAdminGmailManualSync,
   continueAdminGmailRecovery,
   acceptAdminLimitedGmailRecovery,
+  resumeAdminGmailRecovery,
 } from "../../../../lib/staff-api";
 
 export default function ConnectorAuthorizationPage() {
@@ -69,7 +70,7 @@ export default function ConnectorAuthorizationPage() {
         <div className="staff-tabs" role="tablist" aria-label="Authorization sections">
           <button type="button" role="tab" aria-selected={tab === "applications"} onClick={() => setTab("applications")}>Application Access</button>
           <button type="button" role="tab" aria-selected={tab === "connections"} onClick={() => setTab("connections")}>Google Connections</button>
-          <button type="button" role="tab" aria-selected={tab === "gmail"} onClick={() => setTab("gmail")}>Gmail Push</button>
+          <button type="button" role="tab" aria-selected={tab === "gmail"} onClick={() => setTab("gmail")}>Gmail Sync</button>
         </div>
         <div role="tabpanel">
           {tab === "applications" ? (
@@ -118,6 +119,10 @@ export default function ConnectorAuthorizationPage() {
               }}
               onAcceptLimitedRecovery={async (state, reason) => {
                 await acceptAdminLimitedGmailRecovery(state, reason);
+                await refresh();
+              }}
+              onResumeRecovery={async (state, reason) => {
+                await resumeAdminGmailRecovery(state, reason);
                 await refresh();
               }}
             />

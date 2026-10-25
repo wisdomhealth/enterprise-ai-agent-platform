@@ -16,6 +16,7 @@ from app.modules.email.models import (
     EmailState,
     EmailSyncState,
     EmailWorkItem,
+    GmailSyncStatus,
 )
 from app.modules.jobs.models import ErrorClass, JobIntent, JobState
 from app.modules.knowledge.models import DriveSource
@@ -202,6 +203,55 @@ async def test_gmail_manual_sync_is_admin_only_and_works_without_push_configurat
     assert accepted.json()["active_job_id"] is not None
     assert accepted.json()["active_job_state"] == "PENDING"
     assert accepted.json()["active_job_trigger"] == "MANUAL"
+
+
+@pytest.mark.asyncio
+async def test_gmail_resume_after_reauthorization_is_admin_only(
+    db_session: AsyncSession, operations_context: dict[str, object]
+) -> None:
+    organization = operations_context["organization"]
+    drive_connector = operations_context["connector"]
+    gmail_connector = Connector(
+        organization_id=organization.id,
+        kind=ConnectorKind.GMAIL,
+        status=ConnectorStatus.ACTIVE,
+        secret_id=drive_connector.secret_id,
+    )
+    db_session.add(gmail_connector)
+    await db_session.flush()
+    state = EmailSyncState(
+        organization_id=organization.id,
+        connector_id=gmail_connector.id,
+        processed_history_id="100",
+        sync_status=GmailSyncStatus.PAUSED_ERROR,
+        last_error_code="GMAIL_REAUTH_REQUIRED",
+    )
+    db_session.add(state)
+    await db_session.commit()
+    connector_id = gmail_connector.id
+    state_version = state.version
+    body = {"expected_version": state_version, "reason": "OAuth completed"}
+
+    async with operations_context["client_for"](operations_context["reviewer"]) as client:
+        forbidden = await client.post(
+            f"/api/v1/admin/connectors/{connector_id}/gmail-recovery/resume",
+            headers={"Idempotency-Key": "reviewer-gmail-resume"},
+            json=body,
+        )
+    assert forbidden.status_code == 404
+    await db_session.refresh(operations_context["admin"])
+    await db_session.refresh(operations_context["session"])
+
+    async with operations_context["client_for"](operations_context["admin"]) as client:
+        accepted = await client.post(
+            f"/api/v1/admin/connectors/{connector_id}/gmail-recovery/resume",
+            headers={"Idempotency-Key": "admin-gmail-resume"},
+            json=body,
+        )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["sync_status"] == "RUNNING"
+    assert accepted.json()["active_job_trigger"] == "RECOVERY_RESUME"
 
 
 @pytest.mark.asyncio

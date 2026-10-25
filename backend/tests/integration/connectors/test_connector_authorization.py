@@ -8,7 +8,7 @@ from app.modules.audit.models import AuditEvent
 from app.modules.authorization.models import ResourceGrant
 from app.modules.connectors.models import Connector, ConnectorKind, ConnectorStatus
 from app.modules.connectors.service import ConnectorService
-from app.modules.email.models import EmailSyncState
+from app.modules.email.models import EmailSyncState, GmailSyncStatus
 from app.modules.identity.dependencies import Principal
 from app.modules.identity.models import Organization, StaffUser, UserRole, UserStatus
 from app.modules.outbox.models import OutboxEvent
@@ -120,6 +120,56 @@ async def test_gmail_authorization_creates_pollable_sync_state(db_session, tmp_p
     )
     assert state is not None
     assert state.organization_id == organization.id
+
+
+@pytest.mark.asyncio
+async def test_active_gmail_with_reauth_pause_can_replace_credentials_without_resuming(
+    db_session, tmp_path
+) -> None:
+    organization = Organization(name="Gmail stale active reauthorization")
+    db_session.add(organization)
+    await db_session.flush()
+    key_path = tmp_path / "connector-master-key"
+    key_path.write_bytes(b"r" * 32)
+    service = ConnectorService.for_file_key(key_path, app_env="development")
+    principal = await _principal_for(
+        db_session, organization, role=UserRole.ADMIN, email="admin@example.test"
+    )
+    resource_id = service.configuration_resource_id(organization.id, ConnectorKind.GMAIL)
+    grant = ResourceGrant(
+        organization_id=organization.id,
+        subject_id=principal.subject_id,
+        resource_type="connector",
+        resource_id=resource_id,
+        actions=["connector.create"],
+    )
+    db_session.add(grant)
+    await db_session.flush()
+    connector = await service.create_or_reauthorize(
+        db_session,
+        principal=principal,
+        kind=ConnectorKind.GMAIL,
+        refresh_token="expired-token",
+    )
+    state = await db_session.scalar(
+        select(EmailSyncState).where(EmailSyncState.connector_id == connector.id)
+    )
+    assert state is not None
+    state.sync_status = GmailSyncStatus.PAUSED_ERROR
+    state.last_error_code = "GMAIL_REAUTH_REQUIRED"
+    grant.actions = ["connector.reauthorize"]
+    await db_session.flush()
+
+    reauthorized = await service.create_or_reauthorize(
+        db_session,
+        principal=principal,
+        kind=ConnectorKind.GMAIL,
+        refresh_token="replacement-token",
+    )
+
+    assert reauthorized.status is ConnectorStatus.ACTIVE
+    assert state.sync_status is GmailSyncStatus.PAUSED_ERROR
+    assert state.last_error_code == "GMAIL_REAUTH_REQUIRED"
 
 
 @pytest.mark.asyncio

@@ -175,6 +175,11 @@ class GmailRecoveryAcceptRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class GmailRecoveryResumeRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class GmailManualSyncRequest(BaseModel):
     expected_version: int = Field(ge=1)
     reason: str = Field(min_length=1, max_length=1000)

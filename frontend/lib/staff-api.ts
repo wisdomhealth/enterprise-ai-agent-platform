@@ -585,6 +585,16 @@ export function acceptAdminLimitedGmailRecovery(
   });
 }
 
+export function resumeAdminGmailRecovery(
+  state: AdminGmailSyncState,
+  reason: string,
+): Promise<AdminGmailSyncState> {
+  return gmailAction(state.connector_id, "gmail-recovery/resume", {
+    expected_version: state.version,
+    reason,
+  });
+}
+
 export function listAdminFailedJobs(): Promise<AdminFailedJob[]> {
   return adminRequest<AdminFailedJob[]>("/jobs/failed");
 }

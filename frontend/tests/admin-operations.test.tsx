@@ -129,6 +129,27 @@ it("confirms connector reauthorization and displays exact minimum scopes", async
   await waitFor(() => expect(reauthorize).toHaveBeenCalledWith("connector-1"));
 });
 
+it("offers Gmail reauthorization when synchronization detected revoked credentials", () => {
+  render(
+    <ConnectorStatus
+      connectors={[{
+        id: "connector-active-gmail",
+        kind: "GMAIL",
+        status: "ACTIVE",
+        updated_at: "2026-10-25T01:00:00Z",
+        requested_scopes: [
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/gmail.send",
+        ],
+      }]}
+      reauthorizationRequiredConnectorIds={new Set(["connector-active-gmail"])}
+      onReauthorize={vi.fn().mockResolvedValue(undefined)}
+    />,
+  );
+
+  expect(screen.getByRole("button", { name: "Reauthorize Gmail" })).toBeVisible();
+});
+
 it("shows initial Drive and Gmail authorization when no connectors exist", () => {
   render(<ConnectorStatus connectors={[]} onReauthorize={vi.fn().mockResolvedValue(undefined)} />);
 
@@ -371,6 +392,7 @@ it("requires an explicit warning confirmation before accepting limited Gmail rec
       onManualSync={vi.fn().mockResolvedValue(undefined)}
       onContinueRecovery={vi.fn().mockResolvedValue(undefined)}
       onAcceptLimitedRecovery={accept}
+      onResumeRecovery={vi.fn().mockResolvedValue(undefined)}
     />,
   );
 
@@ -385,6 +407,58 @@ it("requires an explicit warning confirmation before accepting limited Gmail rec
     "Reviewed the documented gap.",
   ));
   confirm.mockRestore();
+});
+
+it("explains Gmail authorization failure and prevents duplicate resume clicks", async () => {
+  let finishResume: (() => void) | undefined;
+  const resume = vi.fn().mockImplementation(
+    () => new Promise<void>((resolve) => { finishResume = resolve; }),
+  );
+  render(
+    <GmailPushManagement
+      states={[{
+        connector_id: "gmail-paused",
+        mailbox_address: "support@example.test",
+        auto_sync_enabled: false,
+        polling_enabled: true,
+        push_enabled: false,
+        watch_status: "STOPPED",
+        sync_status: "PAUSED_ERROR",
+        processed_history_id: "100",
+        pending_history_id: "105",
+        watch_expiration_at: null,
+        recovery_batch_id: null,
+        recovery_window_started_at: null,
+        recovery_processed_count: 0,
+        recovery_message_limit: 0,
+        recovery_has_more: false,
+        last_error_code: "GMAIL_REAUTH_REQUIRED",
+        last_success_at: null,
+        active_job_id: null,
+        active_job_state: null,
+        active_job_trigger: null,
+        version: 3,
+      }]}
+      onWatch={vi.fn().mockResolvedValue(undefined)}
+      onManualSync={vi.fn().mockResolvedValue(undefined)}
+      onContinueRecovery={vi.fn().mockResolvedValue(undefined)}
+      onAcceptLimitedRecovery={vi.fn().mockResolvedValue(undefined)}
+      onResumeRecovery={resume}
+    />,
+  );
+
+  expect(screen.getByText(/authorization was revoked or expired/i)).toBeVisible();
+  fireEvent.change(screen.getByLabelText("Administrative reason"), {
+    target: { value: "OAuth completed successfully." },
+  });
+  const button = screen.getByRole("button", { name: "Resume synchronization" });
+  fireEvent.click(button);
+  fireEvent.click(button);
+
+  expect(resume).toHaveBeenCalledTimes(1);
+  expect(button).toBeDisabled();
+  finishResume?.();
+  await waitFor(() => expect(button).not.toBeDisabled());
 });
 
 it("shows quality, latency, and cost without model content", () => {
