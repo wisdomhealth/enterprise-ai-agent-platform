@@ -1,10 +1,11 @@
 import json
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from hashlib import sha256
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +38,7 @@ from app.modules.operations.schemas import (
     ConnectorAuthorizationRead,
     ConnectorGrantReplace,
     ConnectorReauthorizationRead,
-    FailedJobRead,
+    FailedJobPageRead,
     GmailManualSyncRequest,
     GmailRecoveryAcceptRequest,
     GmailRecoveryContinueRequest,
@@ -581,12 +582,34 @@ async def manual_gmail_sync(
     )
 
 
-@router.get("/jobs/failed", response_model=list[FailedJobRead])
+@router.get("/jobs/failed", response_model=FailedJobPageRead)
 async def failed_jobs(
     principal: Annotated[Principal, Depends(require_admin_session)],
     db_session: Annotated[AsyncSession, Depends(get_db_session)],
-) -> list[FailedJobRead]:
-    return await OperationsService(db_session).failed_jobs(principal)
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    kind: Annotated[str | None, Query(min_length=1, max_length=150)] = None,
+    state: Annotated[
+        Literal["PENDING", "FAILED", "RECONCILIATION"] | None,
+        Query(),
+    ] = None,
+    updated_from: Annotated[datetime | None, Query()] = None,
+    updated_to: Annotated[datetime | None, Query()] = None,
+) -> FailedJobPageRead:
+    if updated_from is not None and updated_to is not None and updated_from > updated_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="updated_from must be before or equal to updated_to",
+        )
+    return await OperationsService(db_session).failed_jobs(
+        principal,
+        page=page,
+        page_size=page_size,
+        kind=kind,
+        state=state,
+        updated_from=updated_from,
+        updated_to=updated_to,
+    )
 
 
 @router.post(

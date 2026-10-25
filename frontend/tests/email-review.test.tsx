@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 
 import { EmailQueue } from "../components/email/EmailQueue";
@@ -169,6 +169,26 @@ it("shows original mail, rationale, current source details, history, and audit t
   expect(screen.getByText("Internal source: Support policy")).toBeVisible();
   expect(screen.getByText("Draft version 1")).toBeVisible();
   expect(screen.getByText("DRAFTING → AWAITING_REVIEW")).toBeVisible();
+});
+
+it("keeps each current draft label and input in one accessible field row", () => {
+  render(<EmailReviewPanel item={emailDetail} />);
+
+  const form = screen.getByRole("form", { name: "Current email draft" });
+  expect(within(form).getByRole("heading", { name: "Current draft" })).toHaveClass(
+    "staff-field-wide",
+  );
+  for (const label of ["To", "CC", "Reply subject", "Gmail thread"]) {
+    const input = within(form).getByLabelText(label);
+    const field = input.closest(".staff-draft-field");
+    expect(field).not.toBeNull();
+    expect(field).toContainElement(within(form).getByText(label, { selector: "label" }));
+    expect(input).toHaveAttribute("id");
+    expect(within(form).getByText(label, { selector: "label" })).toHaveAttribute(
+      "for",
+      input.id,
+    );
+  }
 });
 
 it("regenerates only after an explicit instruction and confirmation", async () => {
