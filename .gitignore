@@ -19,3 +19,4 @@ test-results/
 dist/
 coverage/
 infra/nginx/tls/*.key
+/videos/enterprise-ai-platform.mp4
